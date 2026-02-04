@@ -12,10 +12,19 @@ export class OneBotClient extends EventEmitter {
   private options: OneBotClientOptions;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private isAlive = false;
+  private selfId: number | null = null;
 
   constructor(options: OneBotClientOptions) {
     super();
     this.options = options;
+  }
+
+  getSelfId(): number | null {
+    return this.selfId;
+  }
+
+  setSelfId(id: number) {
+    this.selfId = id;
   }
 
   connect() {
@@ -64,6 +73,45 @@ export class OneBotClient extends EventEmitter {
 
   sendGroupMsg(groupId: number, message: OneBotMessage | string) {
     this.send("send_group_msg", { group_id: groupId, message });
+  }
+
+  async getMsg(messageId: number): Promise<any> {
+    return this.sendWithResponse("get_msg", { message_id: messageId });
+  }
+
+  private sendWithResponse(action: string, params: any): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        reject(new Error("WebSocket not open"));
+        return;
+      }
+
+      const echo = Math.random().toString(36).substring(2, 15);
+      const handler = (data: WebSocket.RawData) => {
+        try {
+          const resp = JSON.parse(data.toString());
+          if (resp.echo === echo) {
+            this.ws?.off("message", handler);
+            if (resp.status === "ok") {
+              resolve(resp.data);
+            } else {
+              reject(new Error(resp.msg || "API request failed"));
+            }
+          }
+        } catch (err) {
+          // Ignore non-JSON messages
+        }
+      };
+
+      this.ws.on("message", handler);
+      this.ws.send(JSON.stringify({ action, params, echo }));
+
+      // Timeout after 5 seconds
+      setTimeout(() => {
+        this.ws?.off("message", handler);
+        reject(new Error("Request timeout"));
+      }, 5000);
+    });
   }
 
   private send(action: string, params: any) {
