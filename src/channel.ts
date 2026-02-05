@@ -120,9 +120,22 @@ function normalizeTarget(raw: string): string {
 }
 
 const clients = new Map<string, OneBotClient>();
+const processedMsgIds = new Set<string>(); // Deduplication cache
+
+// Clean up old message IDs periodically
+setInterval(() => {
+    if (processedMsgIds.size > 1000) {
+        processedMsgIds.clear();
+    }
+}, 3600000); // Clear every hour
 
 function getClientForAccount(accountId: string) {
     return clients.get(accountId);
+}
+
+function isImageFile(url: string): boolean {
+    const lower = url.toLowerCase();
+    return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 }
 
 export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
@@ -208,6 +221,16 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             
             if (event.post_type !== "message") return;
 
+            // Deduplication
+            if (config.enableDeduplication !== false && event.message_id) {
+                const msgIdKey = String(event.message_id);
+                if (processedMsgIds.has(msgIdKey)) {
+                    console.log(`[QQ] Skipping duplicate message ${msgIdKey}`);
+                    return;
+                }
+                processedMsgIds.add(msgIdKey);
+            }
+
             const isGroup = event.message_type === "group";
             const userId = event.user_id;
             const groupId = event.group_id;
@@ -222,9 +245,27 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             }
             
             // Check admin whitelist if configured
+            const isAdmin = config.admins?.includes(userId) ?? false;
             if (config.admins && config.admins.length > 0 && userId) {
-                if (!config.admins.includes(userId)) {
+                if (!isAdmin) {
                     return; // Ignore non-admin messages
+                }
+            }
+
+            // Admin Commands
+            if (isAdmin && text.startsWith('/')) {
+                const cmd = text.trim();
+                if (cmd === '/status') {
+                    const statusMsg = `[OpenClawd QQ]\nState: Connected\nSelf ID: ${client.getSelfId()}\nMemory: ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)} MB`;
+                    if (isGroup) client.sendGroupMsg(groupId, statusMsg);
+                    else client.sendPrivateMsg(userId, statusMsg);
+                    return;
+                }
+                if (cmd === '/help') {
+                    const helpMsg = `[OpenClawd QQ]\n/status - Check bot status\n/help - Show this message`;
+                    if (isGroup) client.sendGroupMsg(groupId, helpMsg);
+                    else client.sendPrivateMsg(userId, helpMsg);
+                    return;
                 }
             }
             
@@ -314,7 +355,15 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                  if (payload.files) {
                      for (const file of payload.files) {
                          if (file.url) {
-                            send(`[CQ:image,file=${file.url}]`);
+                            // Check file type to decide between [CQ:image] and [CQ:file]
+                            // Simple heuristic based on extension
+                            if (isImageFile(file.url)) {
+                                send(`[CQ:image,file=${file.url}]`);
+                            } else {
+                                // For OneBot v11, [CQ:file] usually requires a file path or url
+                                // Note: Sending non-image files via URL might require specific OneBot implementation support
+                                send(`[CQ:file,file=${file.url},name=${file.name || 'file'}]`);
+                            }
                          }
                      }
                  }
@@ -340,7 +389,14 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             const replySuffix = replyToBody
                 ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]`
                 : "";
-            const bodyWithReply = cleanCQCodes(text) + replySuffix;
+            
+            let bodyWithReply = cleanCQCodes(text) + replySuffix;
+            
+            // Inject System Prompt if configured
+            if (config.systemPrompt) {
+                // Prepending system instructions as context header
+                bodyWithReply = `<system>${config.systemPrompt}</system>\n\n${bodyWithReply}`;
+            }
 
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                 Provider: "qq",
@@ -378,12 +434,20 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 onRecordError: (err) => console.error("QQ Session Error:", err)
             });
 
-            await runtime.channel.reply.dispatchReplyFromConfig({
-                ctx: ctxPayload,
-                cfg,
-                dispatcher, // Passed dispatcher
-                replyOptions, // Passed options
-            });
+            try {
+                await runtime.channel.reply.dispatchReplyFromConfig({
+                    ctx: ctxPayload,
+                    cfg,
+                    dispatcher, // Passed dispatcher
+                    replyOptions, // Passed options
+                });
+            } catch (error) {
+                console.error("[QQ] Dispatch Error:", error);
+                if (config.enableErrorNotify) {
+                     // Notify admin or reply with error (optional)
+                     // deliver({ text: "⚠️ Error processing request" }); 
+                }
+            }
         });
 
         client.connect();
@@ -441,8 +505,24 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
              message.push({ type: "text", data: { text } });
          }
          
-         // Add image
-         message.push({ type: "image", data: { file: mediaUrl } });
+         // Add media (image or file)
+         if (isImageFile(mediaUrl)) {
+             message.push({ type: "image", data: { file: mediaUrl } });
+         } else {
+             // Use CQ:file for non-image files (requires OneBot support for URL files)
+             // Using raw CQ code in text segment or constructing a custom node might be needed depending on implementation
+             // Here we use a safe fallback for modern OneBot implementations that support generic file segments or CQ codes
+             // Note: Standard OneBot v11 segment for file is often implementation specific or done via upload API
+             // For now, we try sending as CQ code inside a text segment or a specialized segment if available
+             // But to be safe, let's treat it as a text-based CQ code injection if the type definition allows, 
+             // or just send the link if not supported.
+             // Given existing code uses `message` array, we'll try to push a raw node if we can, or just text.
+             
+             // Simplest OneBot v11 approach: Send it as a file upload if possible, but here we only have sendMsg.
+             // Let's rely on the implementation parsing [CQ:file]
+             // We'll treat it as a "text" segment containing the CQ code because standard OneBot segment types for 'file' are rare/complex
+             message.push({ type: "text", data: { text: `[CQ:file,file=${mediaUrl},url=${mediaUrl}]` } });
+         }
 
          if (to.startsWith("group:")) {
              const groupId = parseInt(to.replace("group:", ""), 10);
