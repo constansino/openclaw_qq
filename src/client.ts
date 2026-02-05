@@ -111,6 +111,18 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_msg_history", { group_id: groupId });
   }
 
+  async getForwardMsg(id: string): Promise<any> {
+    return this.sendWithResponse("get_forward_msg", { id });
+  }
+
+  setGroupBan(groupId: number, userId: number, duration: number = 1800) {
+    this.send("set_group_ban", { group_id: groupId, user_id: userId, duration });
+  }
+
+  setGroupKick(groupId: number, userId: number, rejectAddRequest: boolean = false) {
+    this.send("set_group_kick", { group_id: groupId, user_id: userId, reject_add_request: rejectAddRequest });
+  }
+
   private sendWithResponse(action: string, params: any): Promise<any> {
     return new Promise((resolve, reject) => {
       if (this.ws?.readyState !== WebSocket.OPEN) {
