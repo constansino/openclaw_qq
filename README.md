@@ -1,4 +1,3 @@
-
 OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础的功能。
 <img width="1324" height="1000" alt="image" src="https://github.com/user-attachments/assets/00b0f347-be84-4fe0-94f2-456679d84f45" />
 <img width="1687" height="1043" alt="PixPin_2026-01-29_16-09-58" src="https://github.com/user-attachments/assets/998a1d42-9566-4d20-8467-39dd1752a035" />
@@ -22,6 +21,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **自动请求处理**：支持配置自动通过好友申请和群邀请。
 *   **智能重连**：采用指数退避算法，避免异常时的连接风暴。
 *   **消息去重**：防止网络抖动导致的重复回复。
+*   **风控规避**：可选 URL 处理模式，降低被封概率；支持发送速率限制 (`rateLimitMs`)。
 
 ### 🎭 深度交互体验
 *   **戳一戳 (Poke)**：响应用户的“戳一戳”动作，支持 AI 趣味互动。
@@ -30,10 +30,10 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **语音输出 (TTS)**：可选开启 TTS，将 AI 的简短文字回复转换为语音发送（实验性）。
 *   **多媒体感知**：全面支持图片（含 Base64 自动转换）、语音（含 STT 转文字）、视频、卡片消息。
 
-### 🎨 格式与分片
+### 🎨 格式与频道
+*   **频道支持 (Guild)**：原生支持 QQ 频道 (Guild) 消息收发，支持子频道。
 *   **Markdown 优化**：自动将 Markdown 表格、列表转换为易读的 ASCII 排版。
 *   **智能分片**：超长消息自动切分发送，且仅在首段保留回复引用。
-*   **风控规避**：可选 URL 处理模式，降低被封概率。
 
 ---
 
@@ -61,8 +61,10 @@ openclaw setup qq
 ### 3. 运行与监控
 启动 OpenClaw 后，你可以使用以下标准命令：
 *   **检查状态**：`openclaw status` (查看 Bot 在线状态、延迟)
-*   **列出群组**：`openclaw list-groups --channel qq`
-*   **发送消息**：`openclaw send qq <群号> "你好"`
+*   **列出群组/频道**：`openclaw list-groups --channel qq`
+*   **发送消息**：
+    *   发送到群：`openclaw send qq group:123456 "你好"`
+    *   发送到频道：`openclaw send qq guild:GUILD_ID:CHANNEL_ID "你好"`
 
 ### (备选) 手动配置 (`openclaw.json`)
 ```json
@@ -80,7 +82,9 @@ openclaw setup qq
       "enableTTS": false,
       "formatMarkdown": true,
       "antiRiskMode": false,
-      "maxMessageLength": 4000
+      "maxMessageLength": 4000,
+      "enableGuilds": true,
+      "rateLimitMs": 1000
     }
   }
 }
@@ -89,6 +93,8 @@ openclaw setup qq
 ### 关键配置说明
 | 字段 | 说明 |
 | :--- | :--- |
+| `enableGuilds` | 是否开启 QQ 频道支持 (默认 true) |
+| `rateLimitMs` | 消息分片发送间隔 (毫秒)，防止刷屏风控 (默认 1000) |
 | `historyLimit` | 注入 AI 上下文的历史消息条数（默认 5） |
 | `keywordTriggers` | 触发机器人的关键词列表（群聊有效） |
 | `enableTTS` | 是否将 AI 回复转为语音（需要服务端支持） |

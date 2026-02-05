@@ -123,6 +123,26 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_list", {});
   }
 
+  // --- Guild (Channel) Extension APIs ---
+  sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
+    this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
+  }
+
+  async getGuildList(): Promise<any[]> {
+    // Note: API name varies by implementation (get_guild_list vs get_guilds)
+    // We try the most common one for extended OneBot
+    try {
+        return await this.sendWithResponse("get_guild_list", {});
+    } catch {
+        return [];
+    }
+  }
+
+  async getGuildServiceProfile(): Promise<any> {
+      try { return await this.sendWithResponse("get_guild_service_profile", {}); } catch { return null; }
+  }
+  // --------------------------------------
+
   setGroupBan(groupId: number, userId: number, duration: number = 1800) {
     this.send("set_group_ban", { group_id: groupId, user_id: userId, duration });
   }
