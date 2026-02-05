@@ -115,6 +115,14 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_forward_msg", { id });
   }
 
+  async getFriendList(): Promise<any[]> {
+    return this.sendWithResponse("get_friend_list", {});
+  }
+
+  async getGroupList(): Promise<any[]> {
+    return this.sendWithResponse("get_group_list", {});
+  }
+
   setGroupBan(groupId: number, userId: number, duration: number = 1800) {
     this.send("set_group_ban", { group_id: groupId, user_id: userId, duration });
   }
