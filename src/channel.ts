@@ -41,7 +41,7 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
   const urls: string[] = [];
   for (const segment of message) {
     if (segment.type === "image") {
-      const url = segment.data?.url || segment.data?.file;
+      const url = segment.data?.url || (typeof segment.data?.file === 'string' && segment.data.file.startsWith('http') ? segment.data.file : undefined);
       if (url && (url.startsWith("http://") || url.startsWith("https://"))) {
         urls.push(url);
         if (urls.length >= maxImages) break;
@@ -57,17 +57,20 @@ function cleanCQCodes(text: string | undefined): string {
   let result = text;
   const imageUrls: string[] = [];
   
-  const imageRegex = /\[CQ:image,[^\]]*url=([^,\]]+)[^\]]*\]/g;
+  // Match both url= and file= if they look like URLs
+  const imageRegex = /\[CQ:image,[^\]]*(?:url|file)=([^,\]]+)[^\]]*\]/g;
   let match;
   while ((match = imageRegex.exec(text)) !== null) {
-    const url = match[1].replace(/&amp;/g, "&");
-    imageUrls.push(url);
+    const val = match[1].replace(/&amp;/g, "&");
+    if (val.startsWith("http")) {
+      imageUrls.push(val);
+    }
   }
 
   result = result.replace(/\[CQ:face,id=(\d+)\]/g, "[表情]");
   
   result = result.replace(/\[CQ:[^\]]+\]/g, (match) => {
-    if (match.startsWith("[CQ:image") && match.includes("url=")) {
+    if (match.startsWith("[CQ:image")) {
       return "[图片]";
     }
     return "";
@@ -449,6 +452,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         }
                         resolvedText += ` @${name} `;
                     } else if (seg.type === "record") resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
+                    else if (seg.type === "image") resolvedText += " [图片]";
                     else if (seg.type === "video") resolvedText += " [视频消息]";
                     else if (seg.type === "json") resolvedText += " [卡片消息]";
                     else if (seg.type === "forward" && seg.data?.id) {
