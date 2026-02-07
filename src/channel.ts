@@ -379,6 +379,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
         if (!config.wsUrl) throw new Error("QQ: wsUrl is required");
 
+        // 1. Prevent multiple clients for the same account
+        const existingClient = clients.get(account.accountId);
+        if (existingClient) {
+            console.log(`[QQ] Stopping existing client for account ${account.accountId} before restart`);
+            existingClient.disconnect();
+        }
+
         const client = new OneBotClient({
             wsUrl: config.wsUrl,
             accessToken: config.accessToken,
@@ -395,6 +402,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
              console.log(`[QQ] Connected account ${account.accountId}`);
              try {
                 const info = await client.getLoginInfo();
+                if (info && info.user_id) client.setSelfId(info.user_id);
                 if (info && info.nickname) console.log(`[QQ] Logged in as: ${info.nickname} (${info.user_id})`);
                 getQQRuntime().channel.activity.record({
                     channel: "qq", accountId: account.accountId, direction: "inbound", 
@@ -426,7 +434,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             }
 
             if (event.post_type !== "message") return;
-            if ([2854196310].includes(event.user_id)) return;
+            
+            // 2. Dynamic self-message filtering
+            const selfId = client.getSelfId() || event.self_id;
+            if (selfId && String(event.user_id) === String(selfId)) return;
 
             if (config.enableDeduplication !== false && event.message_id) {
                 const msgIdKey = String(event.message_id);
