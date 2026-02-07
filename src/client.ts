@@ -12,6 +12,10 @@ export class OneBotClient extends EventEmitter {
   private options: OneBotClientOptions;
   private reconnectAttempts = 0;
   private maxReconnectDelay = 60000; // Max 1 minute delay
+  private selfId: number | null = null;
+  private isAlive = false;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
 
   constructor(options: OneBotClientOptions) {
     super();
@@ -27,48 +31,95 @@ export class OneBotClient extends EventEmitter {
   }
 
   connect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.cleanup();
 
     const headers: Record<string, string> = {};
     if (this.options.accessToken) {
       headers["Authorization"] = `Bearer ${this.options.accessToken}`;
     }
 
-    this.ws = new WebSocket(this.options.wsUrl, { headers });
+    try {
+      this.ws = new WebSocket(this.options.wsUrl, { headers });
 
-    this.ws.on("open", () => {
-      this.isAlive = true;
-      this.reconnectAttempts = 0; // Reset counter on success
-      this.emit("connect");
-      console.log("[QQ] Connected to OneBot server");
-    });
+      this.ws.on("open", () => {
+        this.isAlive = true;
+        this.reconnectAttempts = 0; // Reset counter on success
+        this.emit("connect");
+        console.log("[QQ] Connected to OneBot server");
+        
+        // Start heartbeat check
+        this.startHeartbeat();
+      });
 
-    this.ws.on("message", (data) => {
-      try {
-        const payload = JSON.parse(data.toString()) as OneBotEvent;
-        if (payload.post_type === "meta_event" && payload.meta_event_type === "heartbeat") {
-          this.isAlive = true;
-          return;
+      this.ws.on("message", (data) => {
+        try {
+          const payload = JSON.parse(data.toString()) as OneBotEvent;
+          if (payload.post_type === "meta_event" && payload.meta_event_type === "heartbeat") {
+            this.isAlive = true;
+            return;
+          }
+          this.emit("message", payload);
+        } catch (err) {
+          // Ignore non-JSON or parse errors
         }
-        this.emit("message", payload);
-      } catch (err) {
-        console.error("[QQ] Failed to parse message:", err);
-      }
-    });
+      });
 
-    this.ws.on("close", () => {
-      this.isAlive = false;
-      this.emit("disconnect");
+      this.ws.on("close", () => {
+        this.handleDisconnect();
+      });
+
+      this.ws.on("error", (err) => {
+        console.error("[QQ] WebSocket error:", err);
+        this.handleDisconnect();
+      });
+    } catch (err) {
+      console.error("[QQ] Failed to initiate WebSocket connection:", err);
       this.scheduleReconnect();
-    });
+    }
+  }
 
-    this.ws.on("error", (err) => {
-      console.error("[QQ] WebSocket error:", err);
-      this.ws?.close();
-    });
+  private cleanup() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+        this.ws.terminate();
+      }
+      this.ws = null;
+    }
+  }
+
+  private startHeartbeat() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    // Check every 30 seconds
+    this.heartbeatTimer = setInterval(() => {
+      if (this.isAlive === false) {
+        console.warn("[QQ] Heartbeat timeout, forcing reconnect...");
+        this.handleDisconnect();
+        return;
+      }
+      this.isAlive = false;
+      // We don't send ping, we rely on OneBot's heartbeat meta_event
+      // or we can send a small API call to verify
+    }, 45000); 
+  }
+
+  private handleDisconnect() {
+    this.cleanup();
+    this.emit("disconnect");
+    this.scheduleReconnect();
   }
 
   private scheduleReconnect() {
+    if (this.reconnectTimer) return; // Already scheduled
+    
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
     console.log(`[QQ] Reconnecting in ${delay / 1000}s (Attempt ${this.reconnectAttempts + 1})...`);
     
@@ -201,7 +252,6 @@ export class OneBotClient extends EventEmitter {
   }
 
   disconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.ws?.close();
+    this.cleanup();
   }
 }
