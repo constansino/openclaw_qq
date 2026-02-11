@@ -1,5 +1,7 @@
 # NapCat Docker for OpenClaw QQ
 
+> English version: [README.en.md](./README.en.md)
+
 ## 启动
 
 ```bash

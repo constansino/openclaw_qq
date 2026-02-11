@@ -2,6 +2,8 @@
 OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础的功能。
 # OpenClaw QQ 插件 (OneBot v11)
 
+> English version: [README.en.md](./README.en.md)
+
 本插件通过 OneBot v11 协议（WebSocket）为 [OpenClaw](https://github.com/openclaw/openclaw) 添加全功能的 QQ 频道支持。它不仅支持基础聊天，还集成了群管、频道、多模态交互和生产级风控能力。
 
 ## ✨ 核心特性
