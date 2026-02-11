@@ -105,6 +105,8 @@ You can also edit config directly. Full config example:
       "autoApproveRequests": true,
       "enableGuilds": true,
       "enableTTS": false,
+      "sharedMediaHostDir": "/Users/yourname/openclaw_qq/deploy/napcat/shared_media",
+      "sharedMediaContainerDir": "/openclaw_media",
       "rateLimitMs": 1000,
       "formatMarkdown": true,
       "antiRiskMode": false,
@@ -143,6 +145,8 @@ You can also edit config directly. Full config example:
 | `autoApproveRequests` | boolean | `false` | Whether to auto-approve friend requests and group invites. |
 | `enableGuilds` | boolean | `true` | Whether to enable QQ Guild support. |
 | `enableTTS` | boolean | `false` | (Experimental) Whether to convert AI replies into voice (requires server-side TTS support). |
+| `sharedMediaHostDir` | string | `""` | Optional host-side shared media directory. Recommended: `openclaw_qq/deploy/napcat/shared_media` so local audio can be copied to a NapCat-accessible path. |
+| `sharedMediaContainerDir` | string | `"/openclaw_media"` | Optional in-container mount path for shared media. Must match `deploy/napcat/docker-compose.yml`. |
 | `rateLimitMs` | number | `1000` | **Send rate limit**. Delay in ms between multiple segments; `1000` is recommended for anti-risk control. |
 | `formatMarkdown` | boolean | `false` | Whether to convert Markdown tables/lists to readable plain-text formatting for QQ. |
 | `antiRiskMode` | boolean | `false` | Whether to enable anti-risk formatting (for example, adding spaces in URLs). |
@@ -244,6 +248,16 @@ If you want only specific QQ IDs to trigger the bot (especially in groups), use 
 
 5. **Restart gateway to apply**
    ```bash
+   openclaw gateway restart
+   ```
+
+6. **(Recommended) Enable shared media mount (fix cross-container audio path issues)**
+   ```bash
+   mkdir -p openclaw_qq/deploy/napcat/shared_media
+   cd openclaw_qq/deploy/napcat && docker compose up -d
+
+   openclaw config set channels.qq.sharedMediaHostDir '"/Users/yourname/openclaw_qq/deploy/napcat/shared_media"' --json
+   openclaw config set channels.qq.sharedMediaContainerDir '"/openclaw_media"' --json
    openclaw gateway restart
    ```
 

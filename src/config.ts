@@ -84,6 +84,8 @@ export const QQConfigSchema = z.object({
   historyLimit: NumberInputSchema(0).describe("群历史注入条数。默认0（推荐，依赖会话系统）；需强保留原文时可设 3~5。"),
   keywordTriggers: KeywordTriggersSchema.describe("关键词触发（字符串）。Web表单填：小助手, 帮我；Raw JSON 填：\"小助手, 帮我\"。当 requireMention=true 时，命中关键词可不@直接触发；当 requireMention=false 时，关键词不是必需条件。"),
   enableTTS: BooleanInputSchema(false).describe("是否启用语音回复（依赖 OneBot 服务端支持）。"),
+  sharedMediaHostDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：宿主机共享媒体目录（供 NapCat 容器访问）。示例：/Users/xxx/openclaw_qq/deploy/napcat/shared_media。"),
+  sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),
   enableGuilds: BooleanInputSchema(true).describe("是否启用 QQ 频道（Guild）支持。"),
   rateLimitMs: NumberInputSchema(1000).describe("多段消息发送间隔（毫秒）。建议 1000。"),
 }).passthrough();

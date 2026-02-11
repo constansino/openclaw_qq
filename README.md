@@ -108,6 +108,8 @@ openclaw setup qq
       "autoApproveRequests": true,
       "enableGuilds": true,
       "enableTTS": false,
+      "sharedMediaHostDir": "/Users/yourname/openclaw_qq/deploy/napcat/shared_media",
+      "sharedMediaContainerDir": "/openclaw_media",
       "rateLimitMs": 1000,
       "formatMarkdown": true,
       "antiRiskMode": false,
@@ -145,6 +147,8 @@ openclaw setup qq
 | `autoApproveRequests` | boolean | `false` | 是否自动通过好友申请和群邀请。 |
 | `enableGuilds` | boolean | `true` | 是否开启 QQ 频道 (Guild) 支持。 |
 | `enableTTS` | boolean | `false` | (实验性) 是否将 AI 回复转为语音发送 (需服务端支持 TTS)。 |
+| `sharedMediaHostDir` | string | `""` | 可选：宿主机共享媒体目录。建议设为 `openclaw_qq/deploy/napcat/shared_media`，用于把本地音频复制到 NapCat 可访问路径，提升语音/文件发送成功率。 |
+| `sharedMediaContainerDir` | string | `"/openclaw_media"` | 可选：共享目录在 NapCat 容器内路径，需与 `deploy/napcat/docker-compose.yml` 中挂载保持一致。 |
 | `rateLimitMs` | number | `1000` | **发送限速**。多条消息间的延迟(毫秒)，建议设为 1000 以防风控。 |
 | `formatMarkdown` | boolean | `false` | 是否将 Markdown 表格/列表转换为易读的纯文本排版。 |
 | `antiRiskMode` | boolean | `false` | 是否开启风控规避（如给 URL 加空格）。 |
@@ -246,6 +250,16 @@ openclaw setup qq
 
 5. **重启网关生效**
    ```bash
+   openclaw gateway restart
+   ```
+
+6. **（推荐）启用共享媒体目录（解决跨容器语音路径问题）**
+   ```bash
+   mkdir -p openclaw_qq/deploy/napcat/shared_media
+   cd openclaw_qq/deploy/napcat && docker compose up -d
+
+   openclaw config set channels.qq.sharedMediaHostDir '"/Users/你的用户名/openclaw_qq/deploy/napcat/shared_media"' --json
+   openclaw config set channels.qq.sharedMediaContainerDir '"/openclaw_media"' --json
    openclaw gateway restart
    ```
 

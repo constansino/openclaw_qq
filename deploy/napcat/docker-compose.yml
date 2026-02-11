@@ -15,3 +15,4 @@ services:
     volumes:
       - ./napcat/config:/app/napcat/config
       - ./napcat/qq:/app/.config/QQ
+      - ./shared_media:/openclaw_media
