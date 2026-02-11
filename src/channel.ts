@@ -1029,6 +1029,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
          if (replyTo && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyTo) } });
          const imageLike = isImageFile(mediaUrl) || isImageFile(finalUrl) || finalUrl.startsWith("base64://");
          const audioLike = isAudioFile(mediaUrl) || isAudioFile(finalUrl);
+
+         if (audioLike && textAck) {
+             const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
+             const delayMs = Number.isFinite(configuredDelay) ? Math.max(1200, configuredDelay) : 1200;
+             await sleep(delayMs);
+         }
+
          if (imageLike) mediaMessage.push({ type: "image", data: { file: finalUrl } });
          else if (audioLike) {
              let recordFile = stagedAudioFile || finalUrl;
