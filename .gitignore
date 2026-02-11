@@ -35,3 +35,6 @@ logs/
 
 # Runtime data
 deploy/napcat/napcat/
+
+# local secrets
+deploy/napcat/.env
