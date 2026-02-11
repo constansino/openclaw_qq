@@ -200,6 +200,52 @@ openclaw setup qq
     openclaw send qq guild:GUILD_ID:CHANNEL_ID "频道消息"
     ```
 
+### 🔐 管理员/黑名单（防盗刷）推荐配置
+
+如果你只希望指定 QQ 号能触发机器人（尤其是群聊），推荐按下面做：
+
+1. **设置管理员（可触发聊天）**
+   ```bash
+   openclaw config set channels.qq.admins '"1838552185,123456789"' --json
+   ```
+
+2. **开启仅管理员可触发**
+   ```bash
+   openclaw config set channels.qq.adminOnlyChat true --json
+   ```
+
+3. **（可选）给非管理员提示 + 防抖**
+   ```bash
+   openclaw config set channels.qq.notifyNonAdminBlocked true --json
+   openclaw config set channels.qq.nonAdminBlockedMessage '"当前仅管理员可触发机器人。"' --json
+   openclaw config set channels.qq.blockedNotifyCooldownMs 10000 --json
+   ```
+
+4. **设置黑名单（直接忽略，不回复）**
+   ```bash
+   openclaw config set channels.qq.blockedUsers '"342571216,10002"' --json
+   ```
+
+5. **重启网关生效**
+   ```bash
+   openclaw gateway restart
+   ```
+
+> 说明：`admins` / `blockedUsers` 在本插件中使用 **字符串列表** 存储，CLI 推荐始终用上面这种 `--json` 写法。
+>
+> Web 配置页可直接填：`1838552185,123456789`（不需要手动加引号）；Raw JSON 模式则填：`"1838552185,123456789"`。
+
+### ⚠️ 关于 `/config` 页面保存 `invalid config`
+
+如果你在 OpenClaw Web UI 修改 QQ 配置时，报错却指向 `models.providers.*.models[].maxTokens`，这是 **OpenClaw Core 的整包校验链路问题**，不是 QQ 插件业务逻辑本身。
+
+相关跟踪（英文）：
+
+- Issue: https://github.com/openclaw/openclaw/issues/13959
+- PR: https://github.com/openclaw/openclaw/pull/13960
+
+在官方合并前，建议优先使用上面的 CLI 命令修改 `channels.qq.*`，可避开大部分 Web 表单序列化/校验噪音。
+
 ---
 
 ## ❓ 常见问题 (FAQ)
