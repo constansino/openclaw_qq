@@ -351,6 +351,27 @@ async function resolveInlineCqRecord(text: string): Promise<string> {
     return result;
 }
 
+async function sendOneBotMessageWithAck(client: OneBotClient, to: string, message: OneBotMessage | string): Promise<{ ok: boolean; data?: any; error?: string }> {
+    try {
+        if (to.startsWith("group:")) {
+            const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message);
+            return { ok: true, data };
+        }
+        if (to.startsWith("guild:")) {
+            const parts = to.split(":");
+            if (parts.length >= 3) {
+                const data = await client.sendGuildChannelMsgAck(parts[1], parts[2], message);
+                return { ok: true, data };
+            }
+            return { ok: false, error: `Invalid guild target: ${to}` };
+        }
+        const data = await client.sendPrivateMsgAck(parseInt(to, 10), message);
+        return { ok: true, data };
+    } catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+
 export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
   id: "qq",
   meta: {
@@ -920,43 +941,64 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         if (!client) return { channel: "qq", sent: false, error: "Client not connected" };
         const normalizedText = await resolveInlineCqRecord(text);
         const chunks = splitMessage(normalizedText, 4000);
+        let lastAck: any = null;
         for (let i = 0; i < chunks.length; i++) {
             let message: OneBotMessage | string = chunks[i];
             if (replyTo && i === 0) message = [ { type: "reply", data: { id: String(replyTo) } }, { type: "text", data: { text: chunks[i] } } ];
-            
-            if (to.startsWith("group:")) client.sendGroupMsg(parseInt(to.replace("group:", ""), 10), message);
-            else if (to.startsWith("guild:")) {
-                const parts = to.split(":");
-                if (parts.length >= 3) client.sendGuildChannelMsg(parts[1], parts[2], message);
+            const ack = await sendOneBotMessageWithAck(client, to, message);
+            if (!ack.ok) {
+                return { channel: "qq", sent: false, error: ack.error || "Failed to send text" };
             }
-            else client.sendPrivateMsg(parseInt(to, 10), message);
+            lastAck = ack.data;
             
             if (chunks.length > 1) await sleep(1000); 
         }
-        return { channel: "qq", sent: true };
+        return { channel: "qq", sent: true, messageId: lastAck?.message_id ?? lastAck?.messageId ?? null };
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, replyTo }) => {
          const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
          if (!client) return { channel: "qq", sent: false, error: "Client not connected" };
          
          const finalUrl = await resolveMediaUrl(mediaUrl);
-         
-         const message: OneBotMessage = [];
-         if (replyTo) message.push({ type: "reply", data: { id: String(replyTo) } });
-         if (text) message.push({ type: "text", data: { text } });
+
+         let textAck: any = null;
+         if (text && text.trim()) {
+             const textMessage: OneBotMessage = [];
+             if (replyTo) textMessage.push({ type: "reply", data: { id: String(replyTo) } });
+             textMessage.push({ type: "text", data: { text } });
+             const ack = await sendOneBotMessageWithAck(client, to, textMessage);
+             if (!ack.ok) {
+                 return { channel: "qq", sent: false, error: `Text send failed: ${ack.error || "unknown"}` };
+             }
+             textAck = ack.data;
+         }
+
+         const mediaMessage: OneBotMessage = [];
+         if (replyTo && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyTo) } });
          const imageLike = isImageFile(mediaUrl) || isImageFile(finalUrl) || finalUrl.startsWith("base64://");
          const audioLike = isAudioFile(mediaUrl) || isAudioFile(finalUrl);
-         if (imageLike) message.push({ type: "image", data: { file: finalUrl } });
-         else if (audioLike) message.push({ type: "record", data: { file: finalUrl } });
-         else message.push({ type: "file", data: { file: finalUrl } });
-         
-         if (to.startsWith("group:")) client.sendGroupMsg(parseInt(to.replace("group:", ""), 10), message);
-         else if (to.startsWith("guild:")) {
-             const parts = to.split(":");
-             if (parts.length >= 3) client.sendGuildChannelMsg(parts[1], parts[2], message);
+         if (imageLike) mediaMessage.push({ type: "image", data: { file: finalUrl } });
+         else if (audioLike) mediaMessage.push({ type: "record", data: { file: finalUrl } });
+         else mediaMessage.push({ type: "file", data: { file: finalUrl } });
+
+         const mediaAck = await sendOneBotMessageWithAck(client, to, mediaMessage);
+         if (!mediaAck.ok) {
+             return {
+                 channel: "qq",
+                 sent: Boolean(textAck),
+                 error: `Media send failed: ${mediaAck.error || "unknown"}`,
+                 textSent: Boolean(textAck),
+                 mediaSent: false,
+                 messageId: textAck?.message_id ?? textAck?.messageId ?? null,
+             };
          }
-         else client.sendPrivateMsg(parseInt(to, 10), message);
-         return { channel: "qq", sent: true };
+         return {
+             channel: "qq",
+             sent: true,
+             textSent: Boolean(textAck),
+             mediaSent: true,
+             messageId: mediaAck.data?.message_id ?? mediaAck.data?.messageId ?? textAck?.message_id ?? textAck?.messageId ?? null,
+         };
     },
     // @ts-ignore
     deleteMessage: async ({ messageId, accountId }) => {

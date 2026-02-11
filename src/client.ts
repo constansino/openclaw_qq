@@ -144,8 +144,16 @@ export class OneBotClient extends EventEmitter {
     this.send("send_private_msg", { user_id: userId, message });
   }
 
+  async sendPrivateMsgAck(userId: number, message: OneBotMessage | string): Promise<any> {
+    return this.sendWithResponse("send_private_msg", { user_id: userId, message });
+  }
+
   sendGroupMsg(groupId: number, message: OneBotMessage | string) {
     this.send("send_group_msg", { group_id: groupId, message });
+  }
+
+  async sendGroupMsgAck(groupId: number, message: OneBotMessage | string): Promise<any> {
+    return this.sendWithResponse("send_group_msg", { group_id: groupId, message });
   }
 
   deleteMsg(messageId: number | string) {
@@ -188,6 +196,10 @@ export class OneBotClient extends EventEmitter {
   // --- Guild (Channel) Extension APIs ---
   sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
     this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
+  }
+
+  async sendGuildChannelMsgAck(guildId: string, channelId: string, message: OneBotMessage | string): Promise<any> {
+    return this.sendWithResponse("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
   }
 
   async getGuildList(): Promise<any[]> {
