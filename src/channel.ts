@@ -158,6 +158,21 @@ function parseIdListInput(values: string | number | Array<string | number> | und
     return normalizeNumericIdList(values);
 }
 
+function parseKeywordTriggersInput(values: string | string[] | undefined): string[] {
+    if (typeof values === "string") {
+        return values
+            .split(/[\n,，;；\s]+/)
+            .map((part) => part.trim())
+            .filter(Boolean);
+    }
+    if (Array.isArray(values)) {
+        return values
+            .map((part) => String(part).trim())
+            .filter(Boolean);
+    }
+    return [];
+}
+
 function getClientForAccount(accountId: string) {
     return clients.get(accountId);
 }
@@ -599,8 +614,9 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             }
 
             let isTriggered = !isGroup || text.includes("[动作] 用户戳了你一下");
-            if (!isTriggered && config.keywordTriggers) {
-                for (const kw of config.keywordTriggers) { if (text.includes(kw)) { isTriggered = true; break; } }
+            const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
+            if (!isTriggered && keywordTriggers.length > 0) {
+                for (const kw of keywordTriggers) { if (text.includes(kw)) { isTriggered = true; break; } }
             }
 
             let mentionedByAt = false;
