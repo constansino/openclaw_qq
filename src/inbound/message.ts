@@ -346,54 +346,83 @@ export async function handleQQInboundMessage(ctx: any): Promise<void> {
             });
 
             const deliver = async (payload: any) => {
+                 const sendDelayMs = Math.max(0, Number(config.blankLineSplitDelayMs ?? config.rateLimitMs ?? 1000));
+
                  const send = async (msg: string) => {
                      let processed = msg;
                      if (config.formatMarkdown) processed = stripMarkdown(processed);
                      if (config.antiRiskMode) processed = processAntiRisk(processed);
                      processed = await resolveInlineCqRecord(processed);
-                     const chunks = splitMessage(processed, config.maxMessageLength || 4000);
-                     for (let i = 0; i < chunks.length; i++) {
-                         let chunk = chunks[i];
-                         if (isGroup && i === 0) chunk = `[CQ:at,qq=${userId}] ${chunk}`;
-                         
-                         if (isGroup) client.sendGroupMsg(groupId, chunk);
-                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, chunk);
-                         else client.sendPrivateMsg(userId, chunk);
-                         
-                         if (!isGuild && config.enableTTS && i === 0 && chunk.length < 100) {
-                             const tts = chunk.replace(/\[CQ:.*?\]/g, "").trim();
-                             if (tts) { 
-                                 if (isGroup) client.sendGroupMsg(groupId, `[CQ:tts,text=${tts}]`); 
-                                 else client.sendPrivateMsg(userId, `[CQ:tts,text=${tts}]`); 
-                             }
-                         }
-                         
-                         if (chunks.length > 1 && config.rateLimitMs > 0) await sleep(config.rateLimitMs);
+
+                     const paragraphParts = processed
+                        .split(/\n\s*\n+/)
+                        .map((part) => part.trim())
+                        .filter(Boolean);
+                     const sendUnits = paragraphParts.length > 0 ? paragraphParts : [processed.trim() || processed];
+                     const outboundChunks: string[] = [];
+                     for (const unit of sendUnits) {
+                        outboundChunks.push(...splitMessage(unit, config.maxMessageLength || 4000));
+                     }
+
+                     let ttsSent = false;
+                     for (let idx = 0; idx < outboundChunks.length; idx++) {
+                        let chunk = outboundChunks[idx];
+                        if (isGroup && idx === 0) chunk = `[CQ:at,qq=${userId}] ${chunk}`;
+
+                        if (isGroup) client.sendGroupMsg(groupId, chunk);
+                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, chunk);
+                        else client.sendPrivateMsg(userId, chunk);
+
+                        if (!isGuild && config.enableTTS && !ttsSent && chunk.length < 100) {
+                            const tts = chunk.replace(/\[CQ:.*?\]/g, "").trim();
+                            if (tts) {
+                                if (isGroup) client.sendGroupMsg(groupId, `[CQ:tts,text=${tts}]`);
+                                else client.sendPrivateMsg(userId, `[CQ:tts,text=${tts}]`);
+                                ttsSent = true;
+                            }
+                        }
+
+                        if (idx < outboundChunks.length - 1 && sendDelayMs > 0) await sleep(sendDelayMs);
                      }
                  };
+
+                 const sendFileMessage = async (msg: string) => {
+                    if (isGroup) client.sendGroupMsg(groupId, msg);
+                    else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, msg);
+                    else client.sendPrivateMsg(userId, msg);
+                    if (sendDelayMs > 0) await sleep(sendDelayMs);
+                 };
+
+                 const files = Array.isArray(payload.files) ? payload.files.filter((f: any) => Boolean(f?.url)) : [];
+                 const sendImageAlone = Boolean(config.sendImageAlone ?? false);
+
+                 if (payload.text && files.length > 0 && !sendImageAlone) {
+                    const first = files[0];
+                    const firstUrl = await resolveMediaUrl(first.url);
+                    if (isImageFile(firstUrl)) {
+                        await send(`${payload.text}\n[CQ:image,file=${firstUrl}]`);
+                        for (let i = 1; i < files.length; i++) {
+                            const f = files[i];
+                            const url = await resolveMediaUrl(f.url);
+                            if (isImageFile(url)) await sendFileMessage(`[CQ:image,file=${url}]`);
+                            else if (isAudioFile(url) || isAudioFile(f.url)) {
+                                if (isGuild) await sendFileMessage(`[语音] ${url}`);
+                                else await sendFileMessage(`[CQ:record,file=${url}]`);
+                            } else await sendFileMessage(`[CQ:file,file=${url},name=${f.name || 'file'}]`);
+                        }
+                        return;
+                    }
+                 }
+
                  if (payload.text) await send(payload.text);
-                 if (payload.files) {
-                     for (const f of payload.files) { 
-                         if (f.url) { 
-                             const url = await resolveMediaUrl(f.url);
-                             if (isImageFile(url)) {
-                                 const imgMsg = `[CQ:image,file=${url}]`;
-                                 if (isGroup) client.sendGroupMsg(groupId, imgMsg);
-                                 else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, imgMsg);
-                                 else client.sendPrivateMsg(userId, imgMsg);
-                             } else if (isAudioFile(url) || isAudioFile(f.url)) {
-                                 const audioMsg = `[CQ:record,file=${url}]`;
-                                 if (isGroup) client.sendGroupMsg(groupId, audioMsg);
-                                 else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, `[语音] ${url}`);
-                                 else client.sendPrivateMsg(userId, audioMsg);
-                             } else {
-                                 const txtMsg = `[CQ:file,file=${url},name=${f.name || 'file'}]`;
-                                 if (isGroup) client.sendGroupMsg(groupId, txtMsg);
-                                 else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, `[文件] ${url}`);
-                                 else client.sendPrivateMsg(userId, txtMsg);
-                             }
-                             if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
-                         } 
+                 if (files.length > 0) {
+                     for (const f of files) {
+                         const url = await resolveMediaUrl(f.url);
+                         if (isImageFile(url)) await sendFileMessage(`[CQ:image,file=${url}]`);
+                         else if (isAudioFile(url) || isAudioFile(f.url)) {
+                             if (isGuild) await sendFileMessage(`[语音] ${url}`);
+                             else await sendFileMessage(`[CQ:record,file=${url}]`);
+                         } else await sendFileMessage(`[CQ:file,file=${url},name=${f.name || 'file'}]`);
                      }
                  }
             };

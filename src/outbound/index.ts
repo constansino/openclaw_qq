@@ -60,6 +60,8 @@ export function createQQOutbound(opts: {
       const hasText = Boolean(text && text.trim());
       const textValue = text?.trim() || "";
 
+      const sendImageAlone = Boolean(runtimeCfg.sendImageAlone ?? false);
+
       const audioLikeSource = isAudioFile(mediaUrl);
       let stagedAudioFile: string | null = null;
       if (audioLikeSource && hostSharedDir) {
@@ -107,24 +109,29 @@ export function createQQOutbound(opts: {
         return message;
       };
 
-      // Try old behavior first: send text + media in a single QQ message.
-      const combinedMessage: OneBotMessage = [];
-      if (replyTo) combinedMessage.push({ type: "reply", data: { id: String(replyTo) } });
-      if (hasText) combinedMessage.push({ type: "text", data: { text: textValue } });
-      combinedMessage.push(...(await buildMediaOnlyMessage()));
+      const preferCombined = !(sendImageAlone && imageLike && hasText);
+      let combinedAck: { ok: boolean; data?: any; error?: string } = { ok: false, error: "combined-disabled" };
 
-      const combinedAck = await sendOneBotMessageWithAck(client, to, combinedMessage);
-      if (combinedAck.ok) {
-        return {
-          channel: "qq",
-          sent: true,
-          textSent: hasText,
-          mediaSent: true,
-          messageId: combinedAck.data?.message_id ?? combinedAck.data?.messageId ?? null,
-        };
+      if (preferCombined) {
+        // Old behavior: send text + media in a single QQ message.
+        const combinedMessage: OneBotMessage = [];
+        if (replyTo) combinedMessage.push({ type: "reply", data: { id: String(replyTo) } });
+        if (hasText) combinedMessage.push({ type: "text", data: { text: textValue } });
+        combinedMessage.push(...(await buildMediaOnlyMessage()));
+
+        combinedAck = await sendOneBotMessageWithAck(client, to, combinedMessage);
+        if (combinedAck.ok) {
+          return {
+            channel: "qq",
+            sent: true,
+            textSent: hasText,
+            mediaSent: true,
+            messageId: combinedAck.data?.message_id ?? combinedAck.data?.messageId ?? null,
+          };
+        }
       }
 
-      // Fallback path: split text/media only if combined send fails.
+      // Split text/media when combined is disabled or failed.
       let textAck: any = null;
       if (hasText) {
         const textOnly: OneBotMessage = [];

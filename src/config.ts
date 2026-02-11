@@ -93,6 +93,8 @@ export const QQConfigSchema = z.object({
   sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),
   enableGuilds: BooleanInputSchema(true).describe("是否启用 QQ 频道（Guild）支持。"),
   rateLimitMs: NumberInputSchema(1000).describe("多段消息发送间隔（毫秒）。建议 1000。"),
+  sendImageAlone: BooleanInputSchema(false).describe("图片分开发送。false=文本和图片尽量合并在一条消息里；true=图片单独发送。"),
+  blankLineSplitDelayMs: NumberInputSchema(1000).describe("当回复中出现空行分段时，相邻消息发送间隔（毫秒）。默认 1000。"),
 }).passthrough();
 
 export type QQConfig = z.infer<typeof QQConfigSchema>;
