@@ -32,3 +32,6 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Runtime data
+deploy/napcat/napcat/
