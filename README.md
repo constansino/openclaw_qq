@@ -316,6 +316,13 @@ A: 通常是 `requireMention` 被设成了 `false`。在该模式下，群内普
 A: 这是 `historyLimit` 的行为。当前版本默认 `0`，即不额外拼接群历史，主要依赖 OpenClaw 会话系统管理上下文（更接近 Telegram 行为）。
 如果你把 `historyLimit` 设为 `>0`，插件会在每次群聊请求里附加最近 N 条原文消息。
 
+
+**Q: 怎么判断机器人是在忙还是已经空闲？**
+A: 默认已开启 `showProcessingStatus=true`。机器人执行任务时会临时把群名片改为 `yezi(输入中)`，任务结束会自动恢复原名。
+另外可用管理员命令 `/status` 查看 `ActiveTasks`：
+- `ActiveTasks > 0`：仍在执行中
+- `ActiveTasks = 0`：当前空闲，需要新指令才会继续
+
 ## 🆕 近期改进
 
 *   修复 `admins` 逻辑：`admins` 现在仅控制管理员指令权限，不再拦截普通群消息。

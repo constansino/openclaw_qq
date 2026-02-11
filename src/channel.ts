@@ -752,6 +752,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 busid?: string;
                 size?: number;
             }> = [];
+            const imageHints: string[] = [];
             
             if (Array.isArray(event.message)) {
                 let resolvedText = "";
@@ -772,7 +773,38 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         }
                         resolvedText += ` @${name} `;
                     } else if (seg.type === "record") resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
-                    else if (seg.type === "image") resolvedText += " [图片]";
+                    else if (seg.type === "image") {
+                        let imageUrl: string | undefined;
+                        const segUrl = typeof seg.data?.url === "string" ? seg.data.url.trim() : "";
+                        if (segUrl && (segUrl.startsWith("http") || segUrl.startsWith("base64://") || segUrl.startsWith("file:"))) {
+                            imageUrl = segUrl;
+                        }
+                        if (!imageUrl && typeof seg.data?.file === "string") {
+                            const fileRef = seg.data.file.trim();
+                            if (fileRef.startsWith("http") || fileRef.startsWith("base64://") || fileRef.startsWith("file:")) {
+                                imageUrl = fileRef;
+                            } else if (fileRef.length > 0) {
+                                try {
+                                    const info = await (client as any).sendWithResponse("get_image", { file: fileRef });
+                                    const resolved = typeof info?.url === "string"
+                                        ? info.url
+                                        : (typeof info?.file === "string" ? info.file : undefined);
+                                    if (resolved) {
+                                        imageUrl = resolved.startsWith("/") ? `file://${resolved}` : resolved;
+                                        seg.data.url = imageUrl;
+                                    }
+                                } catch (err) {
+                                    console.warn(`[QQ] Failed to resolve image URL via get_image: ${String(err)}`);
+                                }
+                            }
+                        }
+                        if (imageUrl) {
+                            imageHints.push(imageUrl);
+                            resolvedText += ` [图片: ${imageUrl}]`;
+                        } else {
+                            resolvedText += " [图片]";
+                        }
+                    }
                     else if (seg.type === "video") resolvedText += " [视频消息]";
                     else if (seg.type === "json") resolvedText += " [卡片消息]";
                     else if (seg.type === "forward" && seg.data?.id) {
@@ -858,6 +890,15 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             const replyMsgId = getReplyMessageId(event.message, text);
             if (replyMsgId) {
                 try { repliedMsg = await client.getMsg(replyMsgId); } catch (err) {}
+            }
+
+            if (repliedMsg) {
+                try {
+                    const replyImageUrls = extractImageUrls(Array.isArray(repliedMsg.message) ? repliedMsg.message : repliedMsg.raw_message, 5);
+                    for (const imageUrl of replyImageUrls) {
+                        if (imageUrl && !imageHints.includes(imageUrl)) imageHints.push(imageUrl);
+                    }
+                } catch {}
             }
 
             if (fileHints.length === 0 && repliedMsg) {
@@ -1052,7 +1093,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             let systemBlock = "";
             if (config.systemPrompt) systemBlock += `<system>${config.systemPrompt}</system>\n\n`;
             if (historyContext) systemBlock += `<history>\n${historyContext}\n</history>\n\n`;
-            if (fileHints.length > 0) {
+            if (fileHints.length > 0 || imageHints.length > 0) {
                 systemBlock += `<attachments>\n`;
                 for (const hint of fileHints) {
                     const parts = [`name=${hint.name}`];
@@ -1062,9 +1103,17 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     if (hint.size !== undefined) parts.push(`size=${hint.size}`);
                     systemBlock += `- qq_file ${parts.join(" ")}\n`;
                 }
+                for (const imageUrl of imageHints.slice(0, 5)) {
+                    systemBlock += `- qq_image url=${imageUrl}\n`;
+                }
                 systemBlock += `</attachments>\n\n`;
             }
             bodyWithReply = systemBlock + bodyWithReply;
+
+            const inboundMediaUrls = Array.from(new Set([
+                ...extractImageUrls(event.message),
+                ...imageHints,
+            ])).slice(0, 5);
 
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                 Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
@@ -1072,7 +1121,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                 Surface: "qq",
                 OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: true,
-                ...(extractImageUrls(event.message).length > 0 && { MediaUrls: extractImageUrls(event.message) }),
+                ...(inboundMediaUrls.length > 0 && { MediaUrls: inboundMediaUrls }),
                 ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
             });
             

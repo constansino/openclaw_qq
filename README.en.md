@@ -314,6 +314,13 @@ A: Most likely `requireMention` is set to `false`. In that mode, normal group me
 A: That is controlled by `historyLimit`. Current default is `0`, meaning no extra group-history injection; context is mainly managed by OpenClaw session system (closer to Telegram behavior).
 If you set `historyLimit > 0`, the plugin appends recent raw group messages on each group request.
 
+
+**Q: How can I tell whether the bot is busy or idle?**
+A: `showProcessingStatus=true` is enabled by default. While running a task, the bot temporarily changes its group card to `yezi(输入中)`, then restores it after completion.
+You can also use admin command `/status` and check `ActiveTasks`:
+- `ActiveTasks > 0`: still processing
+- `ActiveTasks = 0`: idle now, a new instruction is required to continue
+
 ## 🆕 Recent Improvements
 
 * Fixed `admins` logic: `admins` now controls admin-command permissions only and no longer blocks normal group messages.
