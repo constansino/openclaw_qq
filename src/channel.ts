@@ -1027,8 +1027,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
          const mediaMessage: OneBotMessage = [];
          if (replyTo && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyTo) } });
-         const imageLike = isImageFile(mediaUrl) || isImageFile(finalUrl) || finalUrl.startsWith("base64://");
-         const audioLike = isAudioFile(mediaUrl) || isAudioFile(finalUrl);
+         const sourceAudioLike = isAudioFile(mediaUrl);
+         const sourceImageLike = isImageFile(mediaUrl);
+         const audioLike = sourceAudioLike || isAudioFile(finalUrl);
+         const imageLike = !audioLike && (sourceImageLike || isImageFile(finalUrl) || finalUrl.startsWith("base64://"));
 
          if (audioLike && textAck) {
              const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
