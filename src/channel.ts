@@ -269,6 +269,19 @@ function buildTaskKey(accountId: string, isGroup: boolean, isGuild: boolean, gro
     return `${accountId}:dm:${String(userId ?? "unknown")}`;
 }
 
+function stripTrailingBusySuffixes(card: string, busySuffix: string): string {
+    const normalized = (card || "").trim();
+    const suffix = (busySuffix || "输入中").trim();
+    if (!normalized || !suffix) return normalized;
+
+    const marker = `(${suffix})`;
+    let result = normalized;
+    while (result.endsWith(marker)) {
+        result = result.slice(0, -marker.length).trimEnd();
+    }
+    return result.trim();
+}
+
 function countActiveTasksForAccount(accountId: string): number {
     let count = 0;
     const prefix = `${accountId}:`;
@@ -290,9 +303,10 @@ async function setGroupTypingCard(client: OneBotClient, accountId: string, group
 
     try {
         const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: selfId, no_cache: true });
-        const baseCard = (info?.card || info?.nickname || "").trim();
-        groupBaseCards.set(groupKey, baseCard);
         const suffix = (busySuffix || "输入中").trim();
+        const currentCard = (info?.card || info?.nickname || "").trim();
+        const baseCard = stripTrailingBusySuffixes(currentCard, suffix);
+        groupBaseCards.set(groupKey, baseCard);
         const nextCard = baseCard ? `${baseCard}(${suffix})` : `(${suffix})`;
         client.setGroupCard(groupId, selfId, nextCard);
     } catch (err) {
@@ -307,7 +321,8 @@ function clearGroupTypingCard(client: OneBotClient, accountId: string, groupId: 
     const current = groupBusyCounters.get(groupKey) || 0;
     if (current <= 1) {
         groupBusyCounters.delete(groupKey);
-        const baseCard = groupBaseCards.get(groupKey) || "";
+        const suffix = "输入中";
+        const baseCard = stripTrailingBusySuffixes(groupBaseCards.get(groupKey) || "", suffix);
         groupBaseCards.delete(groupKey);
         try {
             client.setGroupCard(groupId, selfId, baseCard);
