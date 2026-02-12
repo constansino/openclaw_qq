@@ -851,6 +851,24 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             if (isGroup && allowedGroupIds.length && !allowedGroupIds.includes(groupId)) return;
             
             const isAdmin = adminIds.includes(userId);
+            const commandTextCandidate = Array.isArray(event.message)
+                ? event.message
+                    .filter((seg) => seg?.type === "text")
+                    .map((seg) => String(seg.data?.text || ""))
+                    .join(" ")
+                    .trim()
+                : text.trim();
+
+            let forceTriggered = false;
+            if (isGroup && /^\/models\b/i.test(commandTextCandidate)) {
+                if (!isAdmin) return;
+                text = commandTextCandidate.replace(/^\/models\b/i, "/model list").trim();
+                forceTriggered = true;
+            } else if (isGroup && /^\/model\b/i.test(commandTextCandidate)) {
+                if (!isAdmin) return;
+                text = commandTextCandidate;
+                forceTriggered = true;
+            }
 
             if (!isGuild && isAdmin && text.trim().startsWith('/')) {
                 const parts = text.trim().split(/\s+/);
@@ -951,7 +969,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                  } catch (e) {}
             }
 
-            let isTriggered = !isGroup || text.includes("[动作] 用户戳了你一下");
+            let isTriggered = forceTriggered || !isGroup || text.includes("[动作] 用户戳了你一下");
             const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
             if (!isTriggered && keywordTriggers.length > 0) {
                 for (const kw of keywordTriggers) { if (text.includes(kw)) { isTriggered = true; break; } }
