@@ -1,20 +1,17 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   type ChannelPlugin,
   type ChannelAccountSnapshot,
   buildChannelConfigSchema,
   DEFAULT_ACCOUNT_ID,
   normalizeAccountId,
-  type ReplyPayload,
   applyAccountNameToChannelSection,
   migrateBaseNameToDefaultAccount,
 } from "openclaw/plugin-sdk";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime } from "./runtime.js";
-import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
+import { createQQOutbound } from "./outbound/index.js";
+import { handleQQInboundMessage } from "./inbound/message.js";
 
 export type ResolvedQQAccount = ChannelAccountSnapshot & {
   config: QQConfig;
@@ -34,86 +31,6 @@ function getCachedMemberName(groupId: string, userId: string): string | null {
 
 function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
-}
-
-function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = 3): string[] {
-  const urls: string[] = [];
-  
-  if (Array.isArray(message)) {
-    for (const segment of message) {
-      if (segment.type === "image") {
-        const url = segment.data?.url || (typeof segment.data?.file === 'string' && (segment.data.file.startsWith('http') || segment.data.file.startsWith('base64://')) ? segment.data.file : undefined);
-        if (url) {
-          urls.push(url);
-          if (urls.length >= maxImages) break;
-        }
-      }
-    }
-  } else if (typeof message === "string") {
-    const imageRegex = /\[CQ:image,[^\]]*(?:url|file)=([^,\]]+)[^\]]*\]/g;
-    let match;
-    while ((match = imageRegex.exec(message)) !== null) {
-      const val = match[1].replace(/&amp;/g, "&");
-      if (val.startsWith("http") || val.startsWith("base64://")) {
-        urls.push(val);
-        if (urls.length >= maxImages) break;
-      }
-    }
-  }
-  
-  return urls;
-}
-
-function cleanCQCodes(text: string | undefined): string {
-  if (!text) return "";
-  
-  let result = text;
-  const imageUrls: string[] = [];
-  
-  // Match both url= and file= if they look like URLs
-  const imageRegex = /\[CQ:image,[^\]]*(?:url|file)=([^,\]]+)[^\]]*\]/g;
-  let match;
-  while ((match = imageRegex.exec(text)) !== null) {
-    const val = match[1].replace(/&amp;/g, "&");
-    if (val.startsWith("http")) {
-      imageUrls.push(val);
-    }
-  }
-
-  result = result.replace(/\[CQ:face,id=(\d+)\]/g, "[表情]");
-  
-  result = result.replace(/\[CQ:[^\]]+\]/g, (match) => {
-    if (match.startsWith("[CQ:image")) {
-      return "[图片]";
-    }
-    return "";
-  });
-  
-  result = result.replace(/\s+/g, " ").trim();
-  
-  if (imageUrls.length > 0) {
-    result = result ? `${result} [图片: ${imageUrls.join(", ")}]` : `[图片: ${imageUrls.join(", ")}]`;
-  }
-  
-  return result;
-}
-
-function getReplyMessageId(message: OneBotMessage | string | undefined, rawMessage?: string): string | null {
-  if (message && typeof message !== "string") {
-    for (const segment of message) {
-      if (segment.type === "reply" && segment.data?.id) {
-        const id = String(segment.data.id).trim();
-        if (id && /^-?\d+$/.test(id)) {
-          return id;
-        }
-      }
-    }
-  }
-  if (rawMessage) {
-    const match = rawMessage.match(/\[CQ:reply,id=(\d+)\]/);
-    if (match) return match[1];
-  }
-  return null;
 }
 
 function normalizeTarget(raw: string): string {
@@ -267,199 +184,7 @@ function getClientForAccount(accountId: string | undefined | null) {
     return undefined;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function isImageFile(url: string): boolean {
-    const lower = url.toLowerCase();
-    return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
-}
-
-function isAudioFile(url: string): boolean {
-    const lower = url.toLowerCase();
-    return lower.endsWith('.wav') || lower.endsWith('.mp3') || lower.endsWith('.m4a') || lower.endsWith('.ogg') || lower.endsWith('.flac') || lower.endsWith('.aac');
-}
-
-async function findRecentAudioFallback(preferredExt?: string): Promise<string | null> {
-    const home = process.env.HOME;
-    if (!home) return null;
-    const fallbackDir = path.join(home, ".openclaw", "workspace", "voicevox_output");
-    try {
-        const entries = await fs.readdir(fallbackDir, { withFileTypes: true });
-        const candidates = entries
-            .filter((entry) => entry.isFile())
-            .map((entry) => path.join(fallbackDir, entry.name))
-            .filter((filePath) => isAudioFile(filePath));
-        if (candidates.length === 0) return null;
-
-        const preferred = preferredExt ? candidates.filter((filePath) => filePath.toLowerCase().endsWith(preferredExt.toLowerCase())) : [];
-        const pool = preferred.length > 0 ? preferred : candidates;
-
-        let bestPath: string | null = null;
-        let bestMtime = 0;
-        for (const filePath of pool) {
-            const stat = await fs.stat(filePath);
-            const mtime = stat.mtimeMs || 0;
-            if (mtime > bestMtime) {
-                bestMtime = mtime;
-                bestPath = filePath;
-            }
-        }
-        return bestPath;
-    } catch {
-        return null;
-    }
-}
-
-async function readLocalFileAsBase64(localPath: string): Promise<string> {
-    const data = await fs.readFile(localPath);
-    return `base64://${data.toString("base64")}`;
-}
-
-async function ensureFileInSharedMedia(localPath: string, hostSharedDir: string): Promise<string> {
-    const ext = path.extname(localPath) || ".dat";
-    const baseName = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}${ext}`;
-    await fs.mkdir(hostSharedDir, { recursive: true });
-    const destPath = path.join(hostSharedDir, baseName);
-    await fs.copyFile(localPath, destPath);
-    return baseName;
-}
-
-function toLocalPathIfAny(value: string): string | null {
-    if (!value) return null;
-    if (value.startsWith("file:")) {
-        try {
-            return fileURLToPath(value);
-        } catch {
-            return null;
-        }
-    }
-    if (
-        value.startsWith("/") ||
-        value.startsWith("./") ||
-        value.startsWith("../") ||
-        /^[A-Za-z]:[\\/]/.test(value)
-    ) {
-        return path.isAbsolute(value) ? value : path.resolve(process.cwd(), value);
-    }
-    return null;
-}
-
-function splitMessage(text: string, limit: number): string[] {
-    if (text.length <= limit) return [text];
-    const chunks = [];
-    let current = text;
-    while (current.length > 0) {
-        chunks.push(current.slice(0, limit));
-        current = current.slice(limit);
-    }
-    return chunks;
-}
-
-function stripMarkdown(text: string): string {
-    return text
-        .replace(/\*\*(.*?)\*\*/g, "$1") // Bold
-        .replace(/\*(.*?)\*/g, "$1")     // Italic
-        .replace(/`(.*?)`/g, "$1")       // Inline code
-        .replace(/#+\s+(.*)/g, "$1")     // Headers
-        .replace(/\[(.*?)\]\(.*?\)/g, "$1") // Links
-        .replace(/^\s*>\s+(.*)/gm, "▎$1") // Blockquotes
-        .replace(/```[\s\S]*?```/g, "[代码块]") // Code blocks
-        .replace(/^\|.*\|$/gm, (match) => { // Simple table row approximation
-             return match.replace(/\|/g, " ").trim();
-        })
-        .replace(/^[\-\*]\s+/gm, "• "); // Lists
-}
-
-function processAntiRisk(text: string): string {
-    return text.replace(/(https?:\/\/)/gi, "$1 ");
-}
-
-async function resolveMediaUrl(url: string): Promise<string> {
-    if (url.startsWith("file:")) {
-        try {
-            const localPath = fileURLToPath(url);
-            return await readLocalFileAsBase64(localPath);
-        } catch (e) {
-            const preferredExt = path.extname(url);
-            const fallback = await findRecentAudioFallback(preferredExt);
-            if (fallback) {
-                try {
-                    console.warn(`[QQ] Local media missing, fallback to recent audio: ${fallback}`);
-                    return await readLocalFileAsBase64(fallback);
-                } catch {}
-            }
-            console.warn(`[QQ] Failed to convert local file to base64: ${e}`);
-            return url;
-        }
-    }
-
-    const looksLocalPath =
-      url.startsWith("/") ||
-      url.startsWith("./") ||
-      url.startsWith("../") ||
-      /^[A-Za-z]:[\\/]/.test(url);
-    if (looksLocalPath) {
-        try {
-            const absolutePath = path.isAbsolute(url) ? url : path.resolve(process.cwd(), url);
-            return await readLocalFileAsBase64(absolutePath);
-        } catch (e) {
-            if (isAudioFile(url)) {
-                const preferredExt = path.extname(url);
-                const fallback = await findRecentAudioFallback(preferredExt);
-                if (fallback) {
-                    try {
-                        console.warn(`[QQ] Local audio path unavailable, fallback to ${fallback}`);
-                        return await readLocalFileAsBase64(fallback);
-                    } catch {}
-                }
-            }
-            console.warn(`[QQ] Failed to read local media path for base64 conversion: ${url} (${e})`);
-            return url;
-        }
-    }
-
-    return url;
-}
-
-async function resolveInlineCqRecord(text: string): Promise<string> {
-    const regex = /\[CQ:record,([^\]]*)\]/g;
-    let result = text;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(text)) !== null) {
-        const whole = match[0];
-        const params = match[1];
-        const fileMatch = params.match(/(?:^|,)file=([^,]+)/);
-        if (!fileMatch) continue;
-        const rawFile = fileMatch[1].trim();
-        const decoded = rawFile.replace(/&amp;/g, "&");
-        const converted = await resolveMediaUrl(decoded);
-        if (converted === decoded) continue;
-        const nextParams = params.replace(fileMatch[1], converted);
-        result = result.replace(whole, `[CQ:record,${nextParams}]`);
-    }
-    return result;
-}
-
-async function sendOneBotMessageWithAck(client: OneBotClient, to: string, message: OneBotMessage | string): Promise<{ ok: boolean; data?: any; error?: string }> {
-    try {
-        if (to.startsWith("group:")) {
-            const data = await client.sendGroupMsgAck(parseInt(to.replace("group:", ""), 10), message);
-            return { ok: true, data };
-        }
-        if (to.startsWith("guild:")) {
-            const parts = to.split(":");
-            if (parts.length >= 3) {
-                const data = await client.sendGuildChannelMsgAck(parts[1], parts[2], message);
-                return { ok: true, data };
-            }
-            return { ok: false, error: `Invalid guild target: ${to}` };
-        }
-        const data = await client.sendPrivateMsgAck(parseInt(to, 10), message);
-        return { ok: true, data };
-    } catch (err) {
-        return { ok: false, error: String(err) };
-    }
-}
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
   id: "qq",
@@ -707,122 +432,29 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         });
 
         client.on("message", async (event) => {
-          try {
-            if (event.post_type === "meta_event") {
-                 if (event.meta_event_type === "lifecycle" && event.sub_type === "connect" && event.self_id) client.setSelfId(event.self_id);
-                 return;
-            }
-
-            if (event.post_type === "notice" && event.notice_type === "notify" && event.sub_type === "poke") {
-                if (String(event.target_id) === String(client.getSelfId())) {
-                    event.post_type = "message";
-                    event.message_type = event.group_id ? "group" : "private";
-                    event.raw_message = `[动作] 用户戳了你一下`;
-                    event.message = [{ type: "text", data: { text: event.raw_message } }];
-                } else return;
-            }
-
-            if (event.post_type !== "message") return;
-            
-            // 2. Dynamic self-message filtering
-            const selfId = client.getSelfId() || event.self_id;
-            if (selfId && String(event.user_id) === String(selfId)) return;
-
-            if (config.enableDeduplication !== false && event.message_id) {
-                const msgIdKey = String(event.message_id);
-                if (processedMsgIds.has(msgIdKey)) return;
-                processedMsgIds.add(msgIdKey);
-            }
-
-            const isGroup = event.message_type === "group";
-            const isGuild = event.message_type === "guild";
-            
-            if (isGuild && !config.enableGuilds) return;
-
-            const userId = event.user_id;
-            const groupId = event.group_id;
-            const guildId = event.guild_id;
-            const channelId = event.channel_id;
-            
-            let text = event.raw_message || "";
-            const fileHints: Array<{
-                name: string;
-                url?: string;
-                fileId?: string;
-                busid?: string;
-                size?: number;
-            }> = [];
-            const imageHints: string[] = [];
-            
-            if (Array.isArray(event.message)) {
-                let resolvedText = "";
-                for (const seg of event.message) {
-                    if (seg.type === "text") resolvedText += seg.data?.text || "";
-                    else if (seg.type === "at") {
-                        let name = seg.data?.qq;
-                        if (name !== "all" && isGroup) {
-                            const cached = getCachedMemberName(String(groupId), String(name));
-                            if (cached) name = cached;
-                            else {
-                                try {
-                                    const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: name });
-                                    name = info?.card || info?.nickname || name;
-                                    setCachedMemberName(String(groupId), String(seg.data.qq), name);
-                                } catch (e) {}
-                            }
-                        }
-                        resolvedText += ` @${name} `;
-                    } else if (seg.type === "record") resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
-                    else if (seg.type === "image") {
-                        let imageUrl: string | undefined;
-                        const segUrl = typeof seg.data?.url === "string" ? seg.data.url.trim() : "";
-                        if (segUrl && (segUrl.startsWith("http") || segUrl.startsWith("base64://") || segUrl.startsWith("file:"))) {
-                            imageUrl = segUrl;
-                        }
-                        if (!imageUrl && typeof seg.data?.file === "string") {
-                            const fileRef = seg.data.file.trim();
-                            if (fileRef.startsWith("http") || fileRef.startsWith("base64://") || fileRef.startsWith("file:")) {
-                                imageUrl = fileRef;
-                            } else if (fileRef.length > 0) {
-                                try {
-                                    const info = await (client as any).sendWithResponse("get_image", { file: fileRef });
-                                    const resolved = typeof info?.url === "string"
-                                        ? info.url
-                                        : (typeof info?.file === "string" ? info.file : undefined);
-                                    if (resolved) {
-                                        imageUrl = resolved.startsWith("/") ? `file://${resolved}` : resolved;
-                                        seg.data.url = imageUrl;
-                                    }
-                                } catch (err) {
-                                    console.warn(`[QQ] Failed to resolve image URL via get_image: ${String(err)}`);
-                                }
-                            }
-                        }
-                        if (imageUrl) {
-                            imageHints.push(imageUrl);
-                            resolvedText += ` [图片: ${imageUrl}]`;
-                        } else {
-                            resolvedText += " [图片]";
-                        }
-                    }
-                    else if (seg.type === "video") resolvedText += " [视频消息]";
-                    else if (seg.type === "json") resolvedText += " [卡片消息]";
-                    else if (seg.type === "forward" && seg.data?.id) {
-                        try {
-                            const forwardData = await client.getForwardMsg(seg.data.id);
-                            if (forwardData?.messages) {
-                                resolvedText += "\n[转发聊天记录]:";
-                                for (const m of forwardData.messages.slice(0, 10)) {
-                                    resolvedText += `\n${m.sender?.nickname || m.user_id}: ${cleanCQCodes(m.content || m.raw_message)}`;
-                                }
-                            }
-                        } catch (e) {}
-                    } else if (seg.type === "file") {
-                         if (!seg.data?.url && isGroup) {
-                             try {
-                                 const info = await (client as any).sendWithResponse("get_group_file_url", { group_id: groupId, file_id: seg.data?.file_id, busid: seg.data?.busid });
-                                 if (info?.url) seg.data.url = info.url;
-                             } catch(e) {}
+          await handleQQInboundMessage({
+            event,
+            client,
+            config,
+            processedMsgIds,
+            blockedUserIds,
+            allowedGroupIds,
+            adminIds,
+            blockedNotifyCooldownMs,
+            accountId: account.accountId,
+            cfg,
+            getCachedMemberName,
+            setCachedMemberName,
+            countActiveTasksForAccount,
+            parseKeywordTriggersInput,
+            blockedNotifyCache,
+            buildTaskKey,
+            activeTaskIds,
+            setGroupTypingCard,
+            clearGroupTypingCard,
+            sleep,
+          });
+        });
                          }
                          const fileName = seg.data?.name || seg.data?.file || "未命名";
                          const fileId = seg.data?.file_id ? String(seg.data.file_id) : undefined;
@@ -1198,158 +830,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         return { loggedOut: true, cleared: true };
     }
   },
-  outbound: {
-    sendText: async ({ to, text, accountId, replyTo }) => {
-        const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
-        if (!client) return { channel: "qq", sent: false, error: "Client not connected" };
-        const normalizedText = await resolveInlineCqRecord(text);
-        const chunks = splitMessage(normalizedText, 4000);
-        let lastAck: any = null;
-        for (let i = 0; i < chunks.length; i++) {
-            let message: OneBotMessage | string = chunks[i];
-            if (replyTo && i === 0) message = [ { type: "reply", data: { id: String(replyTo) } }, { type: "text", data: { text: chunks[i] } } ];
-            const ack = await sendOneBotMessageWithAck(client, to, message);
-            if (!ack.ok) {
-                return { channel: "qq", sent: false, error: ack.error || "Failed to send text" };
-            }
-            lastAck = ack.data;
-            
-            if (chunks.length > 1) await sleep(1000); 
-        }
-        return { channel: "qq", sent: true, messageId: lastAck?.message_id ?? lastAck?.messageId ?? null };
-    },
-    sendMedia: async ({ to, text, mediaUrl, accountId, replyTo }) => {
-         const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
-         if (!client) return { channel: "qq", sent: false, error: "Client not connected" };
-
-         const runtimeCfg = accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID) || accountConfigs.get(DEFAULT_ACCOUNT_ID) || {};
-
-         const hostSharedDir = typeof runtimeCfg.sharedMediaHostDir === "string" ? runtimeCfg.sharedMediaHostDir.trim() : "";
-         const containerSharedDirRaw = typeof runtimeCfg.sharedMediaContainerDir === "string" ? runtimeCfg.sharedMediaContainerDir.trim() : "";
-         const containerSharedDir = containerSharedDirRaw || "/openclaw_media";
-
-         const audioLikeSource = isAudioFile(mediaUrl);
-         let stagedAudioFile: string | null = null;
-         if (audioLikeSource && hostSharedDir) {
-             const localSourcePath = toLocalPathIfAny(mediaUrl);
-             if (localSourcePath) {
-                 try {
-                     const copiedName = await ensureFileInSharedMedia(localSourcePath, hostSharedDir);
-                     stagedAudioFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                 } catch (err) {
-                     console.warn(`[QQ] Failed to stage source audio into shared media dir: ${String(err)}`);
-                 }
-             }
-         }
-         
-         const finalUrl = await resolveMediaUrl(mediaUrl);
-
-         let textAck: any = null;
-         if (text && text.trim()) {
-             const textMessage: OneBotMessage = [];
-             if (replyTo) textMessage.push({ type: "reply", data: { id: String(replyTo) } });
-             textMessage.push({ type: "text", data: { text } });
-             const ack = await sendOneBotMessageWithAck(client, to, textMessage);
-             if (!ack.ok) {
-                 return { channel: "qq", sent: false, error: `Text send failed: ${ack.error || "unknown"}` };
-             }
-             textAck = ack.data;
-         }
-
-         const mediaMessage: OneBotMessage = [];
-         if (replyTo && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyTo) } });
-         const sourceAudioLike = isAudioFile(mediaUrl);
-         const sourceImageLike = isImageFile(mediaUrl);
-         const audioLike = sourceAudioLike || isAudioFile(finalUrl);
-         const imageLike = !audioLike && (sourceImageLike || isImageFile(finalUrl) || finalUrl.startsWith("base64://"));
-
-         if (audioLike && textAck) {
-             const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
-             const delayMs = Number.isFinite(configuredDelay) ? Math.max(1200, configuredDelay) : 1200;
-             await sleep(delayMs);
-         }
-
-         if (imageLike) mediaMessage.push({ type: "image", data: { file: finalUrl } });
-         else if (audioLike) {
-             let recordFile = stagedAudioFile || finalUrl;
-             if (!finalUrl.startsWith("base64://") && hostSharedDir) {
-                 try {
-                     const localPath = finalUrl.startsWith("file:") ? fileURLToPath(finalUrl) : finalUrl;
-                     const copiedName = await ensureFileInSharedMedia(localPath, hostSharedDir);
-                     recordFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                 } catch (err) {
-                     console.warn(`[QQ] Failed to stage audio into shared media dir: ${String(err)}`);
-                 }
-             }
-             mediaMessage.push({ type: "record", data: { file: recordFile } });
-         }
-         else mediaMessage.push({ type: "file", data: { file: finalUrl } });
-
-         const mediaAck = await sendOneBotMessageWithAck(client, to, mediaMessage);
-         if (!mediaAck.ok) {
-             if (audioLike) {
-                 const fileFallback: OneBotMessage = [];
-                 if (replyTo && !(text && text.trim())) fileFallback.push({ type: "reply", data: { id: String(replyTo) } });
-                 let fallbackFile = stagedAudioFile || finalUrl;
-                 if (fallbackFile.startsWith("base64://")) {
-                     return {
-                         channel: "qq",
-                         sent: Boolean(textAck),
-                         error: `Media send failed: ${mediaAck.error || "unknown"}`,
-                         textSent: Boolean(textAck),
-                         mediaSent: false,
-                         messageId: textAck?.message_id ?? textAck?.messageId ?? null,
-                     };
-                 }
-                 if (!finalUrl.startsWith("base64://") && hostSharedDir) {
-                     try {
-                         const localPath = finalUrl.startsWith("file:") ? fileURLToPath(finalUrl) : finalUrl;
-                         const copiedName = await ensureFileInSharedMedia(localPath, hostSharedDir);
-                         fallbackFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                     } catch (err) {
-                         console.warn(`[QQ] Failed to stage fallback audio file into shared media dir: ${String(err)}`);
-                     }
-                 }
-                 fileFallback.push({ type: "file", data: { file: fallbackFile } });
-                 const fallbackAck = await sendOneBotMessageWithAck(client, to, fileFallback);
-                 if (fallbackAck.ok) {
-                     return {
-                         channel: "qq",
-                         sent: true,
-                         textSent: Boolean(textAck),
-                         mediaSent: false,
-                         fallbackSent: true,
-                         fallbackType: "file",
-                         error: `Audio(record) failed; fallback file sent. reason=${mediaAck.error || "unknown"}`,
-                         messageId: fallbackAck.data?.message_id ?? fallbackAck.data?.messageId ?? textAck?.message_id ?? textAck?.messageId ?? null,
-                     };
-                 }
-             }
-             return {
-                 channel: "qq",
-                 sent: Boolean(textAck),
-                 error: `Media send failed: ${mediaAck.error || "unknown"}`,
-                 textSent: Boolean(textAck),
-                 mediaSent: false,
-                 messageId: textAck?.message_id ?? textAck?.messageId ?? null,
-             };
-         }
-         return {
-             channel: "qq",
-             sent: true,
-             textSent: Boolean(textAck),
-             mediaSent: true,
-             messageId: mediaAck.data?.message_id ?? mediaAck.data?.messageId ?? textAck?.message_id ?? textAck?.messageId ?? null,
-         };
-    },
-    // @ts-ignore
-    deleteMessage: async ({ messageId, accountId }) => {
-        const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
-        if (!client) return { channel: "qq", success: false, error: "Client not connected" };
-        try { client.deleteMsg(messageId); return { channel: "qq", success: true }; }
-        catch (err) { return { channel: "qq", success: false, error: String(err) }; }
-    }
-  },
+  outbound: createQQOutbound({
+      getClientForAccount,
+      accountConfigs,
+      sleep,
+  }),
   messaging: { 
       normalizeTarget,
       targetResolver: {
@@ -1357,5 +842,4 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
           hint: "QQ号, 群号 (group:123), 或频道 (guild:id:channel)",
       }
   },
-  setup: { resolveAccountId: ({ accountId }) => normalizeAccountId(accountId) }
 };
