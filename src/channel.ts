@@ -158,6 +158,7 @@ async function buildModelCatalogText(): Promise<string> {
   return lines.join("\n");
 }
 
+
 function getReplyMessageId(message: OneBotMessage | string | undefined, rawMessage?: string): string | null {
   if (message && typeof message !== "string") {
     for (const segment of message) {
@@ -919,14 +920,17 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     .trim()
                 : text.trim();
 
+            const slashIdx = commandTextCandidate.indexOf('/');
+            const inlineCommand = slashIdx >= 0 ? commandTextCandidate.slice(slashIdx).trim() : "";
+
             let forceTriggered = false;
-            if (isGroup && /^\/models\b/i.test(commandTextCandidate)) {
+            if (isGroup && /^\/models\b/i.test(inlineCommand)) {
                 if (!isAdmin) return;
-                text = commandTextCandidate;
+                text = inlineCommand;
                 forceTriggered = true;
-            } else if (isGroup && /^\/model\b/i.test(commandTextCandidate)) {
+            } else if (isGroup && /^\/model\b/i.test(inlineCommand)) {
                 if (!isAdmin) return;
-                text = commandTextCandidate;
+                text = inlineCommand;
                 forceTriggered = true;
             }
 
