@@ -231,6 +231,7 @@ async function resetSessionByKey(storePath: string, sessionKey: string): Promise
 }
 
 const clients = new Map<string, OneBotClient>();
+const allClientsByAccount = new Map<string, Set<OneBotClient>>();
 const accountConfigs = new Map<string, QQConfig>();
 const blockedNotifyCache = new Map<string, number>();
 const activeTaskIds = new Set<string>();
@@ -343,6 +344,32 @@ const tempSessionSlots = new Map<string, string>();
 const tempSessionHistory = new Map<string, string[]>();
 let tempSessionSlotsLoaded = false;
 let tempSessionSlotsLoading: Promise<void> | null = null;
+const globalProcessedMsgIds = new Set<string>();
+const recentCommandFingerprints = new Map<string, number>();
+const accountStartGeneration = new Map<string, number>();
+let globalProcessedMsgCleanupTimer: NodeJS.Timeout | null = null;
+
+function ensureGlobalProcessedMsgCleanupTimer(): void {
+    if (globalProcessedMsgCleanupTimer) return;
+    globalProcessedMsgCleanupTimer = setInterval(() => {
+        if (globalProcessedMsgIds.size > 5000) {
+            globalProcessedMsgIds.clear();
+        }
+        const now = Date.now();
+        for (const [key, ts] of recentCommandFingerprints.entries()) {
+            if (now - ts > 10_000) {
+                recentCommandFingerprints.delete(key);
+            }
+        }
+    }, 3600000);
+}
+
+function markAndCheckRecentCommandDuplicate(key: string, ttlMs = 2500): boolean {
+    const now = Date.now();
+    const lastTs = recentCommandFingerprints.get(key);
+    recentCommandFingerprints.set(key, now);
+    return typeof lastTs === "number" && now - lastTs <= ttlMs;
+}
 
 function buildTempThreadKey(accountId: string, isGroup: boolean, isGuild: boolean, groupId?: number, guildId?: string, channelId?: string, userId?: number): string {
     if (isGroup && groupId !== undefined) return `${accountId}:group:${groupId}`;
@@ -372,7 +399,7 @@ function getTempSessionHistory(threadKey: string): string[] {
 
 function pushTempHistory(threadKey: string, slot: string): void {
     const prev = tempSessionHistory.get(threadKey) || [];
-    const next = [slot, ...prev.filter((item) => item !== slot)].slice(0, 12);
+    const next = [slot, ...prev.filter((item) => item !== slot)];
     tempSessionHistory.set(threadKey, next);
 }
 
@@ -400,8 +427,7 @@ async function ensureTempSessionSlotsLoaded(): Promise<void> {
                         if (!Array.isArray(values)) continue;
                         const cleaned = values
                             .map((value) => sanitizeTempSlotName(String(value)))
-                            .filter(Boolean)
-                            .slice(0, 12);
+                            .filter(Boolean);
                         if (cleaned.length > 0) tempSessionHistory.set(key, cleaned);
                     }
                 }
@@ -419,6 +445,51 @@ async function ensureTempSessionSlotsLoaded(): Promise<void> {
     })();
     await tempSessionSlotsLoading;
     tempSessionSlotsLoading = null;
+}
+
+async function reloadTempSessionStateFromDisk(): Promise<void> {
+    try {
+        const raw = await fs.readFile(TEMP_SESSION_STATE_FILE, "utf-8");
+        const parsed = JSON.parse(raw) as TempSessionState | Record<string, string>;
+        const nextSlots = new Map<string, string>();
+        const nextHistory = new Map<string, string[]>();
+
+        if (parsed && typeof parsed === "object" && "active" in parsed) {
+            const state = parsed as TempSessionState;
+            if (state.active && typeof state.active === "object") {
+                for (const [key, value] of Object.entries(state.active)) {
+                    const slot = sanitizeTempSlotName(value);
+                    if (slot) nextSlots.set(key, slot);
+                }
+            }
+            if (state.history && typeof state.history === "object") {
+                for (const [key, values] of Object.entries(state.history)) {
+                    if (!Array.isArray(values)) continue;
+                    const cleaned = values
+                        .map((value) => sanitizeTempSlotName(String(value)))
+                        .filter(Boolean);
+                    if (cleaned.length > 0) nextHistory.set(key, cleaned);
+                }
+            }
+        } else if (parsed && typeof parsed === "object") {
+            for (const [key, value] of Object.entries(parsed)) {
+                const slot = sanitizeTempSlotName(String(value));
+                if (!slot) continue;
+                nextSlots.set(key, slot);
+                nextHistory.set(key, [slot]);
+            }
+        } else {
+            return;
+        }
+
+        tempSessionSlots.clear();
+        tempSessionHistory.clear();
+        for (const [key, value] of nextSlots.entries()) tempSessionSlots.set(key, value);
+        for (const [key, values] of nextHistory.entries()) tempSessionHistory.set(key, values);
+        tempSessionSlotsLoaded = true;
+    } catch (err) {
+        console.warn(`[QQ] Failed to reload temp session state from disk: ${String(err)}`);
+    }
 }
 
 async function persistTempSessionSlots(): Promise<void> {
@@ -878,6 +949,23 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
   status: {
       probeAccount: async ({ account, timeoutMs }) => {
           if (!account.config.wsUrl) return { ok: false, error: "Missing wsUrl" };
+
+          const runningClient = clients.get(account.accountId);
+          if (runningClient) {
+              try {
+                  const info = await Promise.race([
+                      runningClient.getLoginInfo(),
+                      new Promise((_, reject) => setTimeout(() => reject(new Error("Probe timeout")), timeoutMs || 5000)),
+                  ]);
+                  const data = info as any;
+                  return {
+                      ok: true,
+                      bot: { id: String(data?.user_id ?? ""), username: data?.nickname },
+                  };
+              } catch (err) {
+                  return { ok: false, error: String(err) };
+              }
+          }
           
           const client = new OneBotClient({
               wsUrl: account.config.wsUrl,
@@ -908,6 +996,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
               
               client.on("error", (err) => {
                   clearTimeout(timer);
+                  client.disconnect();
                   resolve({ ok: false, error: String(err) });
               });
 
@@ -983,6 +1072,8 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
     startAccount: async (ctx) => {
         const { account, cfg } = ctx;
         const config = account.config;
+        const accountGen = (accountStartGeneration.get(account.accountId) || 0) + 1;
+        accountStartGeneration.set(account.accountId, accountGen);
         accountConfigs.set(account.accountId, config);
         const adminIds = [...new Set(parseIdListInput(config.admins as string | number | Array<string | number> | undefined))];
         const allowedGroupIds = [...new Set(parseIdListInput(config.allowedGroups as string | number | Array<string | number> | undefined))];
@@ -992,6 +1083,14 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         if (!config.wsUrl) throw new Error("QQ: wsUrl is required");
 
         // 1. Prevent multiple clients for the same account
+        const existingSet = allClientsByAccount.get(account.accountId);
+        if (existingSet && existingSet.size > 0) {
+            console.log(`[QQ] Disconnecting ${existingSet.size} stale client(s) for account ${account.accountId}`);
+            for (const stale of existingSet) {
+                try { stale.disconnect(); } catch {}
+            }
+            existingSet.clear();
+        }
         const existingClient = clients.get(account.accountId);
         if (existingClient) {
             console.log(`[QQ] Stopping existing client for account ${account.accountId} before restart`);
@@ -1002,15 +1101,21 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             wsUrl: config.wsUrl,
             accessToken: config.accessToken,
         });
+
+        const isStaleGeneration = () => accountStartGeneration.get(account.accountId) !== accountGen;
         
         clients.set(account.accountId, client);
-
-        const processedMsgIds = new Set<string>();
-        const cleanupInterval = setInterval(() => {
-            if (processedMsgIds.size > 1000) processedMsgIds.clear();
-        }, 3600000);
+        const clientSet = allClientsByAccount.get(account.accountId) || new Set<OneBotClient>();
+        clientSet.add(client);
+        allClientsByAccount.set(account.accountId, clientSet);
+        ensureGlobalProcessedMsgCleanupTimer();
 
         client.on("connect", async () => {
+             if (isStaleGeneration()) {
+                console.log(`[QQ] Ignore stale client connect for account ${account.accountId} gen=${accountGen}`);
+                client.disconnect();
+                return;
+             }
              console.log(`[QQ] Connected account ${account.accountId}`);
              try {
                 const info = await client.getLoginInfo();
@@ -1023,6 +1128,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         });
 
         client.on("request", (event) => {
+            if (isStaleGeneration()) return;
             if (config.autoApproveRequests) {
                 if (event.request_type === "friend") client.setFriendAddRequest(event.flag, true);
                 else if (event.request_type === "group") client.setGroupAddRequest(event.flag, event.sub_type, true);
@@ -1031,6 +1137,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
         client.on("message", async (event) => {
           try {
+            if (isStaleGeneration()) return;
             if (event.post_type === "meta_event") {
                  if (event.meta_event_type === "lifecycle" && event.sub_type === "connect" && event.self_id) client.setSelfId(event.self_id);
                  return;
@@ -1052,9 +1159,9 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             if (selfId && String(event.user_id) === String(selfId)) return;
 
             if (config.enableDeduplication !== false && event.message_id) {
-                const msgIdKey = String(event.message_id);
-                if (processedMsgIds.has(msgIdKey)) return;
-                processedMsgIds.add(msgIdKey);
+                const msgIdKey = `${account.accountId}:${event.self_id ?? ""}:${event.message_type ?? ""}:${event.group_id ?? ""}:${event.user_id ?? ""}:${String(event.message_id)}`;
+                if (globalProcessedMsgIds.has(msgIdKey)) return;
+                globalProcessedMsgIds.add(msgIdKey);
             }
 
             const isGroup = event.message_type === "group";
@@ -1187,6 +1294,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
             const slashIdx = commandTextCandidate.indexOf('/');
             const inlineCommand = slashIdx >= 0 ? commandTextCandidate.slice(slashIdx).trim() : "";
+            const normalizedCommandKey = inlineCommand
+                ? `${account.accountId}:${event.message_type ?? ""}:${String(groupId ?? "")}:${String(guildId ?? "")}:${String(channelId ?? "")}:${String(userId ?? "")}:${inlineCommand.replace(/\s+/g, " ").toLowerCase()}`
+                : "";
+            if (normalizedCommandKey && markAndCheckRecentCommandDuplicate(normalizedCommandKey)) {
+                console.log(`[QQ] dropped duplicate command key=${normalizedCommandKey}`);
+                return;
+            }
 
             let forceTriggered = false;
             if (isGroup && /^\/models\b/i.test(inlineCommand)) {
@@ -1295,7 +1409,20 @@ ${current}
                 }
 
                 if (cmd === '/临时列表' || cmd === '/tmplist') {
+                    await reloadTempSessionStateFromDisk();
+                    activeTempSlot = getTempSessionSlot(threadSessionKey);
                     const slots = getTempSessionHistory(threadSessionKey);
+                    console.log(`[QQ] /临时列表 thread=${threadSessionKey} slots=${slots.length}`);
+                    try {
+                        const rawState = await fs.readFile(TEMP_SESSION_STATE_FILE, "utf-8");
+                        const parsedState = JSON.parse(rawState) as TempSessionState;
+                        const diskSlots = Array.isArray(parsedState?.history?.[threadSessionKey])
+                            ? parsedState.history![threadSessionKey]!.length
+                            : 0;
+                        console.error(`[QQDBG] /临时列表 thread=${threadSessionKey} mem=${slots.length} disk=${diskSlots}`);
+                    } catch (err) {
+                        console.error(`[QQDBG] /临时列表 read-state-failed thread=${threadSessionKey} err=${String(err)}`);
+                    }
                     const rendered = slots.length > 0
                         ? slots.map((slot, idx) => `${idx + 1}. ${slot}${slot === activeTempSlot ? ' (当前)' : ''}`).join("\n")
                         : "（暂无）";
@@ -1730,10 +1857,19 @@ ${current}
 
         client.connect();
         return () => { 
-            clearInterval(cleanupInterval);
+            if (accountStartGeneration.get(account.accountId) === accountGen) {
+                accountStartGeneration.set(account.accountId, accountGen + 1);
+            }
             client.disconnect(); 
             clients.delete(account.accountId); 
             accountConfigs.delete(account.accountId);
+            const setForAccount = allClientsByAccount.get(account.accountId);
+            if (setForAccount) {
+                setForAccount.delete(client);
+                if (setForAccount.size === 0) {
+                    allClientsByAccount.delete(account.accountId);
+                }
+            }
         };
     },
     logoutAccount: async ({ accountId, cfg }) => {
