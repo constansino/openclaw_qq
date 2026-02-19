@@ -228,10 +228,13 @@ Only users listed in `admins` can use:
 
 * Temporary session lanes (tmux-like topic split in one group, admin-only):
   * `/临时 <name>` enter/create a temporary lane (example: `/临时 检查ssh`; full phrase is preserved, not reduced to `ssh`).
+  * `/临时重命名 <new-name>` rename the current temporary lane.
   * `/临时状态` show current lane and effective session key.
-  * `/临时列表` list recently used temporary lanes in this group (marks current one).
+  * `/临时列表` list all recorded temporary lanes in this group (no 12-item cap; marks current one).
   * `/退出临时` leave temporary lane and return to main lane (keeps lane data).
   * `/临时结束` clear and end current temporary lane, then return to main lane.
+  * Aliases: `/tmp`, `/tmprename`, `/tmpstatus`, `/tmplist`, `/exittemp`, `/tmpend`.
+  * Current version does not support numeric switching like `/临时 1`; use `/临时 <name>` instead.
 
 * `/status`
   * View bot runtime status (memory usage, connection status, self ID).
