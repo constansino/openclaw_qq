@@ -2,6 +2,14 @@
 OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础的功能。
 <img width="3659" height="1899" alt="PixPin_2026-02-13_02-52-12" src="https://github.com/user-attachments/assets/f606e35e-014b-4a7e-960b-eb23794ac9ee" />
 更多椰子的糗事可以在这里找到https://aiya.de5.net/ 哎呀aiya 专注于探索目前ai边界 发现ai能干啥和不能干啥
+
+## 最近更新（2026-02）
+
+- 修复 `channel restart` / `health-monitor` 重启循环：`startAccount` 改为常驻直到 `abort`，避免网关误判通道“已退出”后重复拉起。
+- 增强 OneBot 连接状态判断：新增 `isConnected()`，用于同账号重复启动防抖。
+- 提升发送可靠性：发送失败自动回队列并触发重连，降低“日志显示已回复但 QQ 未落地”的概率。
+- 新增心跳事件透传：客户端接收 heartbeat 时向上层发事件，便于健康状态判断。
+
 # OpenClaw QQ 插件 (OneBot v11)
 
 > English version: [README.en.md](./README.en.md)

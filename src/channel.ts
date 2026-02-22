@@ -149,6 +149,43 @@ async function grokDrawDirect(prompt: string): Promise<{ ok: true; url: string }
     return { ok: false, error: `调用 Grok 失败: ${String(err)}` };
   }
 }
+
+function buildModelProbeUrls(rawBaseUrl: string): string[] {
+  const out: string[] = [];
+  const baseUrl = (rawBaseUrl || "").trim().replace(/\/+$/, "");
+  if (!baseUrl) return out;
+  out.push(`${baseUrl}/models`);
+  try {
+    const url = new URL(baseUrl);
+    const origin = url.origin;
+    const path = url.pathname.replace(/\/+$/, "");
+    out.push(`${origin}/v1/models`);
+    if (/\/codex\/v1$/i.test(path)) out.push(`${origin}${path.replace(/\/codex\/v1$/i, "/v1")}/models`);
+    if (/\/v1$/i.test(path)) out.push(`${origin}${path}/models`);
+  } catch {}
+  return [...new Set(out)];
+}
+
+async function fetchProviderModelIdsDynamic(baseUrl: string, apiKey?: string): Promise<{ ids: string[]; source: string } | null> {
+  const probeUrls = buildModelProbeUrls(baseUrl);
+  for (const url of probeUrls) {
+    try {
+      const headers: Record<string, string> = {};
+      if (apiKey && apiKey.trim()) headers.Authorization = `Bearer ${apiKey.trim()}`;
+      const resp = await fetch(url, { method: "GET", headers });
+      if (!resp.ok) continue;
+      const text = await resp.text();
+      const data = JSON.parse(text) as any;
+      const arr = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+      const ids = arr
+        .map((item: any) => (typeof item?.id === "string" ? item.id.trim() : ""))
+        .filter((id: string) => Boolean(id));
+      if (ids.length > 0) return { ids: [...new Set(ids)], source: url };
+    } catch {}
+  }
+  return null;
+}
+
 async function buildModelCatalogText(): Promise<string> {
   const home = process.env.HOME || process.env.USERPROFILE || "";
   const candidates = [
@@ -173,7 +210,10 @@ async function buildModelCatalogText(): Promise<string> {
   }
 
   const providers = parsed?.models?.providers as Record<string, any> | undefined;
-  const currentModel = typeof parsed?.agent?.model === "string" ? parsed.agent.model : "unknown";
+  const currentModel =
+    (typeof parsed?.agents?.defaults?.model?.primary === "string" && parsed.agents.defaults.model.primary.trim())
+    || (typeof parsed?.agent?.model === "string" && parsed.agent.model.trim())
+    || "unknown";
   if (!providers || typeof providers !== "object") {
     return `[OpenClawd QQ]\nCurrent: ${currentModel}\n未找到 models.providers 配置。`;
   }
@@ -181,10 +221,17 @@ async function buildModelCatalogText(): Promise<string> {
   const lines: string[] = [`[OpenClawd QQ]`, `Current: ${currentModel}`, `Providers:`];
   let index = 1;
   for (const [providerName, providerValue] of Object.entries(providers)) {
-    const models = Array.isArray((providerValue as any)?.models) ? (providerValue as any).models : [];
-    lines.push(`- ${providerName} (${models.length})`);
-    for (const model of models) {
-      const modelId = typeof model?.id === "string" && model.id.trim() ? model.id.trim() : "(no-id)";
+    const cfgModels = Array.isArray((providerValue as any)?.models) ? (providerValue as any).models : [];
+    const cfgModelIds = cfgModels
+      .map((model: any) => (typeof model?.id === "string" ? model.id.trim() : ""))
+      .filter((id: string) => Boolean(id));
+    const baseUrl = typeof (providerValue as any)?.baseUrl === "string" ? (providerValue as any).baseUrl.trim() : "";
+    const apiKey = typeof (providerValue as any)?.apiKey === "string" ? (providerValue as any).apiKey : "";
+    const dynamic = baseUrl ? await fetchProviderModelIdsDynamic(baseUrl, apiKey) : null;
+    const modelIds = dynamic?.ids ?? cfgModelIds;
+    const source = dynamic ? `dynamic: ${dynamic.source}` : "config";
+    lines.push(`- ${providerName} (${modelIds.length}) [${source}]`);
+    for (const modelId of modelIds) {
       lines.push(`  ${index}. ${providerName}/${modelId}`);
       index += 1;
     }
@@ -1088,6 +1135,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
         const existingLiveClient = clients.get(account.accountId);
         if (existingLiveClient?.isConnected()) {
             console.log(`[QQ] Existing live client detected for account ${account.accountId}; skip duplicate start`);
+            await new Promise<void>((resolve) => {
+                if (ctx.abortSignal.aborted) {
+                    resolve();
+                    return;
+                }
+                ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+            });
             return;
         }
         const accountGen = (accountStartGeneration.get(account.accountId) || 0) + 1;
@@ -1906,7 +1960,16 @@ ${current}
         });
 
         client.connect();
-        return () => { 
+        await new Promise<void>((resolve) => {
+            if (ctx.abortSignal.aborted) {
+                resolve();
+                return;
+            }
+            ctx.abortSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        try {
+            // keep provider task alive until gateway abort; avoid health-monitor restart loop
+        } finally {
             if (accountStartGeneration.get(account.accountId) === accountGen) {
                 accountStartGeneration.set(account.accountId, accountGen + 1);
             }
@@ -1920,7 +1983,7 @@ ${current}
                     allClientsByAccount.delete(account.accountId);
                 }
             }
-        };
+        }
     },
     logoutAccount: async ({ accountId, cfg }) => {
         return { loggedOut: true, cleared: true };

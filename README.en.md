@@ -1,6 +1,13 @@
 OpenClawd is a multi-purpose agent. The chat demo below only shows the most basic capabilities.
 # OpenClaw QQ Plugin (OneBot v11)
 
+## Recent Updates (2026-02)
+
+- Fixed `channel restart` / `health-monitor` restart loop: `startAccount` now stays alive until `abort`, so the gateway no longer treats the provider task as exited immediately.
+- Added `isConnected()` in the OneBot client for duplicate-start suppression on the same account.
+- Improved outbound reliability: failed WS sends are re-queued and trigger reconnect, reducing "logged as sent but not delivered in QQ" cases.
+- Added heartbeat event passthrough from client to upper layer for better health visibility.
+
 This plugin adds full-featured QQ channel support to [OpenClaw](https://github.com/openclaw/openclaw) via the OneBot v11 protocol (WebSocket). It supports not only basic chat, but also group administration, QQ Guild channels, multimodal interaction, and production-grade risk controls.
 
 ## ✨ Core Features
