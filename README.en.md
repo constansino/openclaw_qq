@@ -221,6 +221,30 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 - Keep `includeSenderInLayers=true` if sender attribution matters for your workflows.
 - Use `debugLayerTrace=true` only during diagnosis, then switch it back off.
 
+### 6. Active Model Failover Configuration
+
+This plugin features a built-in auto-failover mechanism that triggers upon repeated request failures or empty AI replies. Combined with `maxRetries` and `retryDelayMs`, it seamlessly switches to a fallback model when the primary model encounters rate limits or errors.
+
+To configure this, find or add the `model` object field inside your `openclaw.json` (either globally at `agents.defaults.model` or inside a specific agent configuration), and define a `fallbacks` array like so:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "provider-a/your-primary-model", 
+        "fallbacks": [
+          "provider-b/your-fallback-model",
+          "provider-c/another-fallback-model"
+        ]
+      }
+    }
+  }
+}
+```
+
+> **Trigger Condition**: The system will only attempt to switch to the fallback models starting from the **3rd attempt** (meaning when `maxRetries` is at least 3, and `tryCount >= 2`).
+
 ---
 
 ## 🎮 Usage Guide

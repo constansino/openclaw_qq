@@ -233,6 +233,30 @@ openclaw setup qq
 - 关注可读性：若对“谁说的”敏感，保持 `includeSenderInLayers=true`。
 - 问题排查：临时开启 `debugLayerTrace=true`，定位后及时关闭。
 
+### 6. 模型故障转移 (Active Model Failover) 配置
+
+本插件内置了“多次请求失败/空回复后自动切换备用模型”的能力。配合 `maxRetries` 与 `retryDelayMs` 使用，可在主模型报错或触发限流时，无缝切换到备用模型。
+
+配置方式如下，在主配置文件 `openclaw.json` 中找到或添加 `model` 字段（可以是全局 `agents.defaults.model` 或特定 agent 内），使用对象结构配置 `fallbacks`：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "provider-a/your-primary-model", 
+        "fallbacks": [
+          "provider-b/your-fallback-model",
+          "provider-c/another-fallback-model"
+        ]
+      }
+    }
+  }
+}
+```
+
+> **触发机制**：当单次对话请求触发了重试的 **第 3 次（即 maxRetries 设为 3 及以上时，tryCount >= 2）** 时，系统才会尝试进入备用列表，并按顺序采用 `fallbacks` 中的模型提供商重试。
+
 ---
 
 ## 🎮 使用指南
