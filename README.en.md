@@ -20,6 +20,7 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 * **Keyword Wake-up**: In addition to @mentions, you can configure specific keywords (for example, “assistant”) to trigger conversation.
 
 ### 🛡️ Powerful Management & Risk Control
+* **Active Model Failover**: Built-in retry mechanism with backoff logic. If the primary LLM API fails due to rate limits/timeouts or returns an empty response repeatedly, it automatically and seamlessly switches to defined fallback models in `openclaw.json` (triggering on the 3rd attempt) to guarantee 24/7 chat availability.
 * **Self-healing Connection**: Built-in heartbeat detection plus exponential backoff reconnection can auto-detect and recover “zombie connections” for 24/7 uptime.
 * **Group Moderation Commands**: Admins can use commands directly in QQ to manage members (mute/kick).
 * **Allow/Block Lists**:
@@ -175,6 +176,8 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `notifyNonAdminBlocked` | boolean | `false` | When `adminOnlyChat=true` and a non-admin triggers, whether to send a rejection notice. |
 | `nonAdminBlockedMessage` | string | `Only admins can trigger this bot currently.\nPlease contact an administrator if you need access.` | Rejection message shown to blocked non-admin users. |
 | `blockedNotifyCooldownMs` | number | `10000` | Cooldown (ms) for non-admin rejection notices. Prevents repeated notices within the same session/user target. |
+| `maxRetries` | number | `3` | **Max auto-retries**. Number of retries when model requests fail or return empty; switches to `fallbacks` array models starting from the 3rd attempt. |
+| `retryDelayMs` | number | `3000` | Delay in milliseconds between retries. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
 | `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |

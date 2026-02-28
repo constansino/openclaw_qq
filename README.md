@@ -26,6 +26,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **关键词唤醒**：除了 @机器人，支持配置特定的关键词（如“小助手”）来触发对话。
 
 ### 🛡️ 强大的管理与风控
+*   **模型故障转移 (Active Model Failover)**：当主大模型 API 出现由于限流、宕机导致的超时报错，或持续返回空回复时，自带带有退避逻辑的重试机制，并在达到重试阈值（第3次重试）时自动、无缝地切换至核心配置 (`openclaw.json`) 中 `fallbacks` 数组定义的备用模型，双重保障不漏回消息。
 *   **连接自愈**：内置心跳检测与重连指数退避机制，能自动识别并修复“僵尸连接”，确保 7x24 小时在线。
 *   **群管指令**：管理员可直接在 QQ 中使用指令管理群成员（禁言/踢出）。
 *   **黑白名单**：
@@ -188,6 +189,8 @@ openclaw setup qq
 | `notifyNonAdminBlocked` | boolean | `false` | 当 `adminOnlyChat=true` 且被非管理员触发时，是否发送提示消息。 |
 | `nonAdminBlockedMessage` | string | `当前仅管理员可触发机器人。\n如需使用请联系管理员。` | 非管理员被拦截时的提示文案。 |
 | `blockedNotifyCooldownMs` | number | `10000` | 非管理员提示防抖（毫秒）。同一用户在同一会话内重复触发时，冷却期内不重复提示。 |
+| `maxRetries` | number | `3` | **最大重试次数**。模型请求失败或返回空回复时自动重试的次数；重试第3次起将尝试启用 `openclaw.json` 定义的 `fallbacks` 备用大模型。 |
+| `retryDelayMs` | number | `3000` | **重试等待延迟**。每次重试之间的等待时间（毫秒）。 |
 | `enableEmptyReplyFallback` | boolean | `true` | 空回复兜底开关。模型返回空内容时，自动发提示，避免看起来“机器人没反应”。 |
 | `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | 空回复兜底提示文案。 |
 | `showProcessingStatus` | boolean | `true` | 忙碌状态可视化（默认开启）。处理中会把机器人群名片临时改为 `（输入中）` 后缀。 |
