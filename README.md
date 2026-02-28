@@ -118,6 +118,8 @@ openclaw setup qq
       "showProcessingStatus": true,
       "processingStatusDelayMs": 500,
       "processingStatusText": "输入中",
+      "maxRetries": 3,
+      "retryDelayMs": 3000,
       "allowedGroups": "10001,10002",
       "blockedUsers": "999999",
       "systemPrompt": "你是一个名为“人工智障”的QQ机器人，说话风格要风趣幽默。",
