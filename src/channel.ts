@@ -2301,10 +2301,34 @@ ${current}
                                     };
                                 }
 
-                                await runtime.channel.reply.dispatchReplyFromConfig({ ctx: ctxPayload, cfg: currentCfg, dispatcher, replyOptions });
+                                const dispatchStartTime = Date.now();
+                                let dispatchError: any = null;
+                                try {
+                                    await runtime.channel.reply.dispatchReplyFromConfig({ ctx: ctxPayload, cfg: currentCfg, dispatcher, replyOptions });
+                                } catch (err) {
+                                    dispatchError = err;
+                                    console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, err);
+                                }
+                                const dispatchDurationMs = Date.now() - dispatchStartTime;
+
+                                if (dispatchError) {
+                                    if (tryCount === maxRetries) {
+                                        if (config.enableErrorNotify) deliver({ text: "⚠️ 服务调用失败，请稍后重试。" });
+                                    }
+                                    continue;
+                                }
 
                                 const shouldFallback = config.enableEmptyReplyFallback !== false && !text.trim().startsWith('/');
                                 if (deliveredAnything || !shouldFallback) {
+                                    break;
+                                }
+
+                                // If nothing was delivered and no error was thrown, it's either an empty reply or a queue drop.
+                                // If the run finished almost instantly (< 500ms), it means OpenClaw core dropped the message 
+                                // (e.g., due to active concurrency limit or duplicate detection). 
+                                // In this case, we MUST NOT retry, as it will just instantly drop again and loop.
+                                if (dispatchDurationMs < 500) {
+                                    console.log(`[QQ] Message dropped by core queue policy (duration ${dispatchDurationMs}ms). Skipping retries.`);
                                     break;
                                 }
 
@@ -2317,10 +2341,7 @@ ${current}
                                     }
                                 }
                             } catch (error) {
-                                console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, error);
-                                if (tryCount === maxRetries) {
-                                    if (config.enableErrorNotify) deliver({ text: "⚠️ 服务调用失败，请稍后重试。" });
-                                }
+                                console.error(`[QQ] Error during retry loop processing:`, error);
                             }
                         }
                     } catch (error) {
