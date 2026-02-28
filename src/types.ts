@@ -1,7 +1,7 @@
 export type OneBotMessageSegment =
   | { type: "text"; data: { text: string } }
   | { type: "image"; data: { file: string; url?: string } }
-  | { type: "record"; data: { file: string } }
+  | { type: "record"; data: { file: string; text?: string } }
   | { type: "video"; data: { file: string } }
   | {
       type: "file";
@@ -14,6 +14,8 @@ export type OneBotMessageSegment =
         file_size?: number;
       };
     }
+  | { type: "json"; data?: Record<string, unknown> }
+  | { type: "forward"; data: { id: string } }
   | { type: "at"; data: { qq: string } }
   | { type: "reply"; data: { id: string } };
 

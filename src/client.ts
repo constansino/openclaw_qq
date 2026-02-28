@@ -181,7 +181,22 @@ export class OneBotClient extends EventEmitter {
   }
 
   async getMsg(messageId: number | string): Promise<any> {
-    return this.sendWithResponse("get_msg", { message_id: messageId });
+    const raw = typeof messageId === "number" ? String(messageId) : String(messageId || "").trim();
+    const tries: Array<Record<string, any>> = [{ message_id: raw }, { id: raw }];
+    if (/^\d+$/.test(raw)) {
+      const n = Number.parseInt(raw, 10);
+      tries.unshift({ message_id: n });
+      tries.push({ id: n });
+    }
+    let lastErr: unknown;
+    for (const params of tries) {
+      try {
+        return await this.sendWithResponse("get_msg", params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("get_msg failed");
   }
 
   // Note: get_group_msg_history is extended API supported by go-cqhttp/napcat
@@ -190,7 +205,26 @@ export class OneBotClient extends EventEmitter {
   }
 
   async getForwardMsg(id: string): Promise<any> {
-    return this.sendWithResponse("get_forward_msg", { id });
+    const raw = String(id || "").trim();
+    const tries: Array<Record<string, any>> = [
+      { id: raw },
+      { message_id: raw },
+      { forward_id: raw },
+    ];
+    if (/^\d+$/.test(raw)) {
+      const n = Number.parseInt(raw, 10);
+      tries.unshift({ id: n });
+      tries.push({ message_id: n }, { forward_id: n });
+    }
+    let lastErr: unknown;
+    for (const params of tries) {
+      try {
+        return await this.sendWithResponse("get_forward_msg", params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("get_forward_msg failed");
   }
 
   async getFriendList(): Promise<any[]> {

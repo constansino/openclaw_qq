@@ -9,6 +9,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 - 增强 OneBot 连接状态判断：新增 `isConnected()`，用于同账号重复启动防抖。
 - 提升发送可靠性：发送失败自动回队列并触发重连，降低“日志显示已回复但 QQ 未落地”的概率。
 - 新增心跳事件透传：客户端接收 heartbeat 时向上层发事件，便于健康状态判断。
+- 新增多层上下文解析：支持递归解析 `reply/forward`，按层提取文本/图片/文件线索并注入上下文。
 
 # OpenClaw QQ 插件 (OneBot v11)
 
@@ -21,7 +22,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 ### 🧠 深度智能与上下文
 *   **历史回溯 (Context)**：可选在群聊中获取最近 N 条历史消息（默认 0，不额外注入），用于需要“强制保留上下文原文”的场景。
 *   **系统提示词 (System Prompt)**：支持注入自定义提示词，让 Bot 扮演特定角色（如“猫娘”、“严厉的管理员”）。
-*   **转发消息理解**：AI 能够解析并读取用户发送的合并转发聊天记录，处理复杂信息。
+*   **多层 reply/forward 解析**：AI 可递归展开引用链与合并转发链路，按层读取上下文、图片和文件线索，处理复杂信息更稳定。
 *   **关键词唤醒**：除了 @机器人，支持配置特定的关键词（如“小助手”）来触发对话。
 
 ### 🛡️ 强大的管理与风控
@@ -176,6 +177,15 @@ openclaw setup qq
 | `blockedUsers` | string | `""` | **用户黑名单（字符串）**。Web表单填：`342571216` 或 `342571216,10002`；Raw JSON 填：`"342571216"`。Bot 将忽略这些用户消息。 |
 | `systemPrompt` | string | - | **人设设定**。注入到 AI 上下文的系统提示词。 |
 | `historyLimit` | number | `0` | **历史消息条数**。默认依赖 OpenClaw 会话系统管理上下文；仅在你需要强制携带群内最近原文时才建议设为 `>0`。 |
+| `enrichReplyForwardContext` | boolean | `true` | 是否启用多层 reply/forward 上下文解析与注入。 |
+| `maxReplyLayers` | number | `5` | reply 链最大递归层数。 |
+| `maxForwardLayers` | number | `5` | forward 链最大递归层数。 |
+| `maxForwardMessagesPerLayer` | number | `8` | 每层 forward 最多展开的子消息数。 |
+| `maxCharsPerLayer` | number | `900` | 每层提取文本的字符上限。 |
+| `maxTotalContextChars` | number | `3000` | reply/forward 注入总字符上限。 |
+| `includeSenderInLayers` | boolean | `true` | 分层上下文中是否包含发送者昵称/ID。 |
+| `includeCurrentOutline` | boolean | `true` | 是否附加“当前消息概要层”。 |
+| `debugLayerTrace` | boolean | `false` | 调试日志开关。开启后打印分层解析链路。 |
 
 > 推荐：默认保持 `historyLimit = 0`。这与 Telegram 通道行为更一致，能减少重复上下文注入和日志噪音。
 > 仅当你明确希望每轮都附带“群内原始近几条消息”时，再开启 `historyLimit`（例如设为 `3~5`）。

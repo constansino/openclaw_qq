@@ -7,6 +7,7 @@ OpenClawd is a multi-purpose agent. The chat demo below only shows the most basi
 - Added `isConnected()` in the OneBot client for duplicate-start suppression on the same account.
 - Improved outbound reliability: failed WS sends are re-queued and trigger reconnect, reducing "logged as sent but not delivered in QQ" cases.
 - Added heartbeat event passthrough from client to upper layer for better health visibility.
+- Added multi-layer context parsing: recursive `reply/forward` expansion with layered text/image/file hints injected into context.
 
 This plugin adds full-featured QQ channel support to [OpenClaw](https://github.com/openclaw/openclaw) via the OneBot v11 protocol (WebSocket). It supports not only basic chat, but also group administration, QQ Guild channels, multimodal interaction, and production-grade risk controls.
 
@@ -15,7 +16,7 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 ### 🧠 Deep Intelligence & Context
 * **History Backtracking (Context)**: Optionally fetch the latest N messages in group chats (default: `0`, no extra injection), for scenarios where you need to forcibly preserve raw historical context.
 * **System Prompt**: Inject custom prompts so the bot can play specific roles (for example, a “catgirl” or a “strict admin”).
-* **Forwarded Message Understanding**: The AI can parse and read merged-forwarded chat records sent by users, handling complex information.
+* **Multi-layer Reply/Forward Parsing**: The AI can recursively expand reply chains and merged forwards, injecting layered text/image/file hints for more reliable context understanding.
 * **Keyword Wake-up**: In addition to @mentions, you can configure specific keywords (for example, “assistant”) to trigger conversation.
 
 ### 🛡️ Powerful Management & Risk Control
@@ -170,6 +171,15 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `blockedUsers` | string | `""` | **User blocklist (string)**. In Web form: `342571216` or `342571216,10002`; in Raw JSON: `"342571216"`. Bot ignores messages from these users. |
 | `systemPrompt` | string | - | **Persona/system role prompt** injected into AI context. |
 | `historyLimit` | number | `0` | **Number of historical messages to inject**. Default relies on OpenClaw session system; set `>0` only when you explicitly need to force raw group history into each turn. |
+| `enrichReplyForwardContext` | boolean | `true` | Enable layered context enrichment from recursive reply/forward parsing. |
+| `maxReplyLayers` | number | `5` | Max recursive depth for reply chains. |
+| `maxForwardLayers` | number | `5` | Max recursive depth for forward chains. |
+| `maxForwardMessagesPerLayer` | number | `8` | Max expanded child messages per forward layer. |
+| `maxCharsPerLayer` | number | `900` | Max extracted text chars per layer. |
+| `maxTotalContextChars` | number | `3000` | Total char budget for injected reply/forward context. |
+| `includeSenderInLayers` | boolean | `true` | Include sender nickname/ID in layered context lines. |
+| `includeCurrentOutline` | boolean | `true` | Include a "current message outline" layer. |
+| `debugLayerTrace` | boolean | `false` | Debug switch for layered parsing traces. |
 
 > Recommendation: keep `historyLimit = 0` by default. This aligns better with Telegram channel behavior and reduces redundant context injection and log noise.
 > Only enable `historyLimit` (for example `3~5`) when you explicitly want to append recent raw group messages on every turn.

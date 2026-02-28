@@ -241,22 +241,279 @@ async function buildModelCatalogText(): Promise<string> {
 }
 
 
-function getReplyMessageId(message: OneBotMessage | string | undefined, rawMessage?: string): string | null {
+function getReplyMessageId(message: OneBotMessage | string | undefined, rawMessage?: string, extra?: any): string | null {
   if (message && typeof message !== "string") {
-    for (const segment of message) {
-      if (segment.type === "reply" && segment.data?.id) {
-        const id = String(segment.data.id).trim();
-        if (id && /^-?\d+$/.test(id)) {
-          return id;
-        }
-      }
+    for (const segment of message as any[]) {
+      const segType = String(segment?.type || "").toLowerCase();
+      if (segType !== "reply") continue;
+      const idCandidate = segment?.data?.id ?? segment?.data?.message_id ?? segment?.data?.reply;
+      const id = typeof idCandidate === "number" ? String(idCandidate) : String(idCandidate || "").trim();
+      if (id && /^-?\d+$/.test(id)) return id;
     }
   }
   if (rawMessage) {
     const match = rawMessage.match(/\[CQ:reply,id=(\d+)\]/);
     if (match) return match[1];
   }
+  const candidates = [
+    extra?.reply?.message_id,
+    extra?.reply?.id,
+    extra?.source?.message_id,
+    extra?.source?.id,
+    extra?.quoted_message_id,
+    extra?.quote_id,
+  ];
+  for (const c of candidates) {
+    const id = typeof c === "number" ? String(c) : (typeof c === "string" ? c.trim() : "");
+    if (id && /^-?\d+$/.test(id)) return id;
+  }
   return null;
+}
+
+type LayerSegmentContext = {
+  text: string;
+  images: string[];
+  files: Array<{ name: string; url?: string; fileId?: string; busid?: string; size?: number }>;
+};
+
+function oneBotPayloadData(payload: any): any {
+  if (payload && typeof payload === "object" && payload.data && typeof payload.data === "object") return payload.data;
+  return payload;
+}
+
+function extractMessageLikeFromPayload(payload: any): OneBotMessage | string | undefined {
+  const data = oneBotPayloadData(payload);
+  const candidates = [data?.message, data?.content, data?.raw_message, data?.rawMessage];
+  for (const c of candidates) {
+    if (Array.isArray(c) || typeof c === "string") return c as any;
+  }
+  return undefined;
+}
+
+function extractForwardNodeList(payload: any): any[] {
+  const data = oneBotPayloadData(payload);
+  const nodes = data?.messages ?? data?.message ?? data?.nodes ?? data?.nodeList;
+  return Array.isArray(nodes) ? nodes : [];
+}
+
+function truncateWithEllipsis(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 1))}…`;
+}
+
+function collectForwardIdsFromMessage(message: OneBotMessage | string | undefined): string[] {
+  const ids: string[] = [];
+  if (Array.isArray(message)) {
+    for (const seg of message as any[]) {
+      const segType = String(seg?.type || "").toLowerCase();
+      if (!["forward", "forward_msg", "nodes"].includes(segType)) continue;
+      const fid = seg?.data?.id ?? seg?.data?.message_id ?? seg?.data?.forward_id;
+      if (fid !== undefined && fid !== null) ids.push(String(fid).trim());
+    }
+  } else if (typeof message === "string" && message) {
+    const patterns = [
+      /\[CQ:forward,id=([^,\]]+)\]/g,
+      /\[CQ:forward_msg,id=([^,\]]+)\]/g,
+      /\[CQ:forward,message_id=([^,\]]+)\]/g,
+      /\[CQ:nodes,id=([^,\]]+)\]/g,
+    ];
+    for (const re of patterns) {
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(message)) !== null) {
+        if (m[1]) ids.push(String(m[1]).trim());
+      }
+    }
+  }
+  return ids.filter(Boolean);
+}
+
+function summarizeOneBotSegments(message: OneBotMessage | string | undefined, maxChars: number): LayerSegmentContext {
+  const images = extractImageUrls(message, 5);
+  const files: Array<{ name: string; url?: string; fileId?: string; busid?: string; size?: number }> = [];
+  let text = "";
+  if (typeof message === "string") {
+    text = cleanCQCodes(message);
+  } else if (Array.isArray(message)) {
+    for (const seg of message) {
+      if (seg.type === "text") text += seg.data?.text || "";
+      else if (seg.type === "at") text += ` @${seg.data?.qq || "unknown"} `;
+      else if (seg.type === "record") text += ` [语音${seg.data?.text ? `:${seg.data.text}` : ""}]`;
+      else if (seg.type === "image") text += " [图片]";
+      else if (seg.type === "video") text += " [视频]";
+      else if (seg.type === "json") text += " [卡片]";
+      else if (seg.type === "file") {
+        const fileName = seg.data?.name || seg.data?.file || "未命名";
+        text += ` [文件:${fileName}]`;
+        files.push({
+          name: fileName,
+          ...(typeof seg.data?.url === "string" ? { url: seg.data.url } : {}),
+          ...(seg.data?.file_id ? { fileId: String(seg.data.file_id) } : {}),
+          ...(seg.data?.busid !== undefined ? { busid: String(seg.data.busid) } : {}),
+          ...(typeof seg.data?.file_size === "number" ? { size: seg.data.file_size } : {}),
+        });
+      } else if (seg.type === "forward" && seg.data?.id) {
+        text += ` [转发:${seg.data.id}]`;
+      } else if (seg.type === "reply" && seg.data?.id) {
+        text += ` [引用:${seg.data.id}]`;
+      }
+    }
+    text = cleanCQCodes(text);
+  }
+  return { text: truncateWithEllipsis(text, maxChars), images, files };
+}
+
+async function buildReplyForwardContextBlock(opts: {
+  client: OneBotClient;
+  rootEvent: any;
+  repliedMsg: any;
+  cfg: QQConfig;
+}): Promise<{ block: string; imageUrls: string[] }> {
+  const { client, rootEvent, repliedMsg, cfg } = opts;
+  if (!cfg.enrichReplyForwardContext) return { block: "", imageUrls: [] };
+  const debugLayerTrace = cfg.debugLayerTrace === true;
+
+  const maxReplyLayers = Math.max(0, Math.trunc(cfg.maxReplyLayers ?? 5));
+  const maxForwardLayers = Math.max(0, Math.trunc(cfg.maxForwardLayers ?? 5));
+  const maxForwardMessagesPerLayer = Math.max(1, Math.trunc(cfg.maxForwardMessagesPerLayer ?? 8));
+  const maxCharsPerLayer = Math.max(100, Math.trunc(cfg.maxCharsPerLayer ?? 900));
+  const maxTotalContextChars = Math.max(300, Math.trunc(cfg.maxTotalContextChars ?? 3000));
+  const includeSenderInLayers = cfg.includeSenderInLayers !== false;
+  const includeCurrentOutline = cfg.includeCurrentOutline !== false;
+
+  const lines: string[] = [];
+  const layeredImages = new Set<string>();
+  let usedChars = 0;
+  const pushLine = (line: string) => {
+    if (!line) return;
+    if (usedChars >= maxTotalContextChars) return;
+    const remaining = maxTotalContextChars - usedChars;
+    const safe = truncateWithEllipsis(line, remaining);
+    if (!safe) return;
+    lines.push(safe);
+    usedChars += safe.length + 1;
+  };
+
+  const seenForwardIds = new Set<string>();
+  const forwardQueue: Array<{ id: string; depth: number; layerTag: string }> = [];
+  const enqueueForwardId = (id: string | undefined | null, depth: number, layerTag: string) => {
+    const fid = String(id || "").trim();
+    if (!fid || seenForwardIds.has(fid) || depth > maxForwardLayers) return;
+    seenForwardIds.add(fid);
+    forwardQueue.push({ id: fid, depth, layerTag });
+  };
+
+  const collectAndEnqueueForwards = (message: OneBotMessage | string | undefined, depth: number, layerTag: string) => {
+    const fids = collectForwardIdsFromMessage(message);
+    if (debugLayerTrace && fids.length > 0) {
+      console.log(`[QQLayerTrace] enqueue forward ids depth=${depth} tag=${layerTag} ids=${fids.join(",")}`);
+    }
+    for (const fid of fids) {
+      enqueueForwardId(fid, depth, layerTag);
+    }
+  };
+
+  if (includeCurrentOutline) {
+    const current = summarizeOneBotSegments(rootEvent.message, maxCharsPerLayer);
+    for (const u of current.images) layeredImages.add(u);
+    pushLine(`[Layer 0][current] ${current.text || "(空文本)"}`);
+    collectAndEnqueueForwards(rootEvent.message, 1, "forward");
+  }
+
+  const seenReplyIds = new Set<string>();
+  let cursor = repliedMsg;
+  for (let i = 1; i <= maxReplyLayers && cursor; i += 1) {
+    if (debugLayerTrace) {
+      const mlike = extractMessageLikeFromPayload(cursor);
+      const mtype = Array.isArray(mlike) ? "array" : typeof mlike;
+      console.log(`[QQLayerTrace] reply layer=${i} hasCursor=true messageLikeType=${mtype}`);
+    }
+    const senderName = cursor?.sender?.nickname || cursor?.sender?.card || cursor?.sender?.user_id || "unknown";
+    const msgBody = extractMessageLikeFromPayload(cursor) ?? (Array.isArray(cursor?.message) ? cursor.message : cursor?.raw_message);
+    const summarized = summarizeOneBotSegments(msgBody, maxCharsPerLayer);
+    for (const u of summarized.images) layeredImages.add(u);
+    const prefix = includeSenderInLayers ? `[Layer ${i}][reply][from:${senderName}]` : `[Layer ${i}][reply]`;
+    pushLine(`${prefix} ${summarized.text || "(空文本)"}`);
+
+    collectAndEnqueueForwards(msgBody, 1, "forward-in-reply");
+
+    const nextReplyId = getReplyMessageId(extractMessageLikeFromPayload(cursor), cursor?.raw_message, oneBotPayloadData(cursor));
+    if (debugLayerTrace) console.log(`[QQLayerTrace] reply layer=${i} nextReplyId=${nextReplyId || ""}`);
+    if (!nextReplyId || seenReplyIds.has(nextReplyId)) break;
+    seenReplyIds.add(nextReplyId);
+    try {
+      cursor = await client.getMsg(nextReplyId);
+      if (debugLayerTrace) console.log(`[QQLayerTrace] get_msg ok id=${nextReplyId}`);
+    } catch (err) {
+      if (debugLayerTrace) console.warn(`[QQLayerTrace] get_msg failed id=${nextReplyId} err=${String(err)}`);
+      break;
+    }
+  }
+
+  while (forwardQueue.length > 0) {
+    const item = forwardQueue.shift()!;
+    if (item.depth > maxForwardLayers) continue;
+    if (debugLayerTrace) console.log(`[QQLayerTrace] dequeue forward id=${item.id} depth=${item.depth} tag=${item.layerTag}`);
+    try {
+      const forwardData = await client.getForwardMsg(item.id);
+      if (debugLayerTrace) console.log(`[QQLayerTrace] get_forward_msg ok id=${item.id}`);
+      const allNodes = extractForwardNodeList(forwardData);
+      if (debugLayerTrace) console.log(`[QQLayerTrace] forward id=${item.id} nodes=${allNodes.length}`);
+      const messages = allNodes.slice(0, maxForwardMessagesPerLayer);
+      let idx = 0;
+      for (const m of messages) {
+        idx += 1;
+        const senderName = m?.sender?.nickname || m?.sender?.card || m?.user_id || "unknown";
+        const content =
+          (Array.isArray(m?.message) ? m.message : undefined)
+          ?? (Array.isArray(m?.content) ? m.content : undefined)
+          ?? (typeof m?.raw_message === "string" ? m.raw_message : undefined)
+          ?? (typeof m?.content === "string" ? m.content : "");
+        const summarized = summarizeOneBotSegments(content, maxCharsPerLayer);
+        for (const u of summarized.images) layeredImages.add(u);
+        const prefix = includeSenderInLayers
+          ? `[Layer F${item.depth}.${idx}][${item.layerTag}][from:${senderName}]`
+          : `[Layer F${item.depth}.${idx}][${item.layerTag}]`;
+        pushLine(`${prefix} ${summarized.text || "(空文本)"}`);
+
+        // nested forward inside forward message
+        if (item.depth < maxForwardLayers) {
+          collectAndEnqueueForwards(content as any, item.depth + 1, "forward-nested");
+        }
+
+        // reply inside forward message
+        const replyIdInForward = getReplyMessageId(
+          Array.isArray(m?.content) ? m.content : undefined,
+          typeof m?.raw_message === "string" ? m.raw_message : undefined,
+          m,
+        );
+        if (replyIdInForward && item.depth < maxForwardLayers) {
+          try {
+            const replied = await client.getMsg(replyIdInForward);
+            const rSender = replied?.sender?.nickname || replied?.sender?.card || replied?.sender?.user_id || "unknown";
+            const rBody = Array.isArray(replied?.message) ? replied.message : replied?.raw_message;
+            const rSummarized = summarizeOneBotSegments(rBody, maxCharsPerLayer);
+            for (const u of rSummarized.images) layeredImages.add(u);
+            const rPrefix = includeSenderInLayers
+              ? `[Layer RF${item.depth}.${idx}][reply-in-forward][from:${rSender}]`
+              : `[Layer RF${item.depth}.${idx}][reply-in-forward]`;
+            pushLine(`${rPrefix} ${rSummarized.text || "(空文本)"}`);
+            collectAndEnqueueForwards(rBody, item.depth + 1, "forward-in-reply-in-forward");
+          } catch {}
+        }
+      }
+    } catch (err) {
+      if (debugLayerTrace) console.warn(`[QQLayerTrace] get_forward_msg failed id=${item.id} err=${String(err)}`);
+      continue;
+    }
+  }
+
+  if (debugLayerTrace) console.log(`[QQLayerTrace] done lines=${lines.length} images=${layeredImages.size}`);
+  if (lines.length === 0) return { block: "", imageUrls: Array.from(layeredImages).slice(0, 5) };
+  return {
+    block: `<context_layers>\n${lines.join("\n")}\n</context_layers>\n\n`,
+    imageUrls: Array.from(layeredImages).slice(0, 5),
+  };
 }
 
 function normalizeTarget(raw: string): string {
@@ -438,6 +695,50 @@ function sanitizeTempSlotName(input: string | undefined): string {
         .replace(/-+/g, "-")
         .replace(/^-+|-+$/g, "")
         .slice(0, 48);
+}
+
+function formatSessionTimeCompact(inputMs?: number): string {
+    const dt = typeof inputMs === "number" && Number.isFinite(inputMs) ? new Date(inputMs) : new Date();
+    const value = Number.isFinite(dt.getTime()) ? dt : new Date();
+    const yyyy = String(value.getFullYear());
+    const mm = String(value.getMonth() + 1).padStart(2, "0");
+    const dd = String(value.getDate()).padStart(2, "0");
+    const hh = String(value.getHours()).padStart(2, "0");
+    const mi = String(value.getMinutes()).padStart(2, "0");
+    return `${yyyy}${mm}${dd}${hh}${mi}`;
+}
+
+function sanitizeSessionTitle(input: string | undefined, fallback: string): string {
+    const raw = String(input || "").trim();
+    if (!raw) return fallback;
+    const compact = raw
+        .replace(/\s+/g, "-")
+        .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return (compact || fallback).slice(0, 80);
+}
+
+function buildQQSessionLabel(params: {
+    isGroup: boolean;
+    isGuild: boolean;
+    groupId?: number;
+    guildId?: string;
+    channelId?: string;
+    userId: number;
+    activeTempSlot: string | null;
+    timestampMs?: number;
+    text?: string;
+}): string {
+    const peer = params.isGroup
+        ? `g-${String(params.groupId ?? "unknown")}`
+        : params.isGuild
+            ? `guild-${String(params.guildId ?? "unknown")}-${String(params.channelId ?? "unknown")}`
+            : `u-${String(params.userId)}`;
+    const fallbackTitle = params.isGroup ? "group" : params.isGuild ? "channel" : "direct";
+    const baseTitle = params.activeTempSlot || String(params.text || "").trim().slice(0, 80);
+    const title = sanitizeSessionTitle(baseTitle, fallbackTitle);
+    return `qq:${peer}-${formatSessionTimeCompact(params.timestampMs)}-${title}`;
 }
 
 function buildEffectiveFromId(baseFromId: string, tempSlot: string | null): string {
@@ -1778,18 +2079,23 @@ ${current}
             }
 
             let baseFromId = `qq:user:${userId}`;
-            let conversationLabel = `QQ User ${userId}`;
             if (isGroup) {
                 baseFromId = String(groupId);
-                conversationLabel = `QQ Group ${groupId}`;
             } else if (isGuild) {
                 baseFromId = `guild:${guildId}:${channelId}`;
-                conversationLabel = `QQ Guild ${guildId} Channel ${channelId}`;
             }
             const fromId = buildEffectiveFromId(baseFromId, activeTempSlot);
-            if (activeTempSlot) {
-                conversationLabel = `${conversationLabel} [tmp:${activeTempSlot}]`;
-            }
+            const sessionLabel = buildQQSessionLabel({
+                isGroup,
+                isGuild,
+                groupId,
+                guildId,
+                channelId,
+                userId,
+                activeTempSlot,
+                timestampMs: event.time * 1000,
+                text,
+            });
 
             const runtime = getQQRuntime();
             const route = runtime.channel.routing.resolveAgentRoute({
@@ -1875,6 +2181,19 @@ ${current}
             let systemBlock = "";
             if (config.systemPrompt) systemBlock += `<system>${config.systemPrompt}</system>\n\n`;
             if (historyContext) systemBlock += `<history>\n${historyContext}\n</history>\n\n`;
+            if (config.debugLayerTrace) {
+                console.log(`[QQLayerTrace] invoke buildReplyForwardContextBlock enrich=${String(config.enrichReplyForwardContext)} debug=${String(config.debugLayerTrace)} hasReply=${String(Boolean(repliedMsg))}`);
+            }
+            const layeredContext = await buildReplyForwardContextBlock({
+                client,
+                rootEvent: event,
+                repliedMsg,
+                cfg: config,
+            });
+            if (config.debugLayerTrace) {
+                console.log(`[QQLayerTrace] blockLen=${layeredContext.block.length} imageCount=${layeredContext.imageUrls.length}`);
+            }
+            if (layeredContext.block) systemBlock += layeredContext.block;
             if (fileHints.length > 0 || imageHints.length > 0) {
                 systemBlock += `<attachments>\n`;
                 for (const hint of fileHints) {
@@ -1895,13 +2214,14 @@ ${current}
             const inboundMediaUrls = Array.from(new Set([
                 ...extractImageUrls(event.message),
                 ...imageHints,
+                ...layeredContext.imageUrls,
             ])).slice(0, 5);
 
             const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
             const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                 Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
-                SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel,
+                SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
                 SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                 Surface: "qq",
                 OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: commandAuthorized,
