@@ -1948,7 +1948,38 @@ ${current}
                                     console.log(`[QQ] Model request failed or returned empty. Retrying (${tryCount}/${maxRetries}) after ${retryDelayMs}ms...`);
                                     await sleep(retryDelayMs);
                                 }
-                                await runtime.channel.reply.dispatchReplyFromConfig({ ctx: ctxPayload, cfg, dispatcher, replyOptions });
+
+                                let currentCfg = cfg as any;
+                                const matchedAgentId = route.agentId;
+                                const matchedAgentConfig = (currentCfg.agents?.list || []).find((a: any) => a.id === matchedAgentId);
+                                const rawModelConfig = matchedAgentConfig?.model || currentCfg.agents?.defaults?.model;
+
+                                // If tryCount >= 2 (i.e. 3rd attempt), start trying fallback models if defined
+                                if (tryCount >= 2 && typeof rawModelConfig === 'object' && Array.isArray(rawModelConfig.fallbacks) && rawModelConfig.fallbacks.length > 0) {
+                                    const fallbacks = rawModelConfig.fallbacks;
+                                    const fallbackIndex = Math.min(tryCount - 2, fallbacks.length - 1);
+                                    const selectedFallback = fallbacks[fallbackIndex];
+                                    console.log(`[QQ] Failover triggered: Switching to fallback model ${selectedFallback}`);
+
+                                    currentCfg = {
+                                        ...currentCfg,
+                                        agents: {
+                                            ...(currentCfg.agents || {}),
+                                            defaults: {
+                                                ...(currentCfg.agents?.defaults || {}),
+                                                model: selectedFallback
+                                            },
+                                            list: (currentCfg.agents?.list || []).map((a: any) => {
+                                                if (a.id === matchedAgentId) {
+                                                    return { ...a, model: selectedFallback };
+                                                }
+                                                return a;
+                                            })
+                                        }
+                                    };
+                                }
+
+                                await runtime.channel.reply.dispatchReplyFromConfig({ ctx: ctxPayload, cfg: currentCfg, dispatcher, replyOptions });
 
                                 // 如果有内容输出，或者不需要空回复兜底，或者明确是命令（以 / 开头），则认为成功，跳出重试循环
                                 const shouldFallback = config.enableEmptyReplyFallback !== false && !text.trim().startsWith('/');
