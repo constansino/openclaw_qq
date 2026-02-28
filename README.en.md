@@ -43,6 +43,20 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
   * **Files**: Supports file send/receive in groups and private chats.
 * **QQ Guild Channels**: Native support for QQ Guild message send/receive.
 
+## 🔐 Permission & Security Model
+
+- `admins`: source of admin identity; only admins can run management commands (`/kick`, `/status`, `/newsession`, etc.).
+- `adminOnlyChat`: whether only admins can trigger normal AI chat replies. Recommended for production groups.
+- `allowedGroups` / `blockedUsers`: ingress allowlist/blocklist for traffic and abuse control.
+- Command auth: when a command is detected, the plugin computes `CommandAuthorized` based on admin identity (no longer hardcoded allow).
+- Recommended baseline: `requireMention=true` + `keywordTriggers` + `adminOnlyChat=true`.
+
+## ⚠️ Known Limits (Read Before Production)
+
+- QQ does not support Telegram-like native streaming output, message editing, or inline buttons.
+- Recursive forward/reply parsing increases context-token usage; tune depth/char budgets for busy groups.
+- Keep `debugLayerTrace` off in production (default is off); enable only while troubleshooting.
+
 ---
 
 ## 📋 Prerequisites
@@ -162,7 +176,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `nonAdminBlockedMessage` | string | `Only admins can trigger this bot currently.\nPlease contact an administrator if you need access.` | Rejection message shown to blocked non-admin users. |
 | `blockedNotifyCooldownMs` | number | `10000` | Cooldown (ms) for non-admin rejection notices. Prevents repeated notices within the same session/user target. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
-| `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | Fallback text used when a model turn returns empty output. |
+| `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |
 | `processingStatusDelayMs` | number | `500` | Delay in milliseconds before applying the busy suffix. |
 | `processingStatusText` | string | `输入中` | Busy suffix text. Default is `输入中`. |
@@ -196,6 +210,13 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `formatMarkdown` | boolean | `false` | Whether to convert Markdown tables/lists to readable plain-text formatting for QQ. |
 | `antiRiskMode` | boolean | `false` | Whether to enable anti-risk formatting (for example, adding spaces in URLs). |
 | `maxMessageLength` | number | `4000` | Max length per message. Longer output is auto-split. |
+
+### 5. Tuning Multi-layer Reply/Forward Parsing
+
+- Safe defaults for busy groups: `maxReplyLayers=3~5`, `maxForwardLayers=2~4`, `maxForwardMessagesPerLayer=5~8`.
+- To reduce token cost first lower `maxForwardMessagesPerLayer` and `maxTotalContextChars`.
+- Keep `includeSenderInLayers=true` if sender attribution matters for your workflows.
+- Use `debugLayerTrace=true` only during diagnosis, then switch it back off.
 
 ---
 

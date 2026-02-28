@@ -49,6 +49,20 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
     *   **文件**：支持群文件和私聊文件的收发。
 *   **QQ 频道 (Guild)**：原生支持 QQ 频道消息收发。
 
+## 🔐 权限与安全模型
+
+- `admins`：管理员身份来源，仅管理员可执行管理指令（如 `/kick`、`/status`、`/newsession` 等）。
+- `adminOnlyChat`：是否限制“只有管理员可以触发 AI 对话”。建议生产群开启。
+- `allowedGroups` / `blockedUsers`：会话入口白名单/黑名单，优先用于流量和风险控制。
+- 命令授权：插件会在检测到命令时按管理员身份计算 `CommandAuthorized`，不再固定放行。
+- 建议组合：`requireMention=true` + `keywordTriggers` + `adminOnlyChat=true`，可显著降低误触发与盗刷。
+
+## ⚠️ 已知限制（务必阅读）
+
+- QQ 不支持 Telegram 那样的原生流式输出/消息编辑/按钮交互。
+- 合并转发递归解析会增加上下文 token 成本；群消息很长时建议下调层数与字符预算。
+- `debugLayerTrace` 仅用于排障，生产环境建议保持关闭（默认已关闭）。
+
 ---
 
 ## 📋 前置条件
@@ -201,6 +215,13 @@ openclaw setup qq
 | `formatMarkdown` | boolean | `false` | 是否将 Markdown 表格/列表转换为易读的纯文本排版。 |
 | `antiRiskMode` | boolean | `false` | 是否开启风控规避（如给 URL 加空格）。 |
 | `maxMessageLength` | number | `4000` | 单条消息最大长度，超过将自动分片发送。 |
+
+### 5. 多层 reply/forward 调参建议
+
+- 大群默认：`maxReplyLayers=3~5`、`maxForwardLayers=2~4`、`maxForwardMessagesPerLayer=5~8`。
+- 压缩 token 成本：优先下调 `maxForwardMessagesPerLayer` 与 `maxTotalContextChars`。
+- 关注可读性：若对“谁说的”敏感，保持 `includeSenderInLayers=true`。
+- 问题排查：临时开启 `debugLayerTrace=true`，定位后及时关闭。
 
 ---
 
