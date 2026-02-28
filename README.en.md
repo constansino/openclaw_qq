@@ -7,6 +7,7 @@ OpenClawd is a multi-purpose agent. The chat demo below only shows the most basi
 - Added `isConnected()` in the OneBot client for duplicate-start suppression on the same account.
 - Improved outbound reliability: failed WS sends are re-queued and trigger reconnect, reducing "logged as sent but not delivered in QQ" cases.
 - Added heartbeat event passthrough from client to upper layer for better health visibility.
+- Added multi-layer context parsing: recursive `reply/forward` expansion with layered text/image/file hints injected into context.
 
 This plugin adds full-featured QQ channel support to [OpenClaw](https://github.com/openclaw/openclaw) via the OneBot v11 protocol (WebSocket). It supports not only basic chat, but also group administration, QQ Guild channels, multimodal interaction, and production-grade risk controls.
 
@@ -15,7 +16,7 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 ### 🧠 Deep Intelligence & Context
 * **History Backtracking (Context)**: Optionally fetch the latest N messages in group chats (default: `0`, no extra injection), for scenarios where you need to forcibly preserve raw historical context.
 * **System Prompt**: Inject custom prompts so the bot can play specific roles (for example, a “catgirl” or a “strict admin”).
-* **Forwarded Message Understanding**: The AI can parse and read merged-forwarded chat records sent by users, handling complex information.
+* **Multi-layer Reply/Forward Parsing**: The AI can recursively expand reply chains and merged forwards, injecting layered text/image/file hints for more reliable context understanding.
 * **Keyword Wake-up**: In addition to @mentions, you can configure specific keywords (for example, “assistant”) to trigger conversation.
 
 ### 🛡️ Powerful Management & Risk Control
@@ -41,6 +42,20 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
   * **Voice**: Receives voice messages (requires server-side STT support) and can optionally send TTS voice replies.
   * **Files**: Supports file send/receive in groups and private chats.
 * **QQ Guild Channels**: Native support for QQ Guild message send/receive.
+
+## 🔐 Permission & Security Model
+
+- `admins`: source of admin identity; only admins can run management commands (`/kick`, `/status`, `/newsession`, etc.).
+- `adminOnlyChat`: whether only admins can trigger normal AI chat replies. Recommended for production groups.
+- `allowedGroups` / `blockedUsers`: ingress allowlist/blocklist for traffic and abuse control.
+- Command auth: when a command is detected, the plugin computes `CommandAuthorized` based on admin identity (no longer hardcoded allow).
+- Recommended baseline: `requireMention=true` + `keywordTriggers` + `adminOnlyChat=true`.
+
+## ⚠️ Known Limits (Read Before Production)
+
+- QQ does not support Telegram-like native streaming output, message editing, or inline buttons.
+- Recursive forward/reply parsing increases context-token usage; tune depth/char budgets for busy groups.
+- Keep `debugLayerTrace` off in production (default is off); enable only while troubleshooting.
 
 ---
 
@@ -161,7 +176,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `nonAdminBlockedMessage` | string | `Only admins can trigger this bot currently.\nPlease contact an administrator if you need access.` | Rejection message shown to blocked non-admin users. |
 | `blockedNotifyCooldownMs` | number | `10000` | Cooldown (ms) for non-admin rejection notices. Prevents repeated notices within the same session/user target. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
-| `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | Fallback text used when a model turn returns empty output. |
+| `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |
 | `processingStatusDelayMs` | number | `500` | Delay in milliseconds before applying the busy suffix. |
 | `processingStatusText` | string | `输入中` | Busy suffix text. Default is `输入中`. |
@@ -170,6 +185,15 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `blockedUsers` | string | `""` | **User blocklist (string)**. In Web form: `342571216` or `342571216,10002`; in Raw JSON: `"342571216"`. Bot ignores messages from these users. |
 | `systemPrompt` | string | - | **Persona/system role prompt** injected into AI context. |
 | `historyLimit` | number | `0` | **Number of historical messages to inject**. Default relies on OpenClaw session system; set `>0` only when you explicitly need to force raw group history into each turn. |
+| `enrichReplyForwardContext` | boolean | `true` | Enable layered context enrichment from recursive reply/forward parsing. |
+| `maxReplyLayers` | number | `5` | Max recursive depth for reply chains. |
+| `maxForwardLayers` | number | `5` | Max recursive depth for forward chains. |
+| `maxForwardMessagesPerLayer` | number | `8` | Max expanded child messages per forward layer. |
+| `maxCharsPerLayer` | number | `900` | Max extracted text chars per layer. |
+| `maxTotalContextChars` | number | `3000` | Total char budget for injected reply/forward context. |
+| `includeSenderInLayers` | boolean | `true` | Include sender nickname/ID in layered context lines. |
+| `includeCurrentOutline` | boolean | `true` | Include a "current message outline" layer. |
+| `debugLayerTrace` | boolean | `false` | Debug switch for layered parsing traces. |
 
 > Recommendation: keep `historyLimit = 0` by default. This aligns better with Telegram channel behavior and reduces redundant context injection and log noise.
 > Only enable `historyLimit` (for example `3~5`) when you explicitly want to append recent raw group messages on every turn.
@@ -186,6 +210,13 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `formatMarkdown` | boolean | `false` | Whether to convert Markdown tables/lists to readable plain-text formatting for QQ. |
 | `antiRiskMode` | boolean | `false` | Whether to enable anti-risk formatting (for example, adding spaces in URLs). |
 | `maxMessageLength` | number | `4000` | Max length per message. Longer output is auto-split. |
+
+### 5. Tuning Multi-layer Reply/Forward Parsing
+
+- Safe defaults for busy groups: `maxReplyLayers=3~5`, `maxForwardLayers=2~4`, `maxForwardMessagesPerLayer=5~8`.
+- To reduce token cost first lower `maxForwardMessagesPerLayer` and `maxTotalContextChars`.
+- Keep `includeSenderInLayers=true` if sender attribution matters for your workflows.
+- Use `debugLayerTrace=true` only during diagnosis, then switch it back off.
 
 ---
 

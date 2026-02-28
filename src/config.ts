@@ -96,6 +96,15 @@ export const QQConfigSchema = z.object({
   sharedMediaHostDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：宿主机共享媒体目录（供 NapCat 容器访问）。示例：/Users/xxx/openclaw_qq/deploy/napcat/shared_media。"),
   sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),
   enableGuilds: BooleanInputSchema(true).describe("是否启用 QQ 频道（Guild）支持。"),
+  enrichReplyForwardContext: BooleanInputSchema(true).describe("是否递归解析 reply/forward 并注入多层上下文。默认开启。"),
+  maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),
+  maxForwardLayers: NumberInputSchema(5).describe("forward 最大递归层数。默认 5。"),
+  maxForwardMessagesPerLayer: NumberInputSchema(8).describe("每层 forward 最多展开多少条子消息。默认 8。"),
+  maxCharsPerLayer: NumberInputSchema(900).describe("每层注入文本最大字符数。默认 900。"),
+  maxTotalContextChars: NumberInputSchema(3000).describe("reply/forward 总注入字符上限。默认 3000。"),
+  includeSenderInLayers: BooleanInputSchema(true).describe("层级上下文里是否包含发送者昵称/ID。"),
+  includeCurrentOutline: BooleanInputSchema(true).describe("是否注入当前消息概要层。"),
+  debugLayerTrace: BooleanInputSchema(false).describe("调试开关：打印 reply/forward 分层解析链路（仅用于排错）。"),
   rateLimitMs: NumberInputSchema(1000).describe("多段消息发送间隔（毫秒）。建议 1000。"),
 }).passthrough();
 
