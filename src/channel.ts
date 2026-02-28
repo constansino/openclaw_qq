@@ -1897,12 +1897,14 @@ ${current}
                 ...imageHints,
             ])).slice(0, 5);
 
+            const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
+            const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
             const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                 Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
                 SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel,
                 SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                 Surface: "qq",
-                OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: true,
+                OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: commandAuthorized,
                 ...(inboundMediaUrls.length > 0 && { MediaUrls: inboundMediaUrls }),
                 ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
             });
