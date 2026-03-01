@@ -20,6 +20,7 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 * **Keyword Wake-up**: In addition to @mentions, you can configure specific keywords (for example, “assistant”) to trigger conversation.
 
 ### 🛡️ Powerful Management & Risk Control
+* **Active Model Failover**: Built-in retry mechanism with backoff logic. If the primary LLM API fails due to rate limits/timeouts or returns an empty response repeatedly, it automatically and seamlessly switches to defined fallback models in `openclaw.json` (triggering on the 3rd attempt) to guarantee 24/7 chat availability.
 * **Self-healing Connection**: Built-in heartbeat detection plus exponential backoff reconnection can auto-detect and recover “zombie connections” for 24/7 uptime.
 * **Group Moderation Commands**: Admins can use commands directly in QQ to manage members (mute/kick).
 * **Allow/Block Lists**:
@@ -175,6 +176,9 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `notifyNonAdminBlocked` | boolean | `false` | When `adminOnlyChat=true` and a non-admin triggers, whether to send a rejection notice. |
 | `nonAdminBlockedMessage` | string | `Only admins can trigger this bot currently.\nPlease contact an administrator if you need access.` | Rejection message shown to blocked non-admin users. |
 | `blockedNotifyCooldownMs` | number | `10000` | Cooldown (ms) for non-admin rejection notices. Prevents repeated notices within the same session/user target. |
+| `maxRetries` | number | `3` | **Max auto-retries**. Number of retries when model requests fail or return empty; switches to `fallbacks` array models starting from the 3rd attempt. |
+| `retryDelayMs` | number | `3000` | Delay in milliseconds between retries. |
+| `fastFailErrors` | array | `["401", ...]` | A list of string keywords (e.g., `"No API key found"`, `"API Key"`, `"401"`) that instantly skip the `maxRetries` wait and immediately trigger the model fallback mechanism to avoid locking up the plugin on unrecoverable authentication errors. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
 | `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |
@@ -217,6 +221,35 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 - To reduce token cost first lower `maxForwardMessagesPerLayer` and `maxTotalContextChars`.
 - Keep `includeSenderInLayers=true` if sender attribution matters for your workflows.
 - Use `debugLayerTrace=true` only during diagnosis, then switch it back off.
+
+### 6. Active Model Failover Configuration
+
+This plugin features a built-in auto-failover mechanism that triggers upon repeated request failures or empty AI replies. Combined with `maxRetries` and `retryDelayMs`, it seamlessly switches to a fallback model when the primary model encounters rate limits or errors.
+
+To configure this, find or add the `model` object field inside your `openclaw.json` (either globally at `agents.defaults.model` or inside a specific agent configuration), and define a `fallbacks` array like so:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "provider-a/your-primary-model", 
+        "fallbacks": [
+          "provider-b/your-fallback-model",
+          "provider-c/another-fallback-model"
+        ]
+      }
+    }
+  }
+}
+```
+
+> **Trigger Condition**: General network errors will attempt to retry on the current model up to `maxRetries` times. However, if the error contains a phrase defined in `fastFailErrors` (e.g., "401", "API Key Invalid"), the system skips the retries and **instantly jumps** to the next available `fallbacks` model to avoid waiting.
+
+### 7. Smart Concurrency Queue
+
+The plugin implements a localized sliding-window debounce queue per-group/per-user to mitigate the risk of message dropping. If 5 users talk to the bot in a group simultaneously, the queue will capture all 5 events, combine them as context, and ensure they are sequentially processed instead of OpenClaw rejecting concurrent events as busy.
+
 
 ---
 

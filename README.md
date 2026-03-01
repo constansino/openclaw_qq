@@ -26,6 +26,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **关键词唤醒**：除了 @机器人，支持配置特定的关键词（如“小助手”）来触发对话。
 
 ### 🛡️ 强大的管理与风控
+*   **模型故障转移 (Active Model Failover)**：当主大模型 API 出现由于限流、宕机导致的超时报错，或持续返回空回复时，自带带有退避逻辑的重试机制，并在达到重试阈值（第3次重试）时自动、无缝地切换至核心配置 (`openclaw.json`) 中 `fallbacks` 数组定义的备用模型，双重保障不漏回消息。
 *   **连接自愈**：内置心跳检测与重连指数退避机制，能自动识别并修复“僵尸连接”，确保 7x24 小时在线。
 *   **群管指令**：管理员可直接在 QQ 中使用指令管理群成员（禁言/踢出）。
 *   **黑白名单**：
@@ -84,10 +85,15 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 cd openclaw/extensions
 # 克隆仓库
 git clone https://github.com/constansino/openclaw_qq.git qq
-# 安装依赖并构建
+# 安装依赖并构建 (注意这里回退了两层目录，即回到了 openclaw 的根目录)
 cd ../..
 pnpm install && pnpm build
 ```
+
+> [!NOTE] 
+> **全局 NPM 安装 / 单独更新插件的用户注意**
+> 如果你是通过 `npm install -g openclaw` 安装的生产环境服务器，你的主配置可能在 `~/.openclaw`，且该目录下没有整个源码主工程的构建脚手架。  
+> 此时直接进入 `~/.openclaw/extensions/qq` 拉取最新代码后，**仅需执行 `npm install`，千万不要执行 `npm build`** (会提示 `Missing script: "build"`)。安装完依赖直接 `openclaw gateway restart` 即可，OpenClaw 会在运行时自定捕获 TypeScript 源码运行。
 
 ### 方法 2: Docker 集成
 在你的 `docker-compose.yml` 或 `Dockerfile` 中，将本插件代码复制到 `/app/extensions/qq` 目录，然后重新构建镜像。
@@ -128,6 +134,8 @@ openclaw setup qq
       "showProcessingStatus": true,
       "processingStatusDelayMs": 500,
       "processingStatusText": "输入中",
+      "maxRetries": 3,
+      "retryDelayMs": 3000,
       "allowedGroups": "10001,10002",
       "blockedUsers": "999999",
       "systemPrompt": "你是一个名为“人工智障”的QQ机器人，说话风格要风趣幽默。",
@@ -181,6 +189,9 @@ openclaw setup qq
 | `notifyNonAdminBlocked` | boolean | `false` | 当 `adminOnlyChat=true` 且被非管理员触发时，是否发送提示消息。 |
 | `nonAdminBlockedMessage` | string | `当前仅管理员可触发机器人。\n如需使用请联系管理员。` | 非管理员被拦截时的提示文案。 |
 | `blockedNotifyCooldownMs` | number | `10000` | 非管理员提示防抖（毫秒）。同一用户在同一会话内重复触发时，冷却期内不重复提示。 |
+| `maxRetries` | number | `3` | **最大重试次数**。模型请求失败或返回空回复时自动重试的次数；重试第3次起将尝试启用 `openclaw.json` 定义的 `fallbacks` 备用大模型。 |
+| `retryDelayMs` | number | `3000` | **重试等待延迟**。每次重试之间的等待时间（毫秒）。 |
+| `fastFailErrors` | array | `["401", ...]` | 包含特定错误文本（如 `"API Key Invalid"`, `"401"`, `"余额不足"`）的数组。当触发这些不可恢复的授权/扣费错误时，系统不再等待 `maxRetries` 的时间，而是直接“光速跳过”当前模型，瞬间切换至备用模型，有效防止插件防抖卡死。 |
 | `enableEmptyReplyFallback` | boolean | `true` | 空回复兜底开关。模型返回空内容时，自动发提示，避免看起来“机器人没反应”。 |
 | `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | 空回复兜底提示文案。 |
 | `showProcessingStatus` | boolean | `true` | 忙碌状态可视化（默认开启）。处理中会把机器人群名片临时改为 `（输入中）` 后缀。 |
@@ -222,6 +233,34 @@ openclaw setup qq
 - 压缩 token 成本：优先下调 `maxForwardMessagesPerLayer` 与 `maxTotalContextChars`。
 - 关注可读性：若对“谁说的”敏感，保持 `includeSenderInLayers=true`。
 - 问题排查：临时开启 `debugLayerTrace=true`，定位后及时关闭。
+
+### 6. 模型故障转移 (Active Model Failover) 配置
+
+本插件内置了“多次请求失败/空回复后自动切换备用模型”的能力。配合 `maxRetries` 与 `retryDelayMs` 使用，可在主模型报错或触发限流时，无缝切换到备用模型。
+
+配置方式如下，在主配置文件 `openclaw.json` 中找到或添加 `model` 字段（可以是全局 `agents.defaults.model` 或特定 agent 内），使用对象结构配置 `fallbacks`：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "provider-a/your-primary-model", 
+        "fallbacks": [
+          "provider-b/your-fallback-model",
+          "provider-c/another-fallback-model"
+        ]
+      }
+    }
+  }
+}
+```
+
+> **触发机制**：对于常规的网络超时错误，系统将在当前模型上反复尝试最多 `maxRetries` 次。但如果返回的错误文本包含了 `fastFailErrors` 数组中定义的词组（如 "401"、"无效的API Key" 等严重授权异常），系统会直接跳过重试等待，**瞬间切换 (Fast Fail)** 至下一个可用的 `fallbacks` 备用大模型。
+
+### 7. 智能并发防止漏吞消息 (Concurrency Queue)
+
+插件内置了基于特定群组/用户的滑动窗口防抖队列，可极大降低消息丢失的风险。如果 5 个群友同时在群里对机器人说话，队列会将这 5 条并发事件安全地打包收集为上下文组合，并确保它们被串行处理，而不会像以前那样被 OpenClaw 核心因并发繁忙而直接拒收丢弃。
 
 ---
 
