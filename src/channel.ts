@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+declare const process: any;
 import {
     type ChannelPlugin,
     type ChannelAccountSnapshot,
@@ -20,6 +22,86 @@ export type ResolvedQQAccount = ChannelAccountSnapshot & {
     config: QQConfig;
     client?: OneBotClient;
 };
+
+interface PendingQQMsg {
+    ctxPayload: any;
+    executeDispatch: (mergedCtx: any) => Promise<void>;
+}
+
+interface SessionQueue {
+    pendingPayloads: PendingQQMsg[];
+    timer: ReturnType<typeof setTimeout> | null;
+    isProcessing: boolean;
+}
+
+const sessionQueues = new Map<string, SessionQueue>();
+
+async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessageFn: (msg: string) => void) {
+    const q = sessionQueues.get(sessionKey);
+    if (!q || q.isProcessing || q.pendingPayloads.length === 0) return;
+
+    q.isProcessing = true;
+    try {
+        const payloads = q.pendingPayloads;
+        q.pendingPayloads = [];
+
+        const mergedCtx = { ...payloads[0].ctxPayload };
+        if (payloads.length > 1) {
+            const mergeText = (key: string) => {
+                if (payloads.some(p => typeof p.ctxPayload[key] === "string")) {
+                    mergedCtx[key] = payloads.map((p, i) => {
+                        const val = p.ctxPayload[key] || p.ctxPayload.Body || p.ctxPayload.RawBody || "";
+                        return `[消息 ${i + 1}]: ${val}`;
+                    }).join("\n\n");
+                }
+            };
+
+            mergeText("Body");
+            mergeText("RawBody");
+            mergeText("BodyForAgent");
+            mergeText("BodyForCommands");
+            mergeText("CommandBody");
+
+            const allMediaUrls = payloads.flatMap(p => p.ctxPayload.MediaUrls || []);
+            if (allMediaUrls.length > 0) {
+                mergedCtx.MediaUrls = Array.from(new Set(allMediaUrls));
+            }
+
+            if (config.enableQueueNotify !== false) {
+                sendMessageFn(`[OpenClawQQ] 已合并 ${payloads.length} 条连续消息并开始处理。`);
+            }
+        }
+
+        await payloads[0].executeDispatch(mergedCtx);
+
+    } finally {
+        q.isProcessing = false;
+        if (q.pendingPayloads.length > 0 && !q.timer) {
+            setTimeout(() => { void drainSessionQueue(sessionKey, config, sendMessageFn); }, 0);
+        } else if (q.pendingPayloads.length === 0) {
+            sessionQueues.delete(sessionKey);
+        }
+    }
+}
+
+function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, config: QQConfig, sendMessageFn: (msg: string) => void) {
+    let q = sessionQueues.get(sessionKey);
+    if (!q) {
+        q = { pendingPayloads: [], timer: null, isProcessing: false };
+        sessionQueues.set(sessionKey, q);
+    }
+
+    q.pendingPayloads.push(msg);
+
+    if (q.timer) clearTimeout(q.timer);
+
+    const debounceMs = config.queueDebounceMs ?? 3000;
+
+    q.timer = setTimeout(() => {
+        q!.timer = null;
+        void drainSessionQueue(sessionKey, config, sendMessageFn);
+    }, debounceMs);
+}
 
 const memberCache = new Map<string, { name: string, time: number }>();
 
@@ -651,7 +733,7 @@ let tempSessionSlotsLoading: Promise<void> | null = null;
 const globalProcessedMsgIds = new Set<string>();
 const recentCommandFingerprints = new Map<string, number>();
 const accountStartGeneration = new Map<string, number>();
-let globalProcessedMsgCleanupTimer: NodeJS.Timeout | null = null;
+let globalProcessedMsgCleanupTimer: ReturnType<typeof setTimeout> | null = null;
 
 function ensureGlobalProcessedMsgCleanupTimer(): void {
     if (globalProcessedMsgCleanupTimer) return;
@@ -2109,8 +2191,13 @@ ${current}
                     });
 
                     let deliveredAnything = false;
+                    let dispatcherError: any = null;
 
-                    const deliver = async (payload: ReplyPayload) => {
+                    const deliver = async (payload: any) => {
+                        if (payload.isError) {
+                            dispatcherError = new Error(payload.text || "API Error");
+                            return;
+                        }
                         const send = async (msg: string) => {
                             let processed = msg;
                             if (config.formatMarkdown) processed = stripMarkdown(processed);
@@ -2236,124 +2323,165 @@ ${current}
                         onRecordError: (err) => console.error("QQ Session Error:", err)
                     });
 
-                    let processingDelayTimer: NodeJS.Timeout | null = null;
-                    let typingCardActivated = false;
-                    const taskKey = buildTaskKey(account.accountId, isGroup, isGuild, groupId, guildId, channelId, userId);
+                    const executeDispatch = async (mergedCtx: any) => {
+                        let processingDelayTimer: ReturnType<typeof setTimeout> | null = null;
+                        let typingCardActivated = false;
+                        const taskKey = buildTaskKey(account.accountId, isGroup, isGuild, groupId, guildId, channelId, userId);
 
-                    const clearProcessingTimers = () => {
-                        if (processingDelayTimer) {
-                            clearTimeout(processingDelayTimer);
-                            processingDelayTimer = null;
+                        const clearProcessingTimers = () => {
+                            if (processingDelayTimer) {
+                                clearTimeout(processingDelayTimer);
+                                processingDelayTimer = null;
+                            }
+                        };
+
+                        if (config.showProcessingStatus !== false) {
+                            activeTaskIds.add(taskKey);
+                            const delayMs = Math.max(100, Number(config.processingStatusDelayMs ?? 500));
+                            processingDelayTimer = setTimeout(() => {
+                                if (isGroup) {
+                                    typingCardActivated = true;
+                                    void setGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
+                                }
+                            }, delayMs);
+                        }
+
+                        const maxRetries = config.maxRetries ?? 3;
+                        const retryDelayMs = config.retryDelayMs ?? 3000;
+
+                        try {
+                            const matchedAgentId = route.agentId;
+                            const matchedAgentConfig = ((cfg as any).agents?.list || []).find((a: any) => a.id === matchedAgentId);
+                            const rawModelConfig = matchedAgentConfig?.model || (cfg as any).agents?.defaults?.model;
+                            const fallbacks = (typeof rawModelConfig === 'object' && Array.isArray(rawModelConfig.fallbacks)) ? rawModelConfig.fallbacks : [];
+
+                            const modelsToTry = [null, ...fallbacks];
+                            let globalDispatchError: any = null;
+
+                            out_loop:
+                            for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
+                                const selectedFallback = modelsToTry[modelIndex];
+
+                                const modelToTest = modelsToTry[modelIndex] || rawModelConfig.primary;
+                                let currentCfg = cfg as any;
+
+                                if (modelIndex > 0) {
+                                    console.log(`[QQ] Failover triggered: Switching to fallback model ${modelToTest}`);
+                                    if (config.enableErrorNotify !== false) {
+                                        const notifyMsg = `⏳ 当前服务无响应，正尝试切换至备用线路 ${modelIndex}/${fallbacks.length}...`;
+                                        if (isGroup) client.sendGroupMsg(groupId, notifyMsg);
+                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, notifyMsg);
+                                        else client.sendPrivateMsg(userId, notifyMsg);
+                                    }
+                                }
+
+                                currentCfg = {
+                                    ...(cfg as any),
+                                    agents: {
+                                        ...((cfg as any).agents || {}),
+                                        defaults: {
+                                            ...((cfg as any).agents?.defaults || {}),
+                                            model: { primary: modelToTest, fallbacks: [] }
+                                        },
+                                        list: ((cfg as any).agents?.list || []).map((a: any) => {
+                                            if (a.id === matchedAgentId) {
+                                                return { ...a, model: { primary: modelToTest, fallbacks: [] } };
+                                            }
+                                            return a;
+                                        })
+                                    }
+                                };
+
+                                for (let tryCount = 0; tryCount <= maxRetries; tryCount++) {
+                                    deliveredAnything = false;
+                                    globalDispatchError = null;
+                                    dispatcherError = null;
+                                    try {
+                                        if (tryCount > 0) {
+                                            console.log(`[QQ] Model request failed or returned empty. Retrying (${tryCount}/${maxRetries}) after ${retryDelayMs}ms...`);
+                                            await sleep(retryDelayMs);
+                                        }
+
+                                        const dispatchStartTime = Date.now();
+                                        try {
+                                            await runtime.channel.reply.dispatchReplyFromConfig({ ctx: mergedCtx, cfg: currentCfg, dispatcher, replyOptions });
+                                        } catch (err) {
+                                            globalDispatchError = err;
+                                            console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, err);
+                                        }
+                                        const dispatchDurationMs = Date.now() - dispatchStartTime;
+
+                                        globalDispatchError = globalDispatchError || dispatcherError;
+                                        const errMessage = globalDispatchError ? ((globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError)) : "";
+
+                                        if (globalDispatchError) {
+                                            const fastFailWords = config.fastFailErrors || ["api key", "no api key found", "not found", "401", "unauthorized", "billing", "余额不足", "已欠费"];
+                                            const shouldFastFail = fastFailWords.some((word: string) => errMessage.toLowerCase().includes(word.toLowerCase()));
+
+                                            // Handle fast skips for predictable API errors like invalid tokens
+                                            // Ensure we don't accidentally skip actual rate limit errors
+                                            if (shouldFastFail && !errMessage.toLowerCase().includes("rate limit") && !errMessage.toLowerCase().includes("429")) {
+                                                console.log(`[QQ] Skipping retries for model due to fast-fail auth error: ${errMessage}`);
+                                                tryCount = maxRetries;
+                                            }
+                                        }
+
+                                        if (!globalDispatchError) {
+                                            const shouldFallback = config.enableEmptyReplyFallback !== false && !text.trim().startsWith('/');
+                                            if (deliveredAnything || !shouldFallback) {
+                                                break out_loop;
+                                            }
+
+                                            if (dispatchDurationMs < 500) {
+                                                console.log(`[QQ] Message dropped by core queue policy (duration ${dispatchDurationMs}ms). Skipping retries.`);
+                                                break out_loop;
+                                            }
+                                        }
+
+                                        if (tryCount === maxRetries) {
+                                            if (modelIndex === modelsToTry.length - 1) {
+                                                if (globalDispatchError) {
+                                                    const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
+                                                    const notifyMsg = errMessage.trim() ? `⚠️ 服务调用失败: ${errMessage}` : "⚠️ 服务调用失败，无具体错误信息，请稍后重试。";
+                                                    if (config.enableErrorNotify) deliver({ text: notifyMsg });
+                                                } else {
+                                                    const fallbackText = (config.emptyReplyFallbackText || "⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。").trim();
+                                                    if (fallbackText) {
+                                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${fallbackText}`);
+                                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, fallbackText);
+                                                        else client.sendPrivateMsg(userId, fallbackText);
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    } catch (loopErr) {
+                                        console.error(`[QQ] Unexpected error in dispatch loop:`, loopErr);
+                                    }
+                                }
+                            }
+                        } catch (error) {
+                            console.error(`[QQ] Outer error:`, error);
+                        }
+                        finally {
+                            clearProcessingTimers();
+                            activeTaskIds.delete(taskKey);
+                            if (typingCardActivated && isGroup) {
+                                clearGroupTypingCard(client, account.accountId, groupId);
+                            }
                         }
                     };
 
-                    if (config.showProcessingStatus !== false) {
-                        activeTaskIds.add(taskKey);
-                        const delayMs = Math.max(100, Number(config.processingStatusDelayMs ?? 500));
-                        processingDelayTimer = setTimeout(() => {
-                            if (isGroup) {
-                                typingCardActivated = true;
-                                void setGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
-                            }
-                        }, delayMs);
-                    }
-
-                    let tryCount = 0;
-                    const maxRetries = config.maxRetries ?? 3;
-                    const retryDelayMs = config.retryDelayMs ?? 3000;
-
-                    try {
-                        for (tryCount = 0; tryCount <= maxRetries; tryCount++) {
-                            deliveredAnything = false;
-                            try {
-                                if (tryCount > 0) {
-                                    console.log(`[QQ] Model request failed or returned empty. Retrying (${tryCount}/${maxRetries}) after ${retryDelayMs}ms...`);
-                                    await sleep(retryDelayMs);
-                                }
-
-                                let currentCfg = cfg as any;
-                                const matchedAgentId = route.agentId;
-                                const matchedAgentConfig = (currentCfg.agents?.list || []).find((a: any) => a.id === matchedAgentId);
-                                const rawModelConfig = matchedAgentConfig?.model || currentCfg.agents?.defaults?.model;
-
-                                // If tryCount >= 2 (i.e. 3rd attempt), start trying fallback models if defined
-                                if (tryCount >= 2 && typeof rawModelConfig === 'object' && Array.isArray(rawModelConfig.fallbacks) && rawModelConfig.fallbacks.length > 0) {
-                                    const fallbacks = rawModelConfig.fallbacks;
-                                    const fallbackIndex = Math.min(tryCount - 2, fallbacks.length - 1);
-                                    const selectedFallback = fallbacks[fallbackIndex];
-                                    console.log(`[QQ] Failover triggered: Switching to fallback model ${selectedFallback}`);
-
-                                    currentCfg = {
-                                        ...currentCfg,
-                                        agents: {
-                                            ...(currentCfg.agents || {}),
-                                            defaults: {
-                                                ...(currentCfg.agents?.defaults || {}),
-                                                model: selectedFallback
-                                            },
-                                            list: (currentCfg.agents?.list || []).map((a: any) => {
-                                                if (a.id === matchedAgentId) {
-                                                    return { ...a, model: selectedFallback };
-                                                }
-                                                return a;
-                                            })
-                                        }
-                                    };
-                                }
-
-                                const dispatchStartTime = Date.now();
-                                let dispatchError: any = null;
-                                try {
-                                    await runtime.channel.reply.dispatchReplyFromConfig({ ctx: ctxPayload, cfg: currentCfg, dispatcher, replyOptions });
-                                } catch (err) {
-                                    dispatchError = err;
-                                    console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, err);
-                                }
-                                const dispatchDurationMs = Date.now() - dispatchStartTime;
-
-                                if (dispatchError) {
-                                    if (tryCount === maxRetries) {
-                                        if (config.enableErrorNotify) deliver({ text: "⚠️ 服务调用失败，请稍后重试。" });
-                                    }
-                                    continue;
-                                }
-
-                                const shouldFallback = config.enableEmptyReplyFallback !== false && !text.trim().startsWith('/');
-                                if (deliveredAnything || !shouldFallback) {
-                                    break;
-                                }
-
-                                // If nothing was delivered and no error was thrown, it's either an empty reply or a queue drop.
-                                // If the run finished almost instantly (< 500ms), it means OpenClaw core dropped the message 
-                                // (e.g., due to active concurrency limit or duplicate detection). 
-                                // In this case, we MUST NOT retry, as it will just instantly drop again and loop.
-                                if (dispatchDurationMs < 500) {
-                                    console.log(`[QQ] Message dropped by core queue policy (duration ${dispatchDurationMs}ms). Skipping retries.`);
-                                    break;
-                                }
-
-                                if (tryCount === maxRetries) {
-                                    const fallbackText = (config.emptyReplyFallbackText || "⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。").trim();
-                                    if (fallbackText) {
-                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${fallbackText}`);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, fallbackText);
-                                        else client.sendPrivateMsg(userId, fallbackText);
-                                    }
-                                }
-                            } catch (error) {
-                                console.error(`[QQ] Error during retry loop processing:`, error);
-                            }
+                    enqueueQQMessageForDispatch(
+                        route.sessionKey,
+                        { ctxPayload, executeDispatch },
+                        config,
+                        (msg: string) => {
+                            if (isGroup) client.sendGroupMsg(groupId, msg);
+                            else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, msg);
+                            else client.sendPrivateMsg(userId, msg);
                         }
-                    } catch (error) {
-                        console.error(`[QQ] Outer error:`, error);
-                    }
-                    finally {
-                        clearProcessingTimers();
-                        activeTaskIds.delete(taskKey);
-                        if (typingCardActivated && isGroup) {
-                            clearGroupTypingCard(client, account.accountId, groupId);
-                        }
-                    }
+                    );
                 } catch (err) {
                     console.error("[QQ] Critical error in message handler:", err);
                 }

@@ -79,6 +79,7 @@ export const QQConfigSchema = z.object({
   emptyReplyFallbackText: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。")).describe("空回复兜底文案。示例：⚠️ 本轮模型返回空内容，请 /newsession 后重试。"),
   maxRetries: NumberInputSchema(3).describe("模型请求失败或返回空回复时的最大自动重试次数。默认3。"),
   retryDelayMs: NumberInputSchema(3000).describe("自动重试之间的间隔时间（毫秒，默认 3000）。"),
+  fastFailErrors: z.array(z.string()).optional().default(["无效的API Key", "No API key found", "not found", "未传有效鉴权凭证", "401", "Unauthorized", "API key", "billing", "余额不足", "已欠费"]).describe("遇到这些报错时不再耗费重试次数，直接跳过当前模型。"),
   showProcessingStatus: BooleanInputSchema(true).describe("忙碌状态可视化开关（默认开启）。开启后，机器人在群里处理任务时会临时把自己的群名片改成“(输入中)”后缀。"),
   processingStatusDelayMs: NumberInputSchema(500).describe("触发“输入中”群名片后缀的延迟（毫秒，默认 500）。"),
   processingStatusIntervalMs: NumberInputSchema(0).describe("保留字段（当前未使用）。"),
@@ -104,8 +105,9 @@ export const QQConfigSchema = z.object({
   maxTotalContextChars: NumberInputSchema(3000).describe("reply/forward 总注入字符上限。默认 3000。"),
   includeSenderInLayers: BooleanInputSchema(true).describe("层级上下文里是否包含发送者昵称/ID。"),
   includeCurrentOutline: BooleanInputSchema(true).describe("是否注入当前消息概要层。"),
-  debugLayerTrace: BooleanInputSchema(false).describe("调试开关：打印 reply/forward 分层解析链路（仅用于排错）。"),
   rateLimitMs: NumberInputSchema(1000).describe("多段消息发送间隔（毫秒）。建议 1000。"),
+  enableQueueNotify: BooleanInputSchema(true).describe("当消息进入防抖合并队列时，是否发送提示（由于已经是静默合并，建议设为false或保持默认）。"),
+  queueDebounceMs: NumberInputSchema(3000).describe("连续消息合并防抖等待时间（毫秒，默认 3000）。"),
 }).passthrough();
 
 export type QQConfig = z.infer<typeof QQConfigSchema>;
