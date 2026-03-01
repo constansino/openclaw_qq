@@ -2194,7 +2194,13 @@ ${current}
                     let dispatcherError: any = null;
 
                     const deliver = async (payload: any) => {
-                        if (payload.isError) {
+                        const isTextFailure = payload.text && (
+                            payload.text.includes("Agent failed before reply:") ||
+                            payload.text.includes("Context overflow") ||
+                            payload.text.includes("Message ordering conflict")
+                        );
+
+                        if (payload.isError || isTextFailure) {
                             dispatcherError = new Error(payload.text || "API Error");
                             return;
                         }
