@@ -191,6 +191,7 @@ openclaw setup qq
 | `blockedNotifyCooldownMs` | number | `10000` | 非管理员提示防抖（毫秒）。同一用户在同一会话内重复触发时，冷却期内不重复提示。 |
 | `maxRetries` | number | `3` | **最大重试次数**。模型请求失败或返回空回复时自动重试的次数；重试第3次起将尝试启用 `openclaw.json` 定义的 `fallbacks` 备用大模型。 |
 | `retryDelayMs` | number | `3000` | **重试等待延迟**。每次重试之间的等待时间（毫秒）。 |
+| `fastFailErrors` | array | `["401", ...]` | 包含特定错误文本（如 `"API Key Invalid"`, `"401"`, `"余额不足"`）的数组。当触发这些不可恢复的授权/扣费错误时，系统不再等待 `maxRetries` 的时间，而是直接“光速跳过”当前模型，瞬间切换至备用模型，有效防止插件防抖卡死。 |
 | `enableEmptyReplyFallback` | boolean | `true` | 空回复兜底开关。模型返回空内容时，自动发提示，避免看起来“机器人没反应”。 |
 | `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | 空回复兜底提示文案。 |
 | `showProcessingStatus` | boolean | `true` | 忙碌状态可视化（默认开启）。处理中会把机器人群名片临时改为 `（输入中）` 后缀。 |
@@ -255,7 +256,11 @@ openclaw setup qq
 }
 ```
 
-> **触发机制**：当单次对话请求触发了重试的 **第 3 次（即 maxRetries 设为 3 及以上时，tryCount >= 2）** 时，系统才会尝试进入备用列表，并按顺序采用 `fallbacks` 中的模型提供商重试。
+> **触发机制**：对于常规的网络超时错误，系统将在当前模型上反复尝试最多 `maxRetries` 次。但如果返回的错误文本包含了 `fastFailErrors` 数组中定义的词组（如 "401"、"无效的API Key" 等严重授权异常），系统会直接跳过重试等待，**瞬间切换 (Fast Fail)** 至下一个可用的 `fallbacks` 备用大模型。
+
+### 7. 智能并发防止漏吞消息 (Concurrency Queue)
+
+插件内置了基于特定群组/用户的滑动窗口防抖队列，可极大降低消息丢失的风险。如果 5 个群友同时在群里对机器人说话，队列会将这 5 条并发事件安全地打包收集为上下文组合，并确保它们被串行处理，而不会像以前那样被 OpenClaw 核心因并发繁忙而直接拒收丢弃。
 
 ---
 

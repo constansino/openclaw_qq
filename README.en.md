@@ -178,6 +178,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `blockedNotifyCooldownMs` | number | `10000` | Cooldown (ms) for non-admin rejection notices. Prevents repeated notices within the same session/user target. |
 | `maxRetries` | number | `3` | **Max auto-retries**. Number of retries when model requests fail or return empty; switches to `fallbacks` array models starting from the 3rd attempt. |
 | `retryDelayMs` | number | `3000` | Delay in milliseconds between retries. |
+| `fastFailErrors` | array | `["401", ...]` | A list of string keywords (e.g., `"No API key found"`, `"API Key"`, `"401"`) that instantly skip the `maxRetries` wait and immediately trigger the model fallback mechanism to avoid locking up the plugin on unrecoverable authentication errors. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
 | `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |
@@ -243,7 +244,12 @@ To configure this, find or add the `model` object field inside your `openclaw.js
 }
 ```
 
-> **Trigger Condition**: The system will only attempt to switch to the fallback models starting from the **3rd attempt** (meaning when `maxRetries` is at least 3, and `tryCount >= 2`).
+> **Trigger Condition**: General network errors will attempt to retry on the current model up to `maxRetries` times. However, if the error contains a phrase defined in `fastFailErrors` (e.g., "401", "API Key Invalid"), the system skips the retries and **instantly jumps** to the next available `fallbacks` model to avoid waiting.
+
+### 7. Smart Concurrency Queue
+
+The plugin implements a localized sliding-window debounce queue per-group/per-user to mitigate the risk of message dropping. If 5 users talk to the bot in a group simultaneously, the queue will capture all 5 events, combine them as context, and ensure they are sequentially processed instead of OpenClaw rejecting concurrent events as busy.
+
 
 ---
 
