@@ -8,6 +8,9 @@ OpenClawd is a multi-purpose agent. The chat demo below only shows the most basi
 - Improved outbound reliability: failed WS sends are re-queued and trigger reconnect, reducing "logged as sent but not delivered in QQ" cases.
 - Added heartbeat event passthrough from client to upper layer for better health visibility.
 - Added multi-layer context parsing: recursive `reply/forward` expansion with layered text/image/file hints injected into context.
+- Added auto-retry + Fast Fail: supports `maxRetries` / `retryDelayMs` / `fastFailErrors`, and can skip waiting on unrecoverable errors.
+- Added Active Model Failover: automatically switches to `fallbacks` in `openclaw.json` when the primary model repeatedly fails or returns empty output.
+- Added concurrency anti-drop queue: concurrent messages in the same session are debounced and serialized to reduce "busy drop" cases.
 
 This plugin adds full-featured QQ channel support to [OpenClaw](https://github.com/openclaw/openclaw) via the OneBot v11 protocol (WebSocket). It supports not only basic chat, but also group administration, QQ Guild channels, multimodal interaction, and production-grade risk controls.
 
@@ -179,6 +182,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `maxRetries` | number | `3` | **Max auto-retries**. Number of retries when model requests fail or return empty; switches to `fallbacks` array models starting from the 3rd attempt. |
 | `retryDelayMs` | number | `3000` | Delay in milliseconds between retries. |
 | `fastFailErrors` | array | `["401", ...]` | A list of string keywords (e.g., `"No API key found"`, `"API Key"`, `"401"`) that instantly skip the `maxRetries` wait and immediately trigger the model fallback mechanism to avoid locking up the plugin on unrecoverable authentication errors. |
+| `queueDebounceMs` | number | `3000` | Debounce window (ms) for the concurrency queue. Burst messages in the same session are grouped before dispatch to reduce drops. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
 | `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |
@@ -249,6 +253,10 @@ To configure this, find or add the `model` object field inside your `openclaw.js
 ### 7. Smart Concurrency Queue
 
 The plugin implements a localized sliding-window debounce queue per-group/per-user to mitigate the risk of message dropping. If 5 users talk to the bot in a group simultaneously, the queue will capture all 5 events, combine them as context, and ensure they are sequentially processed instead of OpenClaw rejecting concurrent events as busy.
+
+- Debounce window: controlled by `queueDebounceMs` (default `3000ms`).
+- Scope: local to each session key (group/direct/channel), not a global single queue.
+- Tuning: increase to `4000~6000` for heavy group bursts; decrease to `1000~2000` if you prefer lower latency.
 
 
 ---
