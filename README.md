@@ -13,6 +13,9 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 - 新增自动重试 + Fast Fail：支持 `maxRetries` / `retryDelayMs` / `fastFailErrors`，不可恢复错误可直接跳过等待。
 - 新增 Active Model Failover：主模型连续失败或空回复时，自动切到 `openclaw.json` 的 `fallbacks` 备用模型。
 - 新增并发防漏吞队列：同会话并发消息先进入防抖窗口再串行分发，降低“并发忙导致直接丢消息”风险。
+- 新增隐藏 QQ 元数据注入：可向模型注入会话来源、触发方式、会话标签等网关上下文（默认开启）。
+- 新增同会话“新消息打断旧回复”：发送中若收到新消息，旧轮输出会被软中断并切换到最新请求。
+- 新增长回复自动合并转发：支持按阈值自动改用 QQ 合并转发输出，减少群内刷屏。
 
 # OpenClaw QQ 插件 (OneBot v11)
 
@@ -27,6 +30,7 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **系统提示词 (System Prompt)**：支持注入自定义提示词，让 Bot 扮演特定角色（如“猫娘”、“严厉的管理员”）。
 *   **多层 reply/forward 解析**：AI 可递归展开引用链与合并转发链路，按层读取上下文、图片和文件线索，处理复杂信息更稳定。
 *   **关键词唤醒**：除了 @机器人，支持配置特定的关键词（如“小助手”）来触发对话。
+*   **隐藏网关元数据注入**：默认向系统上下文追加 `<qq_context>` 块（对用户不可见），帮助模型更稳地理解触发来源与会话类型。
 
 ### 🛡️ 强大的管理与风控
 *   **模型故障转移 (Active Model Failover)**：当主大模型 API 出现由于限流、宕机导致的超时报错，或持续返回空回复时，自带带有退避逻辑的重试机制，并在达到重试阈值（第3次重试）时自动、无缝地切换至核心配置 (`openclaw.json`) 中 `fallbacks` 数组定义的备用模型，双重保障不漏回消息。
@@ -46,7 +50,9 @@ OpenClawd 是一个多功能代理。下面的聊天演示仅展示了最基础�
 *   **戳一戳 (Poke)**：当用户“戳一戳”机器人时，AI 会感知到并做出有趣的回应。
 *   **拟人化回复**：
     *   **自动 @**：在群聊回复时，自动 @原发送者（仅在第一段消息），符合人类社交礼仪。
+    *   **新消息可打断旧回复**：同一会话里，若上一轮还在发送，收到新消息会优先切到新请求，避免“越回越乱”。
     *   **昵称解析**：将消息中的 `[CQ:at]` 代码转换为真实昵称（如 `@张三`），AI 回复更自然。
+    *   **长回复自动合并转发**：可配置字符阈值，超过后自动改用 QQ 合并转发发送，减少多段刷屏。
 *   **多模态支持**：
     *   **图片**：支持收发图片。优化了对 `base64://` 格式的支持，即使 Bot 与 OneBot 服务端不在同一局域网也可正常交互。
     *   **语音**：接收语音消息（需服务端支持 STT）并可选开启 TTS 语音回复。
@@ -152,7 +158,12 @@ openclaw setup qq
       "rateLimitMs": 1000,
       "formatMarkdown": true,
       "antiRiskMode": false,
-      "maxMessageLength": 4000
+      "maxMessageLength": 4000,
+      "injectGatewayMeta": true,
+      "interruptOnNewMessage": true,
+      "forwardLongReplyThreshold": 0,
+      "forwardNodeCharLimit": 1000,
+      "forwardNodeName": "OpenClaw"
     }
   },
   "plugins": {
@@ -196,6 +207,11 @@ openclaw setup qq
 | `retryDelayMs` | number | `3000` | **重试等待延迟**。每次重试之间的等待时间（毫秒）。 |
 | `fastFailErrors` | array | `["401", ...]` | 包含特定错误文本（如 `"API Key Invalid"`, `"401"`, `"余额不足"`）的数组。当触发这些不可恢复的授权/扣费错误时，系统不再等待 `maxRetries` 的时间，而是直接“光速跳过”当前模型，瞬间切换至备用模型，有效防止插件防抖卡死。 |
 | `queueDebounceMs` | number | `3000` | 并发消息队列防抖窗口（毫秒）。同会话短时间内的多条消息会先聚合后再分发，减少并发漏吞。 |
+| `injectGatewayMeta` | boolean | `true` | 是否注入隐藏 QQ 网关元数据（`<qq_context>`），用于增强模型对会话来源和触发方式的理解。 |
+| `interruptOnNewMessage` | boolean | `true` | 同会话收到新消息时，是否软中断上一轮回复并切换到最新请求。 |
+| `forwardLongReplyThreshold` | number | `0` | 长回复自动改用 QQ 合并转发的阈值（字符数）。`0` 表示关闭。 |
+| `forwardNodeCharLimit` | number | `1000` | 长回复合并转发时，每个节点的字符上限。 |
+| `forwardNodeName` | string | `OpenClaw` | 长回复合并转发时，节点显示名称。 |
 | `enableEmptyReplyFallback` | boolean | `true` | 空回复兜底开关。模型返回空内容时，自动发提示，避免看起来“机器人没反应”。 |
 | `emptyReplyFallbackText` | string | `⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。` | 空回复兜底提示文案。 |
 | `showProcessingStatus` | boolean | `true` | 忙碌状态可视化（默认开启）。处理中会把机器人群名片临时改为 `（输入中）` 后缀。 |

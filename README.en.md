@@ -11,6 +11,9 @@ OpenClawd is a multi-purpose agent. The chat demo below only shows the most basi
 - Added auto-retry + Fast Fail: supports `maxRetries` / `retryDelayMs` / `fastFailErrors`, and can skip waiting on unrecoverable errors.
 - Added Active Model Failover: automatically switches to `fallbacks` in `openclaw.json` when the primary model repeatedly fails or returns empty output.
 - Added concurrency anti-drop queue: concurrent messages in the same session are debounced and serialized to reduce "busy drop" cases.
+- Added hidden QQ metadata injection: optional gateway context (trigger type/session label/source) can be injected into system context (enabled by default).
+- Added same-session interruption: when a new message arrives, in-progress old reply output is soft-interrupted and switched to the latest request.
+- Added long-reply forward mode: replies over a configurable threshold can be sent as QQ merged forward messages to reduce spam.
 
 This plugin adds full-featured QQ channel support to [OpenClaw](https://github.com/openclaw/openclaw) via the OneBot v11 protocol (WebSocket). It supports not only basic chat, but also group administration, QQ Guild channels, multimodal interaction, and production-grade risk controls.
 
@@ -21,6 +24,7 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 * **System Prompt**: Inject custom prompts so the bot can play specific roles (for example, a “catgirl” or a “strict admin”).
 * **Multi-layer Reply/Forward Parsing**: The AI can recursively expand reply chains and merged forwards, injecting layered text/image/file hints for more reliable context understanding.
 * **Keyword Wake-up**: In addition to @mentions, you can configure specific keywords (for example, “assistant”) to trigger conversation.
+* **Hidden Gateway Metadata Injection**: Appends a hidden `<qq_context>` block (not visible to end users) so the model can better understand trigger source and session type.
 
 ### 🛡️ Powerful Management & Risk Control
 * **Active Model Failover**: Built-in retry mechanism with backoff logic. If the primary LLM API fails due to rate limits/timeouts or returns an empty response repeatedly, it automatically and seamlessly switches to defined fallback models in `openclaw.json` (triggering on the 3rd attempt) to guarantee 24/7 chat availability.
@@ -40,7 +44,9 @@ This plugin adds full-featured QQ channel support to [OpenClaw](https://github.c
 * **Poke**: When a user pokes the bot, the AI can detect it and respond in a fun way.
 * **Human-like Replies**:
   * **Auto @mention**: In group replies, automatically @mentions the original sender (first segment only), matching human social norms.
+  * **Interrupt Old Reply on New Input**: In the same session, if a new message arrives while replying, output switches to the latest request.
   * **Nickname Resolution**: Converts `[CQ:at]` codes to real nicknames (for example, `@ZhangSan`) so replies feel more natural.
+  * **Long Reply as Merged Forward**: You can set a character threshold; once exceeded, the plugin sends QQ merged forward messages instead of many split chunks.
 * **Multimodal Support**:
   * **Images**: Supports sending and receiving images. Optimized for `base64://` so it works even when the bot and OneBot server are not in the same LAN.
   * **Voice**: Receives voice messages (requires server-side STT support) and can optionally send TTS voice replies.
@@ -139,7 +145,12 @@ You can also edit config directly. Full config example:
       "rateLimitMs": 1000,
       "formatMarkdown": true,
       "antiRiskMode": false,
-      "maxMessageLength": 4000
+      "maxMessageLength": 4000,
+      "injectGatewayMeta": true,
+      "interruptOnNewMessage": true,
+      "forwardLongReplyThreshold": 0,
+      "forwardNodeCharLimit": 1000,
+      "forwardNodeName": "OpenClaw"
     }
   },
   "plugins": {
@@ -183,6 +194,11 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `retryDelayMs` | number | `3000` | Delay in milliseconds between retries. |
 | `fastFailErrors` | array | `["401", ...]` | A list of string keywords (e.g., `"No API key found"`, `"API Key"`, `"401"`) that instantly skip the `maxRetries` wait and immediately trigger the model fallback mechanism to avoid locking up the plugin on unrecoverable authentication errors. |
 | `queueDebounceMs` | number | `3000` | Debounce window (ms) for the concurrency queue. Burst messages in the same session are grouped before dispatch to reduce drops. |
+| `injectGatewayMeta` | boolean | `true` | Whether to inject hidden QQ gateway metadata (`<qq_context>`) for better model awareness of source/trigger/session. |
+| `interruptOnNewMessage` | boolean | `true` | Whether to soft-interrupt the in-progress reply when a newer message arrives in the same session. |
+| `forwardLongReplyThreshold` | number | `0` | Character threshold for auto-switching long replies to QQ merged forward mode. `0` disables this behavior. |
+| `forwardNodeCharLimit` | number | `1000` | Max chars per node when long replies are sent as merged forwards. |
+| `forwardNodeName` | string | `OpenClaw` | Display name used in merged forward nodes for long replies. |
 | `enableEmptyReplyFallback` | boolean | `true` | Empty-reply fallback switch. If the model returns empty content, the bot sends a user-visible hint instead of appearing silent. |
 | `emptyReplyFallbackText` | string | `⚠️ The model returned empty content this turn. Please retry, or run /newsession first.` | Fallback text used when a model turn returns empty output. |
 | `showProcessingStatus` | boolean | `true` | Busy-status visualization (enabled by default). While processing, the bot temporarily appends ` (输入中)` to its group card. |

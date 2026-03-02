@@ -25,13 +25,16 @@ export type ResolvedQQAccount = ChannelAccountSnapshot & {
 
 interface PendingQQMsg {
     ctxPayload: any;
-    executeDispatch: (mergedCtx: any) => Promise<void>;
+    runEpoch: number;
+    executeDispatch: (mergedCtx: any, runState: { isStale: () => boolean }) => Promise<void>;
 }
 
 interface SessionQueue {
     pendingPayloads: PendingQQMsg[];
     timer: ReturnType<typeof setTimeout> | null;
     isProcessing: boolean;
+    latestEpoch: number;
+    activeEpoch: number;
 }
 
 const sessionQueues = new Map<string, SessionQueue>();
@@ -41,10 +44,11 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
     if (!q || q.isProcessing || q.pendingPayloads.length === 0) return;
 
     q.isProcessing = true;
+    const payloads = q.pendingPayloads;
+    q.pendingPayloads = [];
+    const runEpoch = payloads[payloads.length - 1]?.runEpoch ?? q.latestEpoch;
+    q.activeEpoch = runEpoch;
     try {
-        const payloads = q.pendingPayloads;
-        q.pendingPayloads = [];
-
         const mergedCtx = { ...payloads[0].ctxPayload };
         if (payloads.length > 1) {
             const mergeText = (key: string) => {
@@ -72,10 +76,17 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
             }
         }
 
-        await payloads[0].executeDispatch(mergedCtx);
+        await payloads[0].executeDispatch(mergedCtx, {
+            isStale: () => {
+                const state = sessionQueues.get(sessionKey);
+                if (!state) return true;
+                return state.activeEpoch !== runEpoch || state.latestEpoch !== runEpoch;
+            },
+        });
 
     } finally {
         q.isProcessing = false;
+        q.activeEpoch = 0;
         if (q.pendingPayloads.length > 0 && !q.timer) {
             setTimeout(() => { void drainSessionQueue(sessionKey, config, sendMessageFn); }, 0);
         } else if (q.pendingPayloads.length === 0) {
@@ -87,11 +98,19 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
 function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, config: QQConfig, sendMessageFn: (msg: string) => void) {
     let q = sessionQueues.get(sessionKey);
     if (!q) {
-        q = { pendingPayloads: [], timer: null, isProcessing: false };
+        q = { pendingPayloads: [], timer: null, isProcessing: false, latestEpoch: 0, activeEpoch: 0 };
         sessionQueues.set(sessionKey, q);
     }
 
+    q.latestEpoch += 1;
+    msg.runEpoch = q.latestEpoch;
     q.pendingPayloads.push(msg);
+
+    if (config.interruptOnNewMessage !== false && q.isProcessing && q.activeEpoch > 0) {
+        if (config.enableQueueNotify !== false) {
+            sendMessageFn("[OpenClawQQ] 检测到新消息，正在中断上一轮回复并切换到新请求。");
+        }
+    }
 
     if (q.timer) clearTimeout(q.timer);
 
@@ -1184,6 +1203,82 @@ function splitMessage(text: string, limit: number): string[] {
     return chunks;
 }
 
+function buildQQHiddenMetaBlock(params: {
+    accountId: string;
+    userId: number;
+    isGroup: boolean;
+    isGuild: boolean;
+    groupId?: number;
+    guildId?: string;
+    channelId?: string;
+    conversationLabel: string;
+    sessionLabel: string;
+    senderName?: string;
+    isAdmin: boolean;
+    activeTempSlot: string | null;
+    mentionedByAt: boolean;
+    mentionedByReply: boolean;
+    keywordTriggered: boolean;
+}): string {
+    const chatType = params.isGroup ? "group" : params.isGuild ? "guild" : "direct";
+    const triggerSummary = [
+        params.mentionedByAt ? "mention" : "",
+        params.mentionedByReply ? "reply" : "",
+        params.keywordTriggered ? "keyword" : "",
+    ].filter(Boolean).join(",");
+    const lines = [
+        "<qq_context>",
+        `accountId=${params.accountId}`,
+        `chatType=${chatType}`,
+        `userId=${params.userId}`,
+        params.isGroup ? `groupId=${String(params.groupId ?? "")}` : "",
+        params.isGuild ? `guildId=${String(params.guildId ?? "")}` : "",
+        params.isGuild ? `channelId=${String(params.channelId ?? "")}` : "",
+        `senderName=${params.senderName || "unknown"}`,
+        `isAdmin=${String(params.isAdmin)}`,
+        `trigger=${triggerSummary || "normal"}`,
+        `tempSession=${params.activeTempSlot || "none"}`,
+        `conversationLabel=${params.conversationLabel}`,
+        `sessionLabel=${params.sessionLabel}`,
+        "</qq_context>",
+    ].filter(Boolean);
+    return `${lines.join("\n")}\n\n`;
+}
+
+async function sendLongTextAsForwardMessage(params: {
+    client: OneBotClient;
+    groupId: number;
+    text: string;
+    nodeName: string;
+    nodeUin: string;
+    nodeCharLimit: number;
+}): Promise<boolean> {
+    const nodeLimitRaw = Number(params.nodeCharLimit);
+    const safeNodeLimit = Number.isFinite(nodeLimitRaw) ? Math.max(200, Math.floor(nodeLimitRaw)) : 1000;
+    const chunks = splitMessage(params.text, safeNodeLimit);
+    const messages = chunks.map((chunk) => ({
+        type: "node",
+        data: {
+            name: params.nodeName,
+            uin: params.nodeUin,
+            content: chunk,
+        },
+    }));
+    const tries: Array<{ action: string; params: Record<string, unknown> }> = [
+        { action: "send_group_forward_msg", params: { group_id: params.groupId, messages } },
+        { action: "send_forward_msg", params: { group_id: params.groupId, messages } },
+    ];
+    for (const attempt of tries) {
+        try {
+            await (params.client as any).sendWithResponse(attempt.action, attempt.params, 15000);
+            return true;
+        } catch (err) {
+            // Try next action name for different OneBot implementations.
+        }
+    }
+    return false;
+}
+
 function stripMarkdown(text: string): string {
     return text
         .replace(/\*\*(.*?)\*\*/g, "$1") // Bold
@@ -2107,9 +2202,16 @@ ${current}
                     }
 
                     let isTriggered = forceTriggered || !isGroup || text.includes("[动作] 用户戳了你一下");
+                    let keywordTriggered = false;
                     const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
                     if (!isTriggered && keywordTriggers.length > 0) {
-                        for (const kw of keywordTriggers) { if (text.includes(kw)) { isTriggered = true; break; } }
+                        for (const kw of keywordTriggers) {
+                            if (text.includes(kw)) {
+                                isTriggered = true;
+                                keywordTriggered = true;
+                                break;
+                            }
+                        }
                     }
 
                     let mentionedByAt = false;
@@ -2161,10 +2263,13 @@ ${current}
                     }
 
                     let baseFromId = `qq:user:${userId}`;
+                    let conversationLabel = `QQ User ${userId}`;
                     if (isGroup) {
                         baseFromId = String(groupId);
+                        conversationLabel = `QQ Group ${groupId}`;
                     } else if (isGuild) {
                         baseFromId = `guild:${guildId}:${channelId}`;
+                        conversationLabel = `QQ Guild ${guildId} Channel ${channelId}`;
                     }
                     const fromId = buildEffectiveFromId(baseFromId, activeTempSlot);
                     const sessionLabel = buildQQSessionLabel({
@@ -2192,8 +2297,10 @@ ${current}
 
                     let deliveredAnything = false;
                     let dispatcherError: any = null;
+                    let currentRunState: { isStale: () => boolean } | null = null;
 
                     const deliver = async (payload: any) => {
+                        if (currentRunState?.isStale()) return;
                         const isTextFailure = payload.text && (
                             payload.text.includes("Agent failed before reply:") ||
                             payload.text.includes("Context overflow") ||
@@ -2204,13 +2311,31 @@ ${current}
                             dispatcherError = new Error(payload.text || "API Error");
                             return;
                         }
-                        const send = async (msg: string) => {
+                        const send = async (msg: string): Promise<boolean> => {
+                            if (currentRunState?.isStale()) return false;
                             let processed = msg;
                             if (config.formatMarkdown) processed = stripMarkdown(processed);
                             if (config.antiRiskMode) processed = processAntiRisk(processed);
                             processed = await resolveInlineCqRecord(processed);
+                            if (currentRunState?.isStale()) return false;
+
+                            const forwardThreshold = Number(config.forwardLongReplyThreshold ?? 0);
+                            if (isGroup && Number.isFinite(forwardThreshold) && forwardThreshold > 0 && processed.length >= forwardThreshold) {
+                                const sentAsForward = await sendLongTextAsForwardMessage({
+                                    client,
+                                    groupId,
+                                    text: processed,
+                                    nodeName: (config.forwardNodeName || "OpenClaw").trim() || "OpenClaw",
+                                    nodeUin: String(client.getSelfId() || userId),
+                                    nodeCharLimit: Number(config.forwardNodeCharLimit ?? 1000),
+                                });
+                                if (currentRunState?.isStale()) return false;
+                                if (sentAsForward) return true;
+                            }
+
                             const chunks = splitMessage(processed, config.maxMessageLength || 4000);
                             for (let i = 0; i < chunks.length; i++) {
+                                if (currentRunState?.isStale()) return i > 0;
                                 let chunk = chunks[i];
                                 if (isGroup && i === 0) chunk = `[CQ:at,qq=${userId}] ${chunk}`;
 
@@ -2228,16 +2353,18 @@ ${current}
 
                                 if (chunks.length > 1 && config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                             }
+                            return chunks.length > 0;
                         };
                         if (payload.text && payload.text.trim()) {
-                            deliveredAnything = true;
-                            await send(payload.text);
+                            const sentText = await send(payload.text);
+                            if (sentText) deliveredAnything = true;
                         }
                         if (payload.files) {
-                            if (payload.files.length > 0) deliveredAnything = true;
                             for (const f of payload.files) {
+                                if (currentRunState?.isStale()) return;
                                 if (f.url) {
                                     const url = await resolveMediaUrl(f.url);
+                                    if (currentRunState?.isStale()) return;
                                     if (isImageFile(url)) {
                                         const imgMsg = `[CQ:image,file=${url}]`;
                                         if (isGroup) client.sendGroupMsg(groupId, imgMsg);
@@ -2254,6 +2381,7 @@ ${current}
                                         else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, `[文件] ${url}`);
                                         else client.sendPrivateMsg(userId, txtMsg);
                                     }
+                                    deliveredAnything = true;
                                     if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                                 }
                             }
@@ -2272,6 +2400,25 @@ ${current}
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
                     let bodyWithReply = cleanCQCodes(text) + replySuffix;
                     let systemBlock = "";
+                    if (config.injectGatewayMeta !== false) {
+                        systemBlock += buildQQHiddenMetaBlock({
+                            accountId: account.accountId,
+                            userId,
+                            isGroup,
+                            isGuild,
+                            groupId,
+                            guildId,
+                            channelId,
+                            conversationLabel,
+                            sessionLabel,
+                            senderName: event.sender?.nickname || event.sender?.card || "Unknown",
+                            isAdmin,
+                            activeTempSlot,
+                            mentionedByAt,
+                            mentionedByReply,
+                            keywordTriggered,
+                        });
+                    }
                     if (config.systemPrompt) systemBlock += `<system>${config.systemPrompt}</system>\n\n`;
                     if (historyContext) systemBlock += `<history>\n${historyContext}\n</history>\n\n`;
                     if (config.debugLayerTrace) {
@@ -2329,7 +2476,8 @@ ${current}
                         onRecordError: (err) => console.error("QQ Session Error:", err)
                     });
 
-                    const executeDispatch = async (mergedCtx: any) => {
+                    const executeDispatch = async (mergedCtx: any, runState: { isStale: () => boolean }) => {
+                        currentRunState = runState;
                         let processingDelayTimer: ReturnType<typeof setTimeout> | null = null;
                         let typingCardActivated = false;
                         const taskKey = buildTaskKey(account.accountId, isGroup, isGuild, groupId, guildId, channelId, userId);
@@ -2370,6 +2518,9 @@ ${current}
 
                                 const modelToTest = modelsToTry[modelIndex] || rawModelConfig.primary;
                                 let currentCfg = cfg as any;
+                                if (runState.isStale()) {
+                                    break out_loop;
+                                }
 
                                 if (modelIndex > 0) {
                                     console.log(`[QQ] Failover triggered: Switching to fallback model ${modelToTest}`);
@@ -2399,6 +2550,9 @@ ${current}
                                 };
 
                                 for (let tryCount = 0; tryCount <= maxRetries; tryCount++) {
+                                    if (runState.isStale()) {
+                                        break out_loop;
+                                    }
                                     deliveredAnything = false;
                                     globalDispatchError = null;
                                     dispatcherError = null;
@@ -2406,6 +2560,9 @@ ${current}
                                         if (tryCount > 0) {
                                             console.log(`[QQ] Model request failed or returned empty. Retrying (${tryCount}/${maxRetries}) after ${retryDelayMs}ms...`);
                                             await sleep(retryDelayMs);
+                                            if (runState.isStale()) {
+                                                break out_loop;
+                                            }
                                         }
 
                                         const dispatchStartTime = Date.now();
@@ -2416,6 +2573,9 @@ ${current}
                                             console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, err);
                                         }
                                         const dispatchDurationMs = Date.now() - dispatchStartTime;
+                                        if (runState.isStale()) {
+                                            break out_loop;
+                                        }
 
                                         globalDispatchError = globalDispatchError || dispatcherError;
                                         const errMessage = globalDispatchError ? ((globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError)) : "";
@@ -2445,10 +2605,10 @@ ${current}
                                         }
 
                                         if (tryCount === maxRetries) {
-                                            if (modelIndex === modelsToTry.length - 1) {
-                                                if (globalDispatchError) {
-                                                    const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
-                                                    const notifyMsg = errMessage.trim() ? `⚠️ 服务调用失败: ${errMessage}` : "⚠️ 服务调用失败，无具体错误信息，请稍后重试。";
+                                                if (modelIndex === modelsToTry.length - 1 && !runState.isStale()) {
+                                                    if (globalDispatchError) {
+                                                        const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
+                                                        const notifyMsg = errMessage.trim() ? `⚠️ 服务调用失败: ${errMessage}` : "⚠️ 服务调用失败，无具体错误信息，请稍后重试。";
                                                     if (config.enableErrorNotify) deliver({ text: notifyMsg });
                                                 } else {
                                                     const fallbackText = (config.emptyReplyFallbackText || "⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。").trim();
@@ -2470,6 +2630,7 @@ ${current}
                             console.error(`[QQ] Outer error:`, error);
                         }
                         finally {
+                            currentRunState = null;
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
                             if (typingCardActivated && isGroup) {
@@ -2480,7 +2641,7 @@ ${current}
 
                     enqueueQQMessageForDispatch(
                         route.sessionKey,
-                        { ctxPayload, executeDispatch },
+                        { ctxPayload, executeDispatch, runEpoch: 0 },
                         config,
                         (msg: string) => {
                             if (isGroup) client.sendGroupMsg(groupId, msg);

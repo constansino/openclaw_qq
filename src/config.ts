@@ -108,6 +108,11 @@ export const QQConfigSchema = z.object({
   rateLimitMs: NumberInputSchema(1000).describe("多段消息发送间隔（毫秒）。建议 1000。"),
   enableQueueNotify: BooleanInputSchema(true).describe("当消息进入防抖合并队列时，是否发送提示（由于已经是静默合并，建议设为false或保持默认）。"),
   queueDebounceMs: NumberInputSchema(3000).describe("连续消息合并防抖等待时间（毫秒，默认 3000）。"),
+  injectGatewayMeta: BooleanInputSchema(true).describe("是否在系统提示前注入隐藏 QQ 网关元数据（会话来源、触发方式、会话标签等）。默认开启。"),
+  interruptOnNewMessage: BooleanInputSchema(true).describe("同会话新消息到达时，是否中断上一轮回复并优先处理最新请求。默认开启。"),
+  forwardLongReplyThreshold: NumberInputSchema(0).describe("长回复自动转为 QQ 合并转发的阈值（字符数）。0=关闭该功能。"),
+  forwardNodeCharLimit: NumberInputSchema(1000).describe("启用长回复合并转发时，每个转发节点的最大字符数。默认 1000。"),
+  forwardNodeName: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("OpenClaw")).describe("启用长回复合并转发时，节点显示昵称。默认 OpenClaw。"),
 }).passthrough();
 
 export type QQConfig = z.infer<typeof QQConfigSchema>;
