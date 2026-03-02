@@ -2572,6 +2572,13 @@ ${current}
                                             globalDispatchError = err;
                                             console.error(`[QQ] Error during dispatchReplyFromConfig (attempt ${tryCount + 1}/${maxRetries + 1}):`, err);
                                         }
+                                        try {
+                                            // Reply dispatch is buffered; wait until queued deliveries settle
+                                            // before checking deliveredAnything/globalDispatchError for retry logic.
+                                            await dispatcher.waitForIdle();
+                                        } catch (idleErr) {
+                                            console.warn(`[QQ] Failed while waiting dispatcher idle: ${String(idleErr)}`);
+                                        }
                                         const dispatchDurationMs = Date.now() - dispatchStartTime;
                                         if (runState.isStale()) {
                                             break out_loop;
@@ -2630,6 +2637,12 @@ ${current}
                             console.error(`[QQ] Outer error:`, error);
                         }
                         finally {
+                            try {
+                                dispatcher.markComplete();
+                                await dispatcher.waitForIdle();
+                            } catch (idleErr) {
+                                console.warn(`[QQ] Failed during dispatcher completion: ${String(idleErr)}`);
+                            }
                             currentRunState = null;
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
