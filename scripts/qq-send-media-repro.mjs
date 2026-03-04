@@ -42,12 +42,12 @@ async function main() {
 
   const wsUrl = args.ws || process.env.ONEBOT_WS_URL;
   const token = args.token || process.env.ONEBOT_ACCESS_TOKEN || "";
-  const group = args.group || "883766069";
+  const group = args.group || "20000001";
   const mp4 = args.mp4;
   const txt = args.txt;
 
   if (!wsUrl || !mp4 || !txt) {
-    console.error("Usage: node scripts/qq-send-media-repro.mjs --ws ws://127.0.0.1:3001 --token xxx --group 883766069 --mp4 /openclaw_media/test.mp4 --txt /openclaw_media/test.txt");
+    console.error("Usage: node scripts/qq-send-media-repro.mjs --ws ws://127.0.0.1:3001 --token xxx --group 20000001 --mp4 /openclaw_media/test.mp4 --txt /openclaw_media/test.txt");
     process.exit(2);
   }
 

@@ -1,5 +1,15 @@
-OpenClawd is a multi-purpose agent. The chat demo below only shows the most basic capabilities.
 # OpenClaw QQ Plugin (OneBot v11)
+
+## 📢 Official Discussion Channel (Primary)
+
+**Designated forum for this plugin:**  
+**https://aiya.de5.net/c/25-category/25**
+
+- We do not run a QQ group for plugin support.
+- All questions, updates, and feedback are centralized on the forum.
+- Forum threads are easier to search and better for long-term knowledge retention.
+
+OpenClawd is a multi-purpose agent. The chat demo below only shows the most basic capabilities.
 
 ## Recent Updates (2026-02)
 
@@ -100,22 +110,13 @@ In your `docker-compose.yml` or `Dockerfile`, copy this plugin code into `/app/e
 
 ## ⚙️ Configuration
 
-### 1. Quick Setup (CLI Onboarding)
-The plugin includes an interactive setup script to quickly generate config.
-Run in plugin directory (`openclaw/extensions/qq`):
-
-```bash
-node bin/onboard.js
-```
-Follow prompts to enter WebSocket URL (for example, `ws://localhost:3001`), token, and admin QQ IDs.
-
-### 2. Standard Setup (OpenClaw Setup)
+### 1. Standard Setup (OpenClaw Setup)
 If integrated into OpenClaw CLI, run:
 ```bash
 openclaw setup qq
 ```
 
-### 3. Manual Configuration (`openclaw.json`)
+### 2. Manual Configuration (`openclaw.json`)
 You can also edit config directly. Full config example:
 
 ```json
@@ -164,7 +165,7 @@ You can also edit config directly. Full config example:
 }
 ```
 
-### 4. Cross-Channel DM Session Isolation (Strongly Recommended)
+### 3. Cross-Channel DM Session Isolation (Strongly Recommended)
 
 If you run multiple DM channels at the same time (for example Telegram + QQ + Feishu), enable this top-level OpenClaw setting:
 
@@ -185,7 +186,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | :--- | :--- | :--- | :--- |
 | `wsUrl` | string | **Required** | OneBot v11 WebSocket URL |
 | `accessToken` | string | - | Connection auth token |
-| `admins` | string | `""` | **Admin QQ ID list (string)**. In Web form: `1838552185,123456789`; in Raw JSON: `"1838552185,123456789"`. Used for admin command permissions like `/status`, `/kick`. |
+| `admins` | string | `""` | **Admin QQ ID list (string)**. In Web form: `10000001,123456789`; in Raw JSON: `"10000001,123456789"`. Used for admin command permissions like `/status`, `/kick`. |
 | `adminOnlyChat` | boolean | `false` | **Only admins can trigger chat replies**. When enabled, non-admins cannot trigger conversations even if they @mention the bot (useful to prevent token abuse). |
 | `notifyNonAdminBlocked` | boolean | `false` | When `adminOnlyChat=true` and a non-admin triggers, whether to send a rejection notice. |
 | `nonAdminBlockedMessage` | string | `Only admins can trigger this bot currently.\nPlease contact an administrator if you need access.` | Rejection message shown to blocked non-admin users. |
@@ -205,8 +206,8 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `processingStatusDelayMs` | number | `500` | Delay in milliseconds before applying the busy suffix. |
 | `processingStatusText` | string | `输入中` | Busy suffix text. Default is `输入中`. |
 | `requireMention` | boolean | `true` | **Group trigger gate**. `true` = trigger only on @mention / reply-to-bot / keyword hit; `false` = normal group messages may also trigger (not recommended for long-term use). |
-| `allowedGroups` | string | `""` | **Group allowlist (string)**. In Web form: `883766069 123456789`; in Raw JSON: `"883766069 123456789"`. If set, bot only replies in listed groups. |
-| `blockedUsers` | string | `""` | **User blocklist (string)**. In Web form: `342571216` or `342571216,10002`; in Raw JSON: `"342571216"`. Bot ignores messages from these users. |
+| `allowedGroups` | string | `""` | **Group allowlist (string)**. In Web form: `20000001 123456789`; in Raw JSON: `"20000001 123456789"`. If set, bot only replies in listed groups. |
+| `blockedUsers` | string | `""` | **User blocklist (string)**. In Web form: `30000001` or `30000001,10002`; in Raw JSON: `"30000001"`. Bot ignores messages from these users. |
 | `systemPrompt` | string | - | **Persona/system role prompt** injected into AI context. |
 | `historyLimit` | number | `0` | **Number of historical messages to inject**. Default relies on OpenClaw session system; set `>0` only when you explicitly need to force raw group history into each turn. |
 | `enrichReplyForwardContext` | boolean | `true` | Enable layered context enrichment from recursive reply/forward parsing. |
@@ -235,14 +236,14 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `antiRiskMode` | boolean | `false` | Whether to enable anti-risk formatting (for example, adding spaces in URLs). |
 | `maxMessageLength` | number | `4000` | Max length per message. Longer output is auto-split. |
 
-### 5. Tuning Multi-layer Reply/Forward Parsing
+### 4. Tuning Multi-layer Reply/Forward Parsing
 
 - Safe defaults for busy groups: `maxReplyLayers=3~5`, `maxForwardLayers=2~4`, `maxForwardMessagesPerLayer=5~8`.
 - To reduce token cost first lower `maxForwardMessagesPerLayer` and `maxTotalContextChars`.
 - Keep `includeSenderInLayers=true` if sender attribution matters for your workflows.
 - Use `debugLayerTrace=true` only during diagnosis, then switch it back off.
 
-### 6. Active Model Failover Configuration
+### 5. Active Model Failover Configuration
 
 This plugin features a built-in auto-failover mechanism that triggers upon repeated request failures or empty AI replies. Combined with `maxRetries` and `retryDelayMs`, it seamlessly switches to a fallback model when the primary model encounters rate limits or errors.
 
@@ -266,7 +267,7 @@ To configure this, find or add the `model` object field inside your `openclaw.js
 
 > **Trigger Condition**: General network errors will attempt to retry on the current model up to `maxRetries` times. However, if the error contains a phrase defined in `fastFailErrors` (e.g., "401", "API Key Invalid"), the system skips the retries and **instantly jumps** to the next available `fallbacks` model to avoid waiting.
 
-### 7. Smart Concurrency Queue
+### 6. Smart Concurrency Queue
 
 The plugin implements a localized sliding-window debounce queue per-group/per-user to mitigate the risk of message dropping. If 5 users talk to the bot in a group simultaneously, the queue will capture all 5 events, combine them as context, and ensure they are sequentially processed instead of OpenClaw rejecting concurrent events as busy.
 
@@ -374,7 +375,7 @@ If you want only specific QQ IDs to trigger the bot (especially in groups), use 
 
 1. **Set admins (allowed to trigger chat)**
    ```bash
-   openclaw config set channels.qq.admins '"1838552185,123456789"' --json
+   openclaw config set channels.qq.admins '"10000001,123456789"' --json
    ```
 
 2. **Enable admin-only chat triggering**
@@ -391,7 +392,7 @@ If you want only specific QQ IDs to trigger the bot (especially in groups), use 
 
 4. **Set blocklist (silently ignore, no reply)**
    ```bash
-   openclaw config set channels.qq.blockedUsers '"342571216,10002"' --json
+   openclaw config set channels.qq.blockedUsers '"30000001,10002"' --json
    ```
 
 5. **Restart gateway to apply**
@@ -411,7 +412,7 @@ If you want only specific QQ IDs to trigger the bot (especially in groups), use 
 
 > Note: `admins` / `blockedUsers` are stored as **string lists** in this plugin. For CLI, always use the `--json` form above.
 >
-> In Web config form, you can directly enter: `1838552185,123456789` (no manual quotes required). In Raw JSON mode, enter: `"1838552185,123456789"`.
+> In Web config form, you can directly enter: `10000001,123456789` (no manual quotes required). In Raw JSON mode, enter: `"10000001,123456789"`.
 
 ### ⚠️ About `invalid config` errors on `/config`
 
