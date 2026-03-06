@@ -208,6 +208,19 @@ function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
 }
 
+function resolveSenderDisplayName(
+    sender: any,
+    opts?: { preferCard?: boolean; fallbackUserId?: unknown }
+): string {
+    const preferCard = opts?.preferCard === true;
+    const card = typeof sender?.card === "string" ? sender.card.trim() : "";
+    const nickname = typeof sender?.nickname === "string" ? sender.nickname.trim() : "";
+    const uidRaw = sender?.user_id ?? opts?.fallbackUserId;
+    const uid = uidRaw !== undefined && uidRaw !== null ? String(uidRaw).trim() : "";
+    if (preferCard) return card || nickname || uid || "unknown";
+    return nickname || card || uid || "unknown";
+}
+
 function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = 3): string[] {
     const urls: string[] = [];
 
@@ -611,6 +624,7 @@ async function buildReplyForwardContextBlock(opts: {
     const maxTotalContextChars = Math.max(300, Math.trunc(cfg.maxTotalContextChars ?? 3000));
     const includeSenderInLayers = cfg.includeSenderInLayers !== false;
     const includeCurrentOutline = cfg.includeCurrentOutline !== false;
+    const preferCardInSenderName = rootEvent?.message_type === "group";
 
     const lines: string[] = [];
     const layeredImages = new Set<string>();
@@ -659,7 +673,7 @@ async function buildReplyForwardContextBlock(opts: {
             const mtype = Array.isArray(mlike) ? "array" : typeof mlike;
             console.log(`[QQLayerTrace] reply layer=${i} hasCursor=true messageLikeType=${mtype}`);
         }
-        const senderName = cursor?.sender?.nickname || cursor?.sender?.card || cursor?.sender?.user_id || "unknown";
+        const senderName = resolveSenderDisplayName(cursor?.sender, { preferCard: preferCardInSenderName });
         const msgBody = extractMessageLikeFromPayload(cursor) ?? (Array.isArray(cursor?.message) ? cursor.message : cursor?.raw_message);
         const summarized = summarizeOneBotSegments(msgBody, maxCharsPerLayer);
         for (const u of summarized.images) layeredImages.add(u);
@@ -694,7 +708,10 @@ async function buildReplyForwardContextBlock(opts: {
             let idx = 0;
             for (const m of messages) {
                 idx += 1;
-                const senderName = m?.sender?.nickname || m?.sender?.card || m?.user_id || "unknown";
+                const senderName = resolveSenderDisplayName(m?.sender, {
+                    preferCard: preferCardInSenderName,
+                    fallbackUserId: m?.user_id,
+                });
                 const content =
                     (Array.isArray(m?.message) ? m.message : undefined)
                     ?? (Array.isArray(m?.content) ? m.content : undefined)
@@ -721,7 +738,10 @@ async function buildReplyForwardContextBlock(opts: {
                 if (replyIdInForward && item.depth < maxForwardLayers) {
                     try {
                         const replied = await client.getMsg(replyIdInForward);
-                        const rSender = replied?.sender?.nickname || replied?.sender?.card || replied?.sender?.user_id || "unknown";
+                        const rSender = resolveSenderDisplayName(replied?.sender, {
+                            preferCard: preferCardInSenderName,
+                            fallbackUserId: replied?.user_id,
+                        });
                         const rBody = Array.isArray(replied?.message) ? replied.message : replied?.raw_message;
                         const rSummarized = summarizeOneBotSegments(rBody, maxCharsPerLayer);
                         for (const u of rSummarized.images) layeredImages.add(u);
@@ -1573,6 +1593,7 @@ function buildQQHiddenMetaBlock(params: {
         `accountId=${params.accountId}`,
         `chatType=${chatType}`,
         `userId=${params.userId}`,
+        `senderQq=${params.userId}`,
         params.isGroup ? `groupId=${String(params.groupId ?? "")}` : "",
         params.isGuild ? `guildId=${String(params.guildId ?? "")}` : "",
         params.isGuild ? `channelId=${String(params.channelId ?? "")}` : "",
@@ -2264,7 +2285,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     if (forwardData?.messages) {
                                         resolvedText += "\n[转发聊天记录]:";
                                         for (const m of forwardData.messages.slice(0, 10)) {
-                                            resolvedText += `\n${m.sender?.nickname || m.user_id}: ${cleanCQCodes(m.content || m.raw_message)}`;
+                                            const senderName = resolveSenderDisplayName(m?.sender, {
+                                                preferCard: isGroup,
+                                                fallbackUserId: m?.user_id,
+                                            });
+                                            resolvedText += `\n${senderName}: ${cleanCQCodes(m.content || m.raw_message)}`;
                                         }
                                     }
                                 } catch (e) { }
@@ -2674,7 +2699,18 @@ ${current}
                             const history = await client.getGroupMsgHistory(groupId);
                             if (history?.messages) {
                                 const limit = config.historyLimit || 5;
-                                historyContext = history.messages.slice(-(limit + 1), -1).map((m: any) => `${m.sender?.nickname || m.user_id}: ${cleanCQCodes(m.raw_message || "")}`).join("\n");
+                                historyContext = history.messages.slice(-(limit + 1), -1).map((m: any) => {
+                                    const senderName = resolveSenderDisplayName(m?.sender, {
+                                        preferCard: true,
+                                        fallbackUserId: m?.user_id,
+                                    });
+                                    const senderQqRaw = m?.sender?.user_id ?? m?.user_id;
+                                    const senderQq = senderQqRaw !== undefined && senderQqRaw !== null ? String(senderQqRaw).trim() : "";
+                                    const senderPrefix = senderQq && senderName !== senderQq
+                                        ? `${senderName}(${senderQq})`
+                                        : senderName;
+                                    return `${senderPrefix}: ${cleanCQCodes(m.raw_message || "")}`;
+                                }).join("\n");
                             }
                         } catch (e) { }
                     }
@@ -2933,7 +2969,10 @@ ${current}
                     let replyToSender = "";
                     if (replyMsgId && repliedMsg) {
                         replyToBody = cleanCQCodes(typeof repliedMsg.message === 'string' ? repliedMsg.message : repliedMsg.raw_message || '');
-                        replyToSender = repliedMsg.sender?.nickname || repliedMsg.sender?.card || String(repliedMsg.sender?.user_id || '');
+                        replyToSender = resolveSenderDisplayName(repliedMsg.sender, {
+                            preferCard: isGroup,
+                            fallbackUserId: repliedMsg?.user_id,
+                        });
                     }
 
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
@@ -2950,7 +2989,7 @@ ${current}
                             channelId,
                             conversationLabel,
                             sessionLabel,
-                            senderName: event.sender?.nickname || event.sender?.card || "Unknown",
+                            senderName: resolveSenderDisplayName(event.sender, { preferCard: isGroup, fallbackUserId: userId }),
                             isAdmin,
                             activeTempSlot,
                             mentionedByAt,
@@ -3000,7 +3039,7 @@ ${current}
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                         Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
-                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
+                        SenderId: String(userId), SenderName: resolveSenderDisplayName(event.sender, { preferCard: isGroup, fallbackUserId: userId }), ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
                         OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
