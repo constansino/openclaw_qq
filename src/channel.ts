@@ -66,9 +66,16 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
             mergeText("BodyForCommands");
             mergeText("CommandBody");
 
+            const allMediaPaths = payloads.flatMap(p => p.ctxPayload.MediaPaths || []);
+            if (allMediaPaths.length > 0) {
+                mergedCtx.MediaPaths = Array.from(new Set(allMediaPaths));
+                if (!mergedCtx.MediaPath) mergedCtx.MediaPath = mergedCtx.MediaPaths[0];
+            }
+
             const allMediaUrls = payloads.flatMap(p => p.ctxPayload.MediaUrls || []);
             if (allMediaUrls.length > 0) {
                 mergedCtx.MediaUrls = Array.from(new Set(allMediaUrls));
+                if (!mergedCtx.MediaUrl) mergedCtx.MediaUrl = mergedCtx.MediaUrls[0];
             }
 
             if (config.enableQueueNotify !== false) {
@@ -137,7 +144,192 @@ function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
 }
 
-function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = 3): string[] {
+const INBOUND_IMAGE_LIMIT = 5;
+const QQ_RESTRICTED_IMAGE_HOSTS = new Set(["multimedia.nt.qq.com.cn", "gchat.qpic.cn"]);
+const QQ_IMAGE_DOWNLOAD_TIMEOUT_MS = 15000;
+
+function resolveOpenClawStateDir(): string {
+    const fromEnv = String(process.env.OPENCLAW_STATE_DIR || "").trim();
+    if (fromEnv) return fromEnv;
+    const home = String(process.env.HOME || process.env.USERPROFILE || "").trim();
+    return home ? path.join(home, ".openclaw") : path.resolve(".openclaw");
+}
+
+function resolveInboundMediaDir(): string {
+    return path.join(resolveOpenClawStateDir(), "media", "inbound");
+}
+
+function sanitizePathSegment(value: string): string {
+    return value.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function inferImageExtensionFromMime(contentType: string | null): string {
+    const ct = String(contentType || "").toLowerCase();
+    if (ct.includes("png")) return ".png";
+    if (ct.includes("jpeg") || ct.includes("jpg")) return ".jpg";
+    if (ct.includes("webp")) return ".webp";
+    if (ct.includes("gif")) return ".gif";
+    if (ct.includes("bmp")) return ".bmp";
+    if (ct.includes("tiff")) return ".tiff";
+    return ".bin";
+}
+
+function inferImageExtensionFromBuffer(buffer: Buffer): string {
+    if (buffer.length >= 8) {
+        const pngSig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        if (pngSig.every((v, i) => buffer[i] === v)) return ".png";
+    }
+    if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return ".jpg";
+    if (buffer.length >= 4 && buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) return ".gif";
+    if (
+        buffer.length >= 12 &&
+        buffer[0] === 0x52 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x46 &&
+        buffer[8] === 0x57 &&
+        buffer[9] === 0x45 &&
+        buffer[10] === 0x42 &&
+        buffer[11] === 0x50
+    ) {
+        return ".webp";
+    }
+    return ".bin";
+}
+
+function inferImageExtensionFromUrl(rawUrl: string): string {
+    try {
+        const parsed = new URL(rawUrl);
+        const ext = path.extname(parsed.pathname || "");
+        return ext || ".bin";
+    } catch {
+        return ".bin";
+    }
+}
+
+function isQqRestrictedImageUrl(rawUrl: string): boolean {
+    try {
+        const parsed = new URL(rawUrl);
+        return QQ_RESTRICTED_IMAGE_HOSTS.has((parsed.hostname || "").toLowerCase());
+    } catch {
+        return false;
+    }
+}
+
+async function writeBufferToInboundMedia(buffer: Buffer, filePrefix: string, extHint?: string): Promise<string> {
+    const mediaDir = resolveInboundMediaDir();
+    await fs.mkdir(mediaDir, { recursive: true });
+    const ext = extHint && extHint.startsWith(".") ? extHint : (extHint ? `.${extHint}` : ".bin");
+    const safeExt = ext.replace(/[^A-Za-z0-9.]/g, "") || ".bin";
+    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}_${sanitizePathSegment(filePrefix)}${safeExt}`;
+    const filePath = path.join(mediaDir, fileName);
+    await fs.writeFile(filePath, buffer);
+    return filePath;
+}
+
+async function writeBase64ImageToInboundMedia(value: string): Promise<string | null> {
+    const payload = String(value || "").replace(/^base64:\/\//, "").trim();
+    if (!payload) return null;
+    try {
+        const buffer = Buffer.from(payload, "base64");
+        if (buffer.length === 0) return null;
+        const ext = inferImageExtensionFromBuffer(buffer);
+        return await writeBufferToInboundMedia(buffer, "qq_base64_image", ext);
+    } catch (err) {
+        console.warn(`[QQ] Failed to convert base64 image to inbound media path: ${String(err)}`);
+        return null;
+    }
+}
+
+async function downloadQqImageToInboundMedia(rawUrl: string, timeoutMs = QQ_IMAGE_DOWNLOAD_TIMEOUT_MS): Promise<string | null> {
+    const url = String(rawUrl || "").trim();
+    if (!url || !isQqRestrictedImageUrl(url)) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await fetch(url, { method: "GET", signal: controller.signal });
+        if (!resp.ok) {
+            console.warn(`[QQ] Failed to download QQ image (${resp.status}) from ${url}`);
+            return null;
+        }
+        const ab = await resp.arrayBuffer();
+        const buffer = Buffer.from(ab);
+        if (buffer.length === 0) {
+            console.warn(`[QQ] Downloaded QQ image is empty: ${url}`);
+            return null;
+        }
+        const extFromUrl = inferImageExtensionFromUrl(url);
+        const extFromMime = inferImageExtensionFromMime(resp.headers.get("content-type"));
+        const extFromBuffer = inferImageExtensionFromBuffer(buffer);
+        const ext = extFromUrl !== ".bin" ? extFromUrl : (extFromMime !== ".bin" ? extFromMime : extFromBuffer);
+        return await writeBufferToInboundMedia(buffer, "qq_inbound_image", ext);
+    } catch (err) {
+        console.warn(`[QQ] Failed to download QQ image URL: ${url} (${String(err)})`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function dedupeStrings(values: string[], maxItems?: number): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of values) {
+        const v = String(item || "").trim();
+        if (!v || seen.has(v)) continue;
+        seen.add(v);
+        out.push(v);
+        if (maxItems && out.length >= maxItems) break;
+    }
+    return out;
+}
+
+function isHttpLike(value: string): boolean {
+    return value.startsWith("http://") || value.startsWith("https://");
+}
+
+function isAbsoluteLikePath(value: string): boolean {
+    return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+async function resolveInboundImageRefs(imageRefs: string[]): Promise<{ mediaPaths: string[]; mediaUrls: string[] }> {
+    const mediaPaths: string[] = [];
+    const mediaUrls: string[] = [];
+    for (const raw of dedupeStrings(imageRefs, INBOUND_IMAGE_LIMIT)) {
+        const value = raw.trim();
+        if (!value) continue;
+        if (value.startsWith("base64://")) {
+            const savedPath = await writeBase64ImageToInboundMedia(value);
+            if (savedPath) mediaPaths.push(savedPath);
+            continue;
+        }
+        if (value.startsWith("file://")) {
+            const localPath = toLocalPathIfAny(value);
+            if (localPath) mediaPaths.push(localPath);
+            continue;
+        }
+        if (isAbsoluteLikePath(value)) {
+            mediaPaths.push(value);
+            continue;
+        }
+        if (isHttpLike(value)) {
+            const downloaded = await downloadQqImageToInboundMedia(value, QQ_IMAGE_DOWNLOAD_TIMEOUT_MS);
+            if (downloaded) {
+                mediaPaths.push(downloaded);
+            } else {
+                mediaUrls.push(value);
+            }
+            continue;
+        }
+        mediaUrls.push(value);
+    }
+    return {
+        mediaPaths: dedupeStrings(mediaPaths, INBOUND_IMAGE_LIMIT),
+        mediaUrls: dedupeStrings(mediaUrls, INBOUND_IMAGE_LIMIT),
+    };
+}
+
+function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = INBOUND_IMAGE_LIMIT): string[] {
     const urls: string[] = [];
 
     if (Array.isArray(message)) {
@@ -2473,11 +2665,15 @@ ${current}
                     }
                     bodyWithReply = systemBlock + bodyWithReply;
 
-                    const inboundMediaUrls = Array.from(new Set([
-                        ...extractImageUrls(event.message),
+                    const inboundImageRefs = dedupeStrings([
+                        ...extractImageUrls(event.message, INBOUND_IMAGE_LIMIT),
                         ...imageHints,
                         ...layeredContext.imageUrls,
-                    ])).slice(0, 5);
+                    ], INBOUND_IMAGE_LIMIT);
+                    const inboundResolvedMedia = await resolveInboundImageRefs(inboundImageRefs);
+                    if (inboundResolvedMedia.mediaPaths.length > 0) {
+                        console.log(`[QQ] Passing ${inboundResolvedMedia.mediaPaths.length} image(s) via MediaPaths: ${inboundResolvedMedia.mediaPaths.join(", ")}`);
+                    }
 
                     const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
@@ -2487,7 +2683,8 @@ ${current}
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
                         OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: commandAuthorized,
-                        ...(inboundMediaUrls.length > 0 && { MediaUrls: inboundMediaUrls }),
+                        ...(inboundResolvedMedia.mediaPaths.length > 0 && { MediaPaths: inboundResolvedMedia.mediaPaths }),
+                        ...(inboundResolvedMedia.mediaUrls.length > 0 && { MediaUrls: inboundResolvedMedia.mediaUrls }),
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
                     });
 
