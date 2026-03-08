@@ -159,6 +159,7 @@ openclaw setup qq
       "blockedUsers": "999999",
       "systemPrompt": "你是一个名为“人工智障”的QQ机器人，说话风格要风趣幽默。",
       "historyLimit": 0,
+      "keywordOnlyTrigger": false,
       "keywordTriggers": "小助手, 帮助",
       "autoApproveRequests": true,
       "enableGuilds": true,
@@ -229,7 +230,8 @@ openclaw setup qq
 | `showReplySessionSource` | boolean | `true` | 是否在每次面向用户的回复前附加来源会话标记，例如 `(from 会话写方案)` 或 `(from 主会话)`。默认开启；使用 `/临时` 功能区分上下文时尤其有用。 |
 | `processingStatusDelayMs` | number | `500` | 触发“输入中”后缀的延迟毫秒数。 |
 | `processingStatusText` | string | `输入中` | 忙碌后缀文本，默认 `输入中`。 |
-| `requireMention` | boolean | `true` | **群聊触发门槛**。`true`=仅在被 @ / 回复机器人 / 命中关键词时触发；`false`=普通群消息也可能触发（不建议长期关闭）。 |
+| `requireMention` | boolean | `true` | **群聊触发门槛**。`true`=仅在被 @ / 回复机器人 / 命中关键词时触发；若同时开启 `keywordOnlyTrigger`，则群聊只认关键词；`false`=普通群消息也可能触发（不建议长期关闭）。 |
+| `keywordOnlyTrigger` | boolean | `false` | **群聊仅关键词触发**。开启后，@机器人 / 回复机器人消息不再触发；建议与 `keywordTriggers` 一起使用，适合与其他机器人共用同一 QQ 账号时避免双重回复。 |
 | `allowedGroups` | string | `""` | **群组白名单（字符串）**。Web表单填：`20000001 123456789`；Raw JSON 填：`"20000001 123456789"`。若设置，Bot 仅在这些群组响应。 |
 | `blockedUsers` | string | `""` | **用户黑名单（字符串）**。Web表单填：`30000001` 或 `30000001,10002`；Raw JSON 填：`"30000001"`。Bot 将忽略这些用户消息。 |
 | `systemPrompt` | string | - | **人设设定**。注入到 AI 上下文的系统提示词。 |
@@ -248,7 +250,7 @@ openclaw setup qq
 > 仅当你明确希望每轮都附带“群内原始近几条消息”时，再开启 `historyLimit`（例如设为 `3~5`）。
 >
 > 安全建议：若你担心群内高频 @ 导致 Token 消耗过快，建议配置 `admins` 并开启 `adminOnlyChat = true`。
-| `keywordTriggers` | string | `""` | **关键词触发（字符串）**。Web表单填：`小助手, 帮我`；Raw JSON 填：`"小助手, 帮我"`。当 `requireMention=true` 时，命中关键词可不@触发；当 `requireMention=false` 时，关键词不是必需条件。 |
+| `keywordTriggers` | string | `""` | **关键词触发（字符串）**。Web表单填：`小助手, 帮我`；Raw JSON 填：`"小助手, 帮我"`。当 `requireMention=true` 时，命中关键词可不@触发；当 `requireMention=false` 时，关键词不是必需条件；当 `keywordOnlyTrigger=true` 时，群聊里只有命中这些关键词才会触发。 |
 | `autoApproveRequests` | boolean | `false` | 是否自动通过好友申请和群邀请。 |
 | `enableGuilds` | boolean | `true` | 是否开启 QQ 频道 (Guild) 支持。 |
 | `enableTTS` | boolean | `false` | (实验性) 是否将 AI 回复转为语音发送 (需服务端支持 TTS)。 |
@@ -310,6 +312,8 @@ openclaw setup qq
     *   发送包含**关键词**（如配置中的“小助手”）的消息。
     *   **戳一戳**机器人头像。
 
+> 若你开启了 `keywordOnlyTrigger=true`，则上面的 **@机器人** / **回复机器人消息** 将不再触发；群聊里只有命中 `keywordTriggers` 才会触发。
+
 ### 👥 建议建一个“双人测试群”
 
 强烈建议额外建一个仅 2 人的测试群（你 + 机器人），用于排障与状态观察：
@@ -322,7 +326,12 @@ openclaw setup qq
 
 ### 🧭 触发规则速查（非常重要）
 
-请重点关注 `requireMention` 与 `keywordTriggers` 的组合：
+请重点关注 `requireMention`、`keywordOnlyTrigger` 与 `keywordTriggers` 的组合：
+
+- `keywordOnlyTrigger=true` + `keywordTriggers` 非空：
+  - 群聊里只有 **命中关键词** 才触发，**@机器人 / 回复机器人** 不再触发。
+- `keywordOnlyTrigger=true` + `keywordTriggers` 为空：
+  - 群聊普通文本、@、回复都不会触发；请先配置唤醒词。
 
 - `requireMention=true` + `keywordTriggers` 为空：
   - 只有 **@机器人** 或 **回复机器人消息** 才触发。
@@ -334,6 +343,11 @@ openclaw setup qq
 > 如果你希望“可以不@，但必须说唤醒词”，推荐：
 >
 > - `requireMention=true`
+> - `keywordTriggers="椰子"`（或多个关键词）
+
+> 如果你希望“只认唤醒词，@ / 回复都不要触发”，请设置：
+>
+> - `keywordOnlyTrigger=true`
 > - `keywordTriggers="椰子"`（或多个关键词）
 
 ### 👮‍♂️ 管理员指令
@@ -480,7 +494,7 @@ A: **完全可以**。只要 `wsUrl` 能够通过内网穿透或公网 IP 访问
 
 **Q: 为什么群聊不回话？**
 A: 
-1. 检查 `requireMention` 是否开启（默认开启），需要 @机器人。
+1. 若未开启 `keywordOnlyTrigger`，检查 `requireMention` 是否开启（默认开启），需要 @机器人。
 2. 检查群组是否在 `allowedGroups` 白名单内（如果设置了的话）。
 3. 检查 OneBot 日志，确认消息是否已上报。
 
@@ -488,6 +502,12 @@ A:
 A: 通常是 `requireMention` 被设成了 `false`。在该模式下，群内普通消息也可能触发。若你要“非@时必须说唤醒词”，请设置：
 
 1. `requireMention=true`
+2. `keywordTriggers` 填入唤醒词（如 `椰子`）
+
+**Q: 我想让群里只有唤醒词触发，连 @ / 回复都忽略，怎么配？**
+A: 设置：
+
+1. `keywordOnlyTrigger=true`
 2. `keywordTriggers` 填入唤醒词（如 `椰子`）
 
 **Q: QQ 日志里为什么会看到“带历史内容”的请求体？**

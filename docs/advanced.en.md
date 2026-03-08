@@ -151,6 +151,7 @@ You can also edit config directly. Full config example:
       "blockedUsers": "999999",
       "systemPrompt": "You are a QQ bot named 'Artificial Dummy', with a witty and humorous speaking style.",
       "historyLimit": 0,
+      "keywordOnlyTrigger": false,
       "keywordTriggers": "assistant, help",
       "autoApproveRequests": true,
       "enableGuilds": true,
@@ -221,7 +222,8 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 | `showReplySessionSource` | boolean | `true` | Whether to prepend a session-source hint to each user-facing reply, such as `(from 会话draft)` or `(from 主会话)`. Enabled by default; especially useful when you use `/tmp` sessions heavily. |
 | `processingStatusDelayMs` | number | `500` | Delay in milliseconds before applying the busy suffix. |
 | `processingStatusText` | string | `输入中` | Busy suffix text. Default is `输入中`. |
-| `requireMention` | boolean | `true` | **Group trigger gate**. `true` = trigger only on @mention / reply-to-bot / keyword hit; `false` = normal group messages may also trigger (not recommended for long-term use). |
+| `requireMention` | boolean | `true` | **Group trigger gate**. `true` = trigger only on @mention / reply-to-bot / keyword hit; if `keywordOnlyTrigger` is also enabled, group chats accept keyword hits only; `false` = normal group messages may also trigger (not recommended for long-term use). |
+| `keywordOnlyTrigger` | boolean | `false` | **Keyword-only trigger mode for groups**. When enabled, @mentions and reply-to-bot messages no longer trigger; use it together with `keywordTriggers` when you share one QQ account with another bot and want to avoid duplicate replies. |
 | `allowedGroups` | string | `""` | **Group allowlist (string)**. In Web form: `20000001 123456789`; in Raw JSON: `"20000001 123456789"`. If set, bot only replies in listed groups. |
 | `blockedUsers` | string | `""` | **User blocklist (string)**. In Web form: `30000001` or `30000001,10002`; in Raw JSON: `"30000001"`. Bot ignores messages from these users. |
 | `systemPrompt` | string | - | **Persona/system role prompt** injected into AI context. |
@@ -241,7 +243,7 @@ This plugin also namespaces QQ private `fromId` as `qq:user:<id>` to further red
 >
 > Security recommendation: if you worry about heavy token usage from frequent group @mentions, configure `admins` and enable `adminOnlyChat = true`.
 
-| `keywordTriggers` | string | `""` | **Keyword trigger list (string)**. In Web form: `assistant, help me`; in Raw JSON: `"assistant, help me"`. When `requireMention=true`, keyword hits can trigger without @mention; when `requireMention=false`, keywords are not required to trigger. |
+| `keywordTriggers` | string | `""` | **Keyword trigger list (string)**. In Web form: `assistant, help me`; in Raw JSON: `"assistant, help me"`. When `requireMention=true`, keyword hits can trigger without @mention; when `requireMention=false`, keywords are not required to trigger; when `keywordOnlyTrigger=true`, group chats trigger only when one of these keywords is hit. |
 | `autoApproveRequests` | boolean | `false` | Whether to auto-approve friend requests and group invites. |
 | `enableGuilds` | boolean | `true` | Whether to enable QQ Guild support. |
 | `enableTTS` | boolean | `false` | (Experimental) Whether to convert AI replies into voice (requires server-side TTS support). |
@@ -304,6 +306,8 @@ The plugin implements a localized sliding-window debounce queue per-group/per-us
   * Send messages containing configured **keywords** (for example, `assistant`).
   * **Poke** the bot avatar.
 
+> If you enable `keywordOnlyTrigger=true`, the `@bot` and reply-to-bot paths above stop triggering in group chats; only `keywordTriggers` hits continue to trigger.
+
 ### 👥 Recommended: Create a 2-Person Test Group
 
 Strongly recommended: create a separate test group with only 2 members (you + the bot) for troubleshooting and status checks:
@@ -316,7 +320,12 @@ Strongly recommended: create a separate test group with only 2 members (you + th
 
 ### 🧭 Trigger Rules Quick Reference (Important)
 
-Pay close attention to the combination of `requireMention` and `keywordTriggers`:
+Pay close attention to the combination of `requireMention`, `keywordOnlyTrigger`, and `keywordTriggers`:
+
+- `keywordOnlyTrigger=true` + non-empty `keywordTriggers`:
+  - Group chat triggers only on **keyword hit**; **@mentions / reply-to-bot** no longer trigger.
+- `keywordOnlyTrigger=true` + empty `keywordTriggers`:
+  - Normal group text, @mentions, and replies will not trigger; configure a wake word first.
 
 - `requireMention=true` + empty `keywordTriggers`:
   - Trigger only on **@mention** or **reply-to-bot**.
@@ -328,6 +337,11 @@ Pay close attention to the combination of `requireMention` and `keywordTriggers`
 > If you want "no @mention needed, but wake-word required", use:
 >
 > - `requireMention=true`
+> - `keywordTriggers="yezi"` (or multiple keywords)
+
+> If you want "wake word only; ignore @mentions and replies", use:
+>
+> - `keywordOnlyTrigger=true`
 > - `keywordTriggers="yezi"` (or multiple keywords)
 
 ### 👮‍♂️ Admin Commands
@@ -459,7 +473,7 @@ A: **Yes.** As long as `wsUrl` is reachable via tunnel/public IP and images are 
 
 **Q: Why no replies in group chat?**
 A:
-1. Check whether `requireMention` is enabled (enabled by default): you must @mention the bot.
+1. If `keywordOnlyTrigger` is not enabled, check whether `requireMention` is enabled (enabled by default): you must @mention the bot.
 2. Check whether the group is included in `allowedGroups` (if set).
 3. Check OneBot logs to confirm events are being delivered.
 
@@ -467,6 +481,12 @@ A:
 A: Most likely `requireMention` is set to `false`. In that mode, normal group messages may trigger. If you want "non-@mention must include wake word", set:
 
 1. `requireMention=true`
+2. Put your wake word in `keywordTriggers` (for example, `yezi`)
+
+**Q: I want group chats to react only to wake words and ignore @mentions / replies. How should I configure it?**
+A: Set:
+
+1. `keywordOnlyTrigger=true`
 2. Put your wake word in `keywordTriggers` (for example, `yezi`)
 
 **Q: Why do QQ request logs include prior chat text/history?**

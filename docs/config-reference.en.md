@@ -9,7 +9,8 @@
 
 ## B. Trigger & Access Control
 
-- `requireMention`: require @mention in group chats.
+- `requireMention`: group trigger gate (@mention / reply / keyword).
+- `keywordOnlyTrigger`: accept keyword hits only in group chats (ignore @mentions / replies).
 - `admins`: admin QQ IDs.
 - `adminOnlyChat`: only admins can trigger chat.
 - `allowedGroups`: group allowlist.

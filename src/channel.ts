@@ -2341,6 +2341,7 @@ ${current}
                         } catch (e) { }
                     }
 
+                    const keywordOnlyTrigger = Boolean(config.keywordOnlyTrigger) && isGroup;
                     let isTriggered = forceTriggered || !isGroup || text.includes("[动作] 用户戳了你一下");
                     let keywordTriggered = false;
                     const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
@@ -2358,7 +2359,8 @@ ${current}
                     let mentionedByReply = false;
 
                     const checkMention = isGroup || isGuild;
-                    if (checkMention && config.requireMention && !isTriggered) {
+                    if (keywordOnlyTrigger && !isTriggered) return;
+                    if (checkMention && config.requireMention && !keywordOnlyTrigger && !isTriggered) {
                         const selfId = client.getSelfId();
                         const effectiveSelfId = selfId ?? event.self_id;
                         if (!effectiveSelfId) return;

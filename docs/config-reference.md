@@ -9,7 +9,8 @@
 
 ## B. 基础触发与访问控制
 
-- `requireMention`：群聊是否必须 @ 才触发。
+- `requireMention`：群聊触发门槛（@ / 回复 / 关键词）。
+- `keywordOnlyTrigger`：群聊是否只接受关键词触发（忽略 @ / 回复）。
 - `admins`：管理员 QQ 列表。
 - `adminOnlyChat`：仅管理员可触发聊天。
 - `allowedGroups`：群白名单。
