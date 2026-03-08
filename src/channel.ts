@@ -1,6 +1,9 @@
-import { promises as fs } from "node:fs";
+import { promises as fs, constants as fsConstants } from "node:fs";
 import path from "node:path";
+import { homedir } from "node:os";
+import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 declare const process: any;
 import {
@@ -123,6 +126,44 @@ function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, conf
 }
 
 const memberCache = new Map<string, { name: string, time: number }>();
+const execFile = promisify(execFileCallback);
+
+async function runModelSyncScript(): Promise<{ ok: boolean; text: string }> {
+    const home = process.env.HOME || homedir();
+    const candidates = [
+        process.env.OPENCLAW_MODELSYNC_SCRIPT,
+        path.join(home, ".openclaw", "workspace", "scripts", "sync_wuju_allowed_models.sh"),
+    ].filter((v): v is string => Boolean(v && v.trim()));
+
+    let scriptPath = "";
+    for (const candidate of candidates) {
+        try {
+            await fs.access(candidate, fsConstants.X_OK);
+            scriptPath = candidate;
+            break;
+        } catch { }
+    }
+    if (!scriptPath) {
+        return { ok: false, text: "未找到可执行同步脚本。请确认 ~/.openclaw/workspace/scripts/sync_wuju_allowed_models.sh 存在并有执行权限。" };
+    }
+
+    try {
+        const { stdout, stderr } = await execFile(scriptPath, [], {
+            timeout: 180000,
+            maxBuffer: 1024 * 1024 * 4,
+            env: process.env,
+        });
+        const merged = [stdout, stderr].filter(Boolean).join("\n").trim();
+        return { ok: true, text: merged || "模型同步完成。" };
+    } catch (err: any) {
+        const stdout = typeof err?.stdout === "string" ? err.stdout : "";
+        const stderr = typeof err?.stderr === "string" ? err.stderr : "";
+        const code = err?.code ?? "unknown";
+        const merged = [stdout, stderr].filter(Boolean).join("\n").trim();
+        const detail = merged ? `\n${merged}` : "";
+        return { ok: false, text: `模型同步失败（code=${code}）。${detail}` };
+    }
+}
 
 function getCachedMemberName(groupId: string, userId: string): string | null {
     const key = `${groupId}:${userId}`;
@@ -1928,6 +1969,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         text = inlineCommand;
                         forceTriggered = true;
                     }
+                    else if (isGroup && /^\/modelsync\b/i.test(inlineCommand)) {
+                        if (!isAdmin) return;
+                        text = "/modelsync";
+                        forceTriggered = true;
+                    }
 
                     const normalizedTextForCommand = normalizeSlashVariants(text).trim();
                     if (!isGuild && isAdmin && normalizedTextForCommand.startsWith('/')) {
@@ -2072,6 +2118,24 @@ ${current}
                             }
                             return;
                         }
+                        if (cmd === '/modelsync') {
+                            const startMsg = `[OpenClawd QQ]\n开始同步模型 allowlist（来源：provider /models）...`;
+                            if (isGroup) client.sendGroupMsg(groupId, startMsg);
+                            else client.sendPrivateMsg(userId, startMsg);
+                            const syncResult = await runModelSyncScript();
+                            const prefix = syncResult.ok ? "✅" : "❌";
+                            const restartHint = syncResult.ok
+                                ? `\n\n⚠️ 注意：allowlist 已写入配置，但需要执行 \`openclaw gateway restart\` 后才会生效。`
+                                : "";
+                            const output = `[OpenClawd QQ]\n${prefix} /modelsync ${syncResult.ok ? "完成" : "失败"}\n${syncResult.text}${restartHint}`;
+                            const chunks = splitLongText(output, 2800);
+                            for (const chunk of chunks) {
+                                if (isGroup) client.sendGroupMsg(groupId, chunk);
+                                else client.sendPrivateMsg(userId, chunk);
+                                if (config.rateLimitMs > 0) await sleep(Math.min(config.rateLimitMs, 800));
+                            }
+                            return;
+                        }
                         if (cmd === '/newsession') {
                             const runtimeForReset = getQQRuntime();
                             const baseFromIdForReset = isGroup
@@ -2132,6 +2196,7 @@ ${current}
 /临时列表 - 查看最近临时会话
 /临时结束 - 结束当前临时会话
 /newsession - 重置当前会话
+/modelsync - 同步模型allowlist（按provider /models）
 /mute @用户 [分] - 禁言
 /kick @用户 - 踢出
 /help - 帮助`;
@@ -2320,7 +2385,6 @@ ${current}
                     let deliveredAnything = false;
                     let dispatcherError: any = null;
                     let currentRunState: { isStale: () => boolean } | null = null;
-
                     const deliver = async (payload: any) => {
                         if (currentRunState?.isStale()) return;
                         const isTextFailure = payload.text && (
