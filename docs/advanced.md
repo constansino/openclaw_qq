@@ -4,7 +4,6 @@
 
 # OpenClaw QQ 插件 (OneBot v11)
 
-> 历史英文 README 归档：[`docs/archive/README.en.legacy.md`](./archive/README.en.legacy.md)
 
 ## 📚 文档中心
 

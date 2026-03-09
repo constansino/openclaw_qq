@@ -20,11 +20,9 @@
 > **官方交流论坛（唯一）：** https://aiya.de5.net/c/25-category/25  
 > 问题反馈、配置经验、更新公告统一在论坛沉淀，便于检索和追踪。
 
-> [!NOTE]
-> 本仓库主 README 自即日起仅维护中文。历史英文 README 已归档：`docs/archive/README.en.legacy.md`。
-
 ## 最近更新（2026-03）
 
+- 仓库文档现统一维护中文版本，仓库内英文 Markdown 已清理。
 - QQ 私聊 session key 已回归官方命名风格：peer id 使用纯 QQ 号，不再写成 `qq:user:<id>`；旧本机会话会在启动时自动规范化。
 - 新增 `keywordOnlyTrigger`：群聊可切换为“仅关键词触发”，忽略 @ / 回复触发，适合与其他机器人共用同一 QQ 账号。
 - 新增 `showReplySessionSource`：回复前可标注来源会话，方便区分主会话与 `/临时` 会话。
@@ -159,11 +157,10 @@ openclaw gateway restart
 - 群聊 @ 机器人可回复
 - 日志无持续鉴权失败/重连风暴
 
-## 文档与归档
+## 文档
 
 - 文档中心：`docs/index.md`
 - 中文主文档：本 `README.md`
-- 历史英文 README 归档：`docs/archive/README.en.legacy.md`
 
 ## 反馈与贡献
 
