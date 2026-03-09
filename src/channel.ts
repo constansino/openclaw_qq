@@ -394,6 +394,28 @@ function cleanCQCodes(text: string | undefined): string {
     return result;
 }
 
+function buildQQBodyForAgent(params: {
+    currentText: string;
+    extractedTextFromSegments: string;
+    replyToBody: string;
+    replyToSender: string;
+    mentionedByAt: boolean;
+}): string {
+    const currentBody = cleanCQCodes(params.currentText);
+    if (!params.replyToBody) return currentBody;
+
+    const replyBlock = `[Replying to ${params.replyToSender || "unknown"}]\n${params.replyToBody}\n[/Replying]`;
+    const plainCurrentText = cleanCQCodes(params.extractedTextFromSegments);
+    if (plainCurrentText) {
+        return [currentBody, replyBlock].filter(Boolean).join("\n\n");
+    }
+
+    const implicitReplyLead = params.mentionedByAt
+        ? "The sender @mentioned you while replying to the quoted message. Treat the quoted message as the main thing to respond to unless the current turn says otherwise."
+        : "The sender replied to the quoted message without additional text. Treat the quoted message as the main thing to respond to unless the current turn says otherwise.";
+    return `${implicitReplyLead}\n\n${replyBlock}`;
+}
+
 function splitLongText(input: string, maxLength = 2800): string[] {
     const text = (input || "").trim();
     if (!text) return [];
@@ -2920,6 +2942,14 @@ ${current}
                     }
 
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
+                    const bodyForAgent = buildQQBodyForAgent({
+                        currentText: text,
+                        extractedTextFromSegments,
+                        replyToBody,
+                        replyToSender,
+                        mentionedByAt,
+                    });
+                    const commandBody = text;
                     let bodyWithReply = cleanCQCodes(text) + replySuffix;
                     let systemBlock = "";
                     if (config.injectGatewayMeta !== false) {
@@ -2987,10 +3017,11 @@ ${current}
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                         Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
+                        BodyForAgent: bodyForAgent, CommandBody: commandBody,
                         SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
-                        OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: commandAuthorized,
+                        OriginatingChannel: "qq", OriginatingTo: fromId, CommandAuthorized: commandAuthorized, WasMentioned: mentionedByAt || mentionedByReply,
                         ...(inboundResolvedMedia.mediaPaths.length > 0 && { MediaPaths: inboundResolvedMedia.mediaPaths }),
                         ...(inboundResolvedMedia.mediaUrls.length > 0 && { MediaUrls: inboundResolvedMedia.mediaUrls }),
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
