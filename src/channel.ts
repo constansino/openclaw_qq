@@ -18,6 +18,8 @@ import {
 } from "openclaw/plugin-sdk";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
+import { qqMessageActions } from "./actions.js";
+import { registerQQClient, registerQQConfig, unregisterQQAccount } from "./registry.js";
 import { getQQRuntime } from "./runtime.js";
 import type { OneBotMessage, OneBotMessageSegment } from "./types.js";
 
@@ -1883,6 +1885,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             await ensureLegacyQQSessionMigration();
             const config = account.config;
             accountConfigs.set(account.accountId, config);
+            registerQQConfig(account.accountId, config);
             const adminIds = [...new Set(parseIdListInput(config.admins as string | number | Array<string | number> | undefined))];
             const allowedGroupIds = [...new Set(parseIdListInput(config.allowedGroups as string | number | Array<string | number> | undefined))];
             const blockedUserIds = [...new Set(parseIdListInput(config.blockedUsers as string | number | Array<string | number> | undefined))];
@@ -1928,6 +1931,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             const isStaleGeneration = () => accountStartGeneration.get(account.accountId) !== accountGen;
 
             clients.set(account.accountId, client);
+            registerQQClient(account.accountId, client);
             const clientSet = allClientsByAccount.get(account.accountId) || new Set<OneBotClient>();
             clientSet.add(client);
             allClientsByAccount.set(account.accountId, clientSet);
@@ -3027,6 +3031,7 @@ ${current}
                 client.disconnect();
                 clients.delete(account.accountId);
                 accountConfigs.delete(account.accountId);
+                unregisterQQAccount(account.accountId);
                 const setForAccount = allClientsByAccount.get(account.accountId);
                 if (setForAccount) {
                     setForAccount.delete(client);
@@ -3251,6 +3256,27 @@ ${current}
             catch (err) { return { channel: "qq", success: false, error: String(err) }; }
         }
     },
+    threading: {
+        buildToolContext: ({ context, hasRepliedRef }) => {
+            const rawFrom = String(context.From || "").trim();
+            const baseFrom = rawFrom.split("::tmp:")[0];
+            let currentChannelId: string | undefined;
+            if (context.ChatType === "group" && /^\d{5,12}$/.test(baseFrom)) {
+                currentChannelId = `group:${baseFrom}`;
+            } else if (context.ChatType === "direct" && /^\d{5,12}$/.test(baseFrom)) {
+                currentChannelId = `user:${baseFrom}`;
+            } else if (context.ChatType === "channel" && /^guild:/i.test(baseFrom)) {
+                currentChannelId = baseFrom;
+            }
+            return {
+                currentChannelId,
+                currentMessageId: context.CurrentMessageId ?? undefined,
+                currentThreadTs: context.ReplyToIdFull ?? context.ReplyToId,
+                hasRepliedRef,
+            };
+        },
+    },
+    actions: qqMessageActions,
     messaging: {
         normalizeTarget,
         targetResolver: {

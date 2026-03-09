@@ -235,6 +235,68 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_list", {});
   }
 
+  async getGroupInfo(groupId: number, noCache: boolean = true): Promise<any> {
+    const tries = [
+      { action: "get_group_info", params: { group_id: groupId, no_cache: noCache } },
+      { action: "get_group_detail_info", params: { group_id: groupId } },
+    ];
+    let lastErr: unknown;
+    for (const attempt of tries) {
+      try {
+        return await this.sendWithResponse(attempt.action, attempt.params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("get_group_info failed");
+  }
+
+  async getGroupMemberInfo(groupId: number, userId: number, noCache: boolean = true): Promise<any> {
+    return this.sendWithResponse("get_group_member_info", { group_id: groupId, user_id: userId, no_cache: noCache });
+  }
+
+  async getGroupMemberList(groupId: number): Promise<any[]> {
+    return this.sendWithResponse("get_group_member_list", { group_id: groupId });
+  }
+
+  async getGroupNotice(groupId: number): Promise<any> {
+    const tries = [
+      { action: "get_group_notice", params: { group_id: groupId } },
+      { action: "get_group_notice", params: { groupId } },
+    ];
+    let lastErr: unknown;
+    for (const attempt of tries) {
+      try {
+        return await this.sendWithResponse(attempt.action, attempt.params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("get_group_notice failed");
+  }
+
+  async getStrangerInfo(userId: number, noCache: boolean = true): Promise<any> {
+    return this.sendWithResponse("get_stranger_info", { user_id: userId, no_cache: noCache });
+  }
+
+  async setMsgEmojiLike(messageId: string | number, emojiId: string | number, set: boolean = true): Promise<any> {
+    const tries = [
+      { message_id: messageId, emoji_id: emojiId, set },
+      { message_id: messageId, emoji_id: emojiId, is_add: set },
+      { msg_id: messageId, emoji_id: emojiId, set },
+      { message_id: messageId, emoji_id: emojiId },
+    ];
+    let lastErr: unknown;
+    for (const params of tries) {
+      try {
+        return await this.sendWithResponse("set_msg_emoji_like", params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("set_msg_emoji_like failed");
+  }
+
   // --- Guild (Channel) Extension APIs ---
   sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
     this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
@@ -262,6 +324,23 @@ export class OneBotClient extends EventEmitter {
       this.send("group_poke", { group_id: groupId, user_id: userId });
       // Note: Some implementations use send_poke or touch
       // Standard OneBot v11 doesn't enforce poke API, but group_poke is common in go-cqhttp
+  }
+
+  async friendPoke(userId: number): Promise<any> {
+    const tries = [
+      { action: "friend_poke", params: { user_id: userId } },
+      { action: "send_poke", params: { user_id: userId } },
+      { action: "send_poke", params: { target_id: userId } },
+    ];
+    let lastErr: unknown;
+    for (const attempt of tries) {
+      try {
+        return await this.sendWithResponse(attempt.action, attempt.params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("friend_poke failed");
   }
   // --------------------------------------
 
