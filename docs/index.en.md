@@ -23,3 +23,7 @@ This repo follows a "run first, optimize later" structure:
 - **Official forum (primary):**
   - https://aiya.de5.net/c/25-category/25
 - No QQ support group; all support and updates are centralized on the forum for long-term searchability.
+
+## HTTP Transport
+
+- [OneBot HTTP Transport Guide](./http-transport.en.md)

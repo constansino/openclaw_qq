@@ -30,3 +30,7 @@
 - **官方交流论坛（唯一）：**
   - https://aiya.de5.net/c/25-category/25
 - 不建立 QQ 群，问题与经验统一沉淀在论坛，便于检索与追踪。
+
+## HTTP ??
+
+- [OneBot HTTP ????](./http-transport.md)
