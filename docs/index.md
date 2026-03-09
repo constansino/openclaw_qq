@@ -1,6 +1,8 @@
 # OpenClaw QQ 文档中心
 
 > OneBot v11 渠道插件文档主页。
+>
+> 当前仓库文档统一维护中文版本。
 
 ## 快速入口
 
@@ -8,7 +10,6 @@
 - [配置参考（分组版）](./config-reference.md)
 - [部署指引（NapCat）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
 - [高级能力与完整参数](./advanced.md)
-- [历史英文 README 归档](./archive/README.en.legacy.md)
 - [在线文档首页](https://constansino.github.io/openclaw_qq/)
 
 ## 文档目标
@@ -30,3 +31,7 @@
 - **官方交流论坛（唯一）：**
   - https://aiya.de5.net/c/25-category/25
 - 不建立 QQ 群，问题与经验统一沉淀在论坛，便于检索与追踪。
+
+## HTTP 模式
+
+- [OneBot HTTP 模式说明](./http-transport.md)

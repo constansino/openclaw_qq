@@ -2,9 +2,13 @@ import WebSocket from "ws";
 import EventEmitter from "events";
 import type { OneBotEvent, OneBotMessage } from "./types.js";
 
+type OneBotTransportMode = "ws" | "http";
+
 interface OneBotClientOptions {
-  wsUrl: string;
+  wsUrl?: string;
+  httpUrl?: string;
   accessToken?: string;
+  transport?: OneBotTransportMode;
 }
 
 export class OneBotClient extends EventEmitter {
@@ -18,10 +22,13 @@ export class OneBotClient extends EventEmitter {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private pendingMessages: Array<{ action: string; params: any }> = [];
   private lastMessageAt = 0;
+  private transportMode: OneBotTransportMode;
+  private connected = false;
 
   constructor(options: OneBotClientOptions) {
     super();
     this.options = options;
+    this.transportMode = options.transport === "http" ? "http" : "ws";
   }
 
   getSelfId(): number | null {
@@ -29,15 +36,41 @@ export class OneBotClient extends EventEmitter {
   }
 
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    if (this.transportMode === "http") {
+      return this.connected;
+    }
+    return this.connected && this.ws?.readyState === WebSocket.OPEN;
   }
 
   setSelfId(id: number) {
     this.selfId = id;
   }
 
+  emitEvent(payload: OneBotEvent) {
+    this.isAlive = true;
+    this.lastMessageAt = Date.now();
+    if (payload?.self_id && !this.selfId) {
+      this.selfId = Number(payload.self_id);
+    }
+    this.dispatchInboundEvent(payload);
+  }
+
   connect() {
     this.cleanup();
+
+    if (this.transportMode === "http") {
+      this.connected = true;
+      this.isAlive = true;
+      this.reconnectAttempts = 0;
+      this.lastMessageAt = Date.now();
+      this.emit("connect");
+      console.log("[QQ] HTTP transport ready");
+      if (this.pendingMessages.length > 0) {
+        const toFlush = this.pendingMessages.splice(0, this.pendingMessages.length);
+        void Promise.allSettled(toFlush.map((item) => this.sendHttpRequest(item.action, item.params).catch(() => null)));
+      }
+      return;
+    }
 
     const headers: Record<string, string> = {};
     if (this.options.accessToken) {
@@ -45,9 +78,10 @@ export class OneBotClient extends EventEmitter {
     }
 
     try {
-      this.ws = new WebSocket(this.options.wsUrl, { headers });
+      this.ws = new WebSocket(this.options.wsUrl!, { headers });
 
       this.ws.on("open", () => {
+        this.connected = true;
         this.isAlive = true;
         this.reconnectAttempts = 0; // Reset counter on success
         this.lastMessageAt = Date.now();
@@ -74,11 +108,7 @@ export class OneBotClient extends EventEmitter {
         this.lastMessageAt = Date.now();
         try {
           const payload = JSON.parse(data.toString()) as OneBotEvent;
-          if (payload.post_type === "meta_event" && payload.meta_event_type === "heartbeat") {
-            this.emit("heartbeat", payload);
-            return;
-          }
-          this.emit("message", payload);
+          this.dispatchInboundEvent(payload);
         } catch (err) {
           // Ignore non-JSON or parse errors
         }
@@ -99,6 +129,7 @@ export class OneBotClient extends EventEmitter {
   }
 
   private cleanup() {
+    this.connected = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -117,6 +148,7 @@ export class OneBotClient extends EventEmitter {
   }
 
   private startHeartbeat() {
+    if (this.transportMode === "http") return;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     // Check every 30 seconds; tolerate idle links and only reconnect when stale for too long.
     this.heartbeatTimer = setInterval(() => {
@@ -136,7 +168,20 @@ export class OneBotClient extends EventEmitter {
     this.scheduleReconnect();
   }
 
+  private dispatchInboundEvent(payload: OneBotEvent) {
+    if (payload.post_type === "meta_event" && payload.meta_event_type === "heartbeat") {
+      this.emit("heartbeat", payload);
+      return;
+    }
+    if (payload.post_type === "request") {
+      this.emit("request", payload);
+      return;
+    }
+    this.emit("message", payload);
+  }
+
   private scheduleReconnect() {
+    if (this.transportMode === "http") return;
     if (this.reconnectTimer) return; // Already scheduled
     
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
@@ -278,6 +323,9 @@ export class OneBotClient extends EventEmitter {
   }
 
   private sendWithResponse(action: string, params: any, timeoutMs: number = 5000): Promise<any> {
+    if (this.transportMode === "http") {
+      return this.sendHttpRequest(action, params, timeoutMs);
+    }
     return new Promise((resolve, reject) => {
       if (this.ws?.readyState !== WebSocket.OPEN) {
         reject(new Error("WebSocket not open"));
@@ -313,6 +361,12 @@ export class OneBotClient extends EventEmitter {
   }
 
   private send(action: string, params: any) {
+    if (this.transportMode === "http") {
+      void this.sendHttpRequest(action, params).catch((err) => {
+        console.warn(`[QQ] HTTP send failed: ${String(err)}`);
+      });
+      return;
+    }
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.safeSend(action, params);
     } else {
@@ -350,6 +404,45 @@ export class OneBotClient extends EventEmitter {
         this.scheduleReconnect();
       }
       return false;
+    }
+  }
+
+  private async sendHttpRequest(action: string, params: any, timeoutMs: number = 5000): Promise<any> {
+    const baseUrl = String(this.options.httpUrl || "").trim().replace(/\/+$/, "");
+    if (!baseUrl) {
+      throw new Error("HTTP API URL not configured");
+    }
+
+    const fetchImpl = (globalThis as any).fetch;
+    if (typeof fetchImpl !== "function") {
+      throw new Error("Global fetch is not available");
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (this.options.accessToken) {
+        headers["Authorization"] = `Bearer ${this.options.accessToken}`;
+      }
+      const response = await fetchImpl(`${baseUrl}/${action}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(params ?? {}),
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload?.msg || payload?.message || `HTTP ${response.status}`);
+      }
+      if (payload?.status && payload.status !== "ok") {
+        throw new Error(payload?.msg || payload?.message || "API request failed");
+      }
+      return payload?.data ?? payload;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

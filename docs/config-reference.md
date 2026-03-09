@@ -9,7 +9,8 @@
 
 ## B. 基础触发与访问控制
 
-- `requireMention`：群聊是否必须 @ 才触发。
+- `requireMention`：群聊触发门槛（@ / 回复 / 关键词）。
+- `keywordOnlyTrigger`：群聊是否只接受关键词触发（忽略 @ / 回复）。
 - `admins`：管理员 QQ 列表。
 - `adminOnlyChat`：仅管理员可触发聊天。
 - `allowedGroups`：群白名单。
@@ -17,16 +18,16 @@
 
 ## C. 稳定性与容错
 
-- `maxRetries`：失败后自动重试次数。
-- `retryDelayMs`：重试间隔。
-- `fastFailErrors`：命中即快速切换模型/跳过等待。
+- `maxRetries`：失败后自动重试次数（默认 `0`，关闭）。
+- `retryDelayMs`：重试间隔（仅在 `maxRetries > 0` 时生效）。
+- `fastFailErrors`：命中即快速切换模型/跳过等待（默认空数组，关闭）。
 - `enableEmptyReplyFallback`：空回复兜底。
 - `emptyReplyFallbackText`：空回复兜底文案。
 
 ## D. 并发与打断
 
-- `queueDebounceMs`：同会话消息防抖合并窗口。
-- `interruptOnNewMessage`：新消息是否打断旧回复。
+- `queueDebounceMs`：同会话消息防抖合并窗口（默认 `0`，关闭）。
+- `interruptOnNewMessage`：新消息是否打断旧回复（默认关闭）。
 
 ## E. 上下文增强
 
@@ -41,6 +42,7 @@
 - `rateLimitMs`：多段发送间隔。
 - `formatMarkdown`：Markdown 转纯文本。
 - `antiRiskMode`：风控规避模式。
+- `showReplySessionSource`：给回复附加来源会话标记（临时会话场景很有用）。
 - `forwardLongReplyThreshold`：长回复自动合并转发阈值。
 
 ## G. 多媒体与频道
@@ -62,8 +64,12 @@
       "adminOnlyChat": true,
       "allowedGroups": "20000001",
       "rateLimitMs": 1000,
-      "maxRetries": 3,
-      "retryDelayMs": 3000
+      "maxRetries": 0,
+      "retryDelayMs": 3000,
+      "fastFailErrors": [],
+      "queueDebounceMs": 0,
+      "injectGatewayMeta": false,
+      "interruptOnNewMessage": false
     }
   }
 }
