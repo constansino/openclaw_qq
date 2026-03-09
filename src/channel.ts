@@ -126,6 +126,7 @@ function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, conf
 }
 
 const memberCache = new Map<string, { name: string, time: number }>();
+const groupInfoCache = new Map<string, { name: string, time: number }>();
 const execFile = promisify(execFileCallback);
 
 async function runModelSyncScript(): Promise<{ ok: boolean; text: string }> {
@@ -176,6 +177,19 @@ function getCachedMemberName(groupId: string, userId: string): string | null {
 
 function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
+}
+
+function getCachedGroupName(accountId: string, groupId: string): string | null {
+    const key = `${accountId}:${groupId}`;
+    const cached = groupInfoCache.get(key);
+    if (cached && Date.now() - cached.time < 3600000) {
+        return cached.name;
+    }
+    return null;
+}
+
+function setCachedGroupName(accountId: string, groupId: string, name: string) {
+    groupInfoCache.set(`${accountId}:${groupId}`, { name, time: Date.now() });
 }
 
 function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = 3): string[] {
@@ -2572,7 +2586,23 @@ ${current}
                     let conversationLabel = `QQ User ${userId}`;
                     if (isGroup) {
                         baseFromId = String(groupId);
-                        conversationLabel = `QQ Group ${groupId}`;
+                        const cachedGroupName = getCachedGroupName(account.accountId, String(groupId));
+                        let resolvedGroupName = cachedGroupName || "";
+                        if (!resolvedGroupName) {
+                            try {
+                                const groupInfo = await client.getGroupInfo(groupId);
+                                const groupName = typeof groupInfo?.group_name === "string"
+                                    ? groupInfo.group_name.trim()
+                                    : (typeof groupInfo?.data?.group_name === "string" ? groupInfo.data.group_name.trim() : "");
+                                if (groupName) {
+                                    resolvedGroupName = groupName;
+                                    setCachedGroupName(account.accountId, String(groupId), groupName);
+                                }
+                            } catch (err) {
+                                console.warn(`[QQ] Failed to resolve group name for ${groupId}: ${String(err)}`);
+                            }
+                        }
+                        conversationLabel = resolvedGroupName ? `QQ Group "${resolvedGroupName}"` : `QQ Group ${groupId}`;
                     } else if (isGuild) {
                         baseFromId = `guild:${guildId}:${channelId}`;
                         conversationLabel = `QQ Guild ${guildId} Channel ${channelId}`;
@@ -2804,7 +2834,7 @@ ${current}
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                         Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
-                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
+                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
                         OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
