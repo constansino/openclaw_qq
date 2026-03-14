@@ -1359,13 +1359,46 @@ function isVideoFile(url: string): boolean {
 
 type MediaKind = "image" | "audio" | "video" | "file";
 
+function normalizeMediaInput(value: string): string {
+    let normalized = String(value || "").trim();
+    if (!normalized) return normalized;
+
+    const markdownMatch = normalized.match(/^!?\[[^\]]*\]\((.+)\)$/);
+    if (markdownMatch?.[1]) {
+        normalized = markdownMatch[1].trim();
+    }
+
+    if (normalized.startsWith("<") && normalized.endsWith(">")) {
+        normalized = normalized.slice(1, -1).trim();
+    }
+
+    if ((normalized.startsWith('"') && normalized.endsWith('"')) || (normalized.startsWith("'") && normalized.endsWith("'"))) {
+        normalized = normalized.slice(1, -1).trim();
+    }
+
+    const titledMarkdownMatch = normalized.match(/^(.*?)(?:\s+["'].*["'])$/);
+    if (titledMarkdownMatch?.[1] && /^(?:file:|https?:|\.?\.?[\\/]|[A-Za-z]:[\\/])/.test(titledMarkdownMatch[1])) {
+        normalized = titledMarkdownMatch[1].trim();
+    }
+
+    if (!normalized.startsWith("base64://")) {
+        try {
+            normalized = decodeURI(normalized);
+        } catch { }
+    }
+
+    return normalized;
+}
+
 function detectMediaKind(...values: Array<string | undefined | null>): MediaKind {
     for (const value of values) {
         if (!value) continue;
-        if (value.startsWith("base64://")) return "image";
-        if (isImageFile(value)) return "image";
-        if (isAudioFile(value)) return "audio";
-        if (isVideoFile(value)) return "video";
+        const normalized = normalizeMediaInput(value);
+        if (!normalized) continue;
+        if (normalized.startsWith("base64://")) return "image";
+        if (isImageFile(normalized)) return "image";
+        if (isAudioFile(normalized)) return "audio";
+        if (isVideoFile(normalized)) return "video";
     }
     return "file";
 }
@@ -1433,8 +1466,9 @@ async function sendChunkWithAckRetry(client: OneBotClient, to: string, message: 
 }
 
 function guessFileName(input: string): string {
-    const local = toLocalPathIfAny(input);
-    const name = path.basename(local || input.split("?")[0].split("#")[0]);
+    const normalized = normalizeMediaInput(input);
+    const local = toLocalPathIfAny(normalized);
+    const name = path.basename(local || normalized.split("?")[0].split("#")[0]);
     if (!name || name === "." || name === "/") return `media_${Date.now()}.bin`;
     return name;
 }
@@ -1514,21 +1548,22 @@ async function ensureFileInSharedMedia(localPath: string, hostSharedDir: string)
 }
 
 function toLocalPathIfAny(value: string): string | null {
-    if (!value) return null;
-    if (value.startsWith("file:")) {
+    const normalized = normalizeMediaInput(value);
+    if (!normalized) return null;
+    if (normalized.startsWith("file:")) {
         try {
-            return fileURLToPath(value);
+            return fileURLToPath(normalized);
         } catch {
             return null;
         }
     }
     if (
-        value.startsWith("/") ||
-        value.startsWith("./") ||
-        value.startsWith("../") ||
-        /^[A-Za-z]:[\\/]/.test(value)
+        normalized.startsWith("/") ||
+        normalized.startsWith("./") ||
+        normalized.startsWith("../") ||
+        /^[A-Za-z]:[\\/]/.test(normalized)
     ) {
-        return path.isAbsolute(value) ? value : path.resolve(process.cwd(), value);
+        return path.isAbsolute(normalized) ? normalized : path.resolve(process.cwd(), normalized);
     }
     return null;
 }
@@ -1650,12 +1685,13 @@ function processAntiRisk(text: string): string {
 }
 
 async function resolveMediaUrl(url: string): Promise<string> {
-    if (url.startsWith("file:")) {
+    const normalizedUrl = normalizeMediaInput(url);
+    if (normalizedUrl.startsWith("file:")) {
         try {
-            const localPath = fileURLToPath(url);
+            const localPath = fileURLToPath(normalizedUrl);
             return await readLocalFileAsBase64(localPath);
         } catch (e) {
-            const preferredExt = path.extname(url);
+            const preferredExt = path.extname(normalizedUrl);
             const fallback = await findRecentAudioFallback(preferredExt);
             if (fallback) {
                 try {
@@ -1664,22 +1700,22 @@ async function resolveMediaUrl(url: string): Promise<string> {
                 } catch { }
             }
             console.warn(`[QQ] Failed to convert local file to base64: ${e}`);
-            return url;
+            return normalizedUrl;
         }
     }
 
     const looksLocalPath =
-        url.startsWith("/") ||
-        url.startsWith("./") ||
-        url.startsWith("../") ||
-        /^[A-Za-z]:[\\/]/.test(url);
+        normalizedUrl.startsWith("/") ||
+        normalizedUrl.startsWith("./") ||
+        normalizedUrl.startsWith("../") ||
+        /^[A-Za-z]:[\\/]/.test(normalizedUrl);
     if (looksLocalPath) {
         try {
-            const absolutePath = path.isAbsolute(url) ? url : path.resolve(process.cwd(), url);
+            const absolutePath = path.isAbsolute(normalizedUrl) ? normalizedUrl : path.resolve(process.cwd(), normalizedUrl);
             return await readLocalFileAsBase64(absolutePath);
         } catch (e) {
-            if (isAudioFile(url)) {
-                const preferredExt = path.extname(url);
+            if (isAudioFile(normalizedUrl)) {
+                const preferredExt = path.extname(normalizedUrl);
                 const fallback = await findRecentAudioFallback(preferredExt);
                 if (fallback) {
                     try {
@@ -1688,12 +1724,12 @@ async function resolveMediaUrl(url: string): Promise<string> {
                     } catch { }
                 }
             }
-            console.warn(`[QQ] Failed to read local media path for base64 conversion: ${url} (${e})`);
-            return url;
+            console.warn(`[QQ] Failed to read local media path for base64 conversion: ${normalizedUrl} (${e})`);
+            return normalizedUrl;
         }
     }
 
-    return url;
+    return normalizedUrl;
 }
 
 async function resolveInlineCqRecord(text: string): Promise<string> {
@@ -3267,9 +3303,10 @@ ${current}
             const containerSharedDirRaw = typeof runtimeCfg.sharedMediaContainerDir === "string" ? runtimeCfg.sharedMediaContainerDir.trim() : "";
             const containerSharedDir = containerSharedDirRaw || "/openclaw_media";
 
-            const sourceKind = detectMediaKind(mediaUrl);
+            const preparedMediaUrl = normalizeMediaInput(mediaUrl);
+            const sourceKind = detectMediaKind(preparedMediaUrl);
             const groupId = parseGroupIdFromTarget(to);
-            const localSourcePath = toLocalPathIfAny(mediaUrl);
+            const localSourcePath = toLocalPathIfAny(preparedMediaUrl);
             let stagedSharedPath: string | null = null;
             if (localSourcePath && hostSharedDir) {
                 stagedSharedPath = await stageLocalFileForContainer(localSourcePath, hostSharedDir, containerSharedDir);
@@ -3288,8 +3325,8 @@ ${current}
                 }
             }
             const finalUrl = sourceKind === "image" || sourceKind === "audio"
-                ? await resolveMediaUrl(mediaUrl)
-                : mediaUrl;
+                ? await resolveMediaUrl(preparedMediaUrl)
+                : preparedMediaUrl;
 
             let textAck: any = null;
             if (text && text.trim()) {
@@ -3305,7 +3342,7 @@ ${current}
 
             const mediaMessage: OneBotMessage = [];
             if (replyTo && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyTo) } });
-            const mediaKind = detectMediaKind(mediaUrl, finalUrl);
+            const mediaKind = detectMediaKind(preparedMediaUrl, finalUrl);
             const audioLike = mediaKind === "audio";
             const imageLike = mediaKind === "image";
             const videoLike = mediaKind === "video";
@@ -3337,7 +3374,7 @@ ${current}
             } else {
                 if (groupId && (stagedSharedPath || localSourcePath)) {
                     const uploadPath = stagedSharedPath || localSourcePath!;
-                    const uploadName = guessFileName(mediaUrl);
+                    const uploadName = guessFileName(preparedMediaUrl);
                     const uploadAck = await uploadGroupFile(client, groupId, uploadPath, uploadName);
                     if (uploadAck.ok) {
                         return {
@@ -3352,7 +3389,7 @@ ${current}
                     }
                     console.warn(`[QQ] upload_group_file failed (primary path): ${uploadAck.error || "unknown"}`);
                 }
-                mediaMessage.push({ type: "file", data: { file: stagedSharedPath || finalUrl, name: guessFileName(mediaUrl) } });
+                mediaMessage.push({ type: "file", data: { file: stagedSharedPath || finalUrl, name: guessFileName(preparedMediaUrl) } });
             }
 
             const mediaAck = await sendOneBotMessageWithAck(client, to, mediaMessage);
@@ -3361,7 +3398,7 @@ ${current}
                 const errorClass = classifyMediaError(primaryError);
                 if ((videoLike || fileLike) && groupId && (stagedSharedPath || localSourcePath)) {
                     const uploadPath = stagedSharedPath || localSourcePath!;
-                    const uploadName = guessFileName(mediaUrl);
+                    const uploadName = guessFileName(preparedMediaUrl);
                     const uploadAck = await uploadGroupFile(client, groupId, uploadPath, uploadName);
                     if (uploadAck.ok) {
                         return {
