@@ -1,7 +1,7 @@
 import { promises as fs, constants as fsConstants } from "node:fs";
+import { execFile as execFileCb } from "node:child_process";
 import path from "node:path";
 import { homedir } from "node:os";
-import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -43,6 +43,7 @@ interface SessionQueue {
 }
 
 const sessionQueues = new Map<string, SessionQueue>();
+const execFileAsync = promisify(execFileCb);
 
 function normalizeOneBotHttpToken(raw: string | undefined | null): string {
     const value = String(raw || "").trim();
@@ -99,9 +100,16 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
             mergeText("BodyForCommands");
             mergeText("CommandBody");
 
+            const allMediaPaths = payloads.flatMap(p => p.ctxPayload.MediaPaths || []);
+            if (allMediaPaths.length > 0) {
+                mergedCtx.MediaPaths = Array.from(new Set(allMediaPaths));
+                if (!mergedCtx.MediaPath) mergedCtx.MediaPath = mergedCtx.MediaPaths[0];
+            }
+
             const allMediaUrls = payloads.flatMap(p => p.ctxPayload.MediaUrls || []);
             if (allMediaUrls.length > 0) {
                 mergedCtx.MediaUrls = Array.from(new Set(allMediaUrls));
+                if (!mergedCtx.MediaUrl) mergedCtx.MediaUrl = mergedCtx.MediaUrls[0];
             }
 
             if (config.enableQueueNotify !== false) {
@@ -156,7 +164,6 @@ function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, conf
 }
 
 const memberCache = new Map<string, { name: string, time: number }>();
-const execFile = promisify(execFileCallback);
 
 async function runModelSyncScript(): Promise<{ ok: boolean; text: string }> {
     const home = process.env.HOME || homedir();
@@ -178,7 +185,7 @@ async function runModelSyncScript(): Promise<{ ok: boolean; text: string }> {
     }
 
     try {
-        const { stdout, stderr } = await execFile(scriptPath, [], {
+        const { stdout, stderr } = await execFileAsync(scriptPath, [], {
             timeout: 180000,
             maxBuffer: 1024 * 1024 * 4,
             env: process.env,
@@ -208,7 +215,192 @@ function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
 }
 
-function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = 3): string[] {
+const INBOUND_IMAGE_LIMIT = 5;
+const QQ_RESTRICTED_IMAGE_HOSTS = new Set(["multimedia.nt.qq.com.cn", "gchat.qpic.cn"]);
+const QQ_IMAGE_DOWNLOAD_TIMEOUT_MS = 15000;
+
+function resolveOpenClawStateDir(): string {
+    const fromEnv = String(process.env.OPENCLAW_STATE_DIR || "").trim();
+    if (fromEnv) return fromEnv;
+    const home = String(process.env.HOME || process.env.USERPROFILE || "").trim();
+    return home ? path.join(home, ".openclaw") : path.resolve(".openclaw");
+}
+
+function resolveInboundMediaDir(): string {
+    return path.join(resolveOpenClawStateDir(), "media", "inbound");
+}
+
+function sanitizePathSegment(value: string): string {
+    return value.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+function inferImageExtensionFromMime(contentType: string | null): string {
+    const ct = String(contentType || "").toLowerCase();
+    if (ct.includes("png")) return ".png";
+    if (ct.includes("jpeg") || ct.includes("jpg")) return ".jpg";
+    if (ct.includes("webp")) return ".webp";
+    if (ct.includes("gif")) return ".gif";
+    if (ct.includes("bmp")) return ".bmp";
+    if (ct.includes("tiff")) return ".tiff";
+    return ".bin";
+}
+
+function inferImageExtensionFromBuffer(buffer: Buffer): string {
+    if (buffer.length >= 8) {
+        const pngSig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        if (pngSig.every((v, i) => buffer[i] === v)) return ".png";
+    }
+    if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return ".jpg";
+    if (buffer.length >= 4 && buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38) return ".gif";
+    if (
+        buffer.length >= 12 &&
+        buffer[0] === 0x52 &&
+        buffer[1] === 0x49 &&
+        buffer[2] === 0x46 &&
+        buffer[3] === 0x46 &&
+        buffer[8] === 0x57 &&
+        buffer[9] === 0x45 &&
+        buffer[10] === 0x42 &&
+        buffer[11] === 0x50
+    ) {
+        return ".webp";
+    }
+    return ".bin";
+}
+
+function inferImageExtensionFromUrl(rawUrl: string): string {
+    try {
+        const parsed = new URL(rawUrl);
+        const ext = path.extname(parsed.pathname || "");
+        return ext || ".bin";
+    } catch {
+        return ".bin";
+    }
+}
+
+function isQqRestrictedImageUrl(rawUrl: string): boolean {
+    try {
+        const parsed = new URL(rawUrl);
+        return QQ_RESTRICTED_IMAGE_HOSTS.has((parsed.hostname || "").toLowerCase());
+    } catch {
+        return false;
+    }
+}
+
+async function writeBufferToInboundMedia(buffer: Buffer, filePrefix: string, extHint?: string): Promise<string> {
+    const mediaDir = resolveInboundMediaDir();
+    await fs.mkdir(mediaDir, { recursive: true });
+    const ext = extHint && extHint.startsWith(".") ? extHint : (extHint ? `.${extHint}` : ".bin");
+    const safeExt = ext.replace(/[^A-Za-z0-9.]/g, "") || ".bin";
+    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}_${sanitizePathSegment(filePrefix)}${safeExt}`;
+    const filePath = path.join(mediaDir, fileName);
+    await fs.writeFile(filePath, buffer);
+    return filePath;
+}
+
+async function writeBase64ImageToInboundMedia(value: string): Promise<string | null> {
+    const payload = String(value || "").replace(/^base64:\/\//, "").trim();
+    if (!payload) return null;
+    try {
+        const buffer = Buffer.from(payload, "base64");
+        if (buffer.length === 0) return null;
+        const ext = inferImageExtensionFromBuffer(buffer);
+        return await writeBufferToInboundMedia(buffer, "qq_base64_image", ext);
+    } catch (err) {
+        console.warn(`[QQ] Failed to convert base64 image to inbound media path: ${String(err)}`);
+        return null;
+    }
+}
+
+async function downloadQqImageToInboundMedia(rawUrl: string, timeoutMs = QQ_IMAGE_DOWNLOAD_TIMEOUT_MS): Promise<string | null> {
+    const url = String(rawUrl || "").trim();
+    if (!url || !isQqRestrictedImageUrl(url)) return null;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await fetch(url, { method: "GET", signal: controller.signal });
+        if (!resp.ok) {
+            console.warn(`[QQ] Failed to download QQ image (${resp.status}) from ${url}`);
+            return null;
+        }
+        const ab = await resp.arrayBuffer();
+        const buffer = Buffer.from(ab);
+        if (buffer.length === 0) {
+            console.warn(`[QQ] Downloaded QQ image is empty: ${url}`);
+            return null;
+        }
+        const extFromUrl = inferImageExtensionFromUrl(url);
+        const extFromMime = inferImageExtensionFromMime(resp.headers.get("content-type"));
+        const extFromBuffer = inferImageExtensionFromBuffer(buffer);
+        const ext = extFromUrl !== ".bin" ? extFromUrl : (extFromMime !== ".bin" ? extFromMime : extFromBuffer);
+        return await writeBufferToInboundMedia(buffer, "qq_inbound_image", ext);
+    } catch (err) {
+        console.warn(`[QQ] Failed to download QQ image URL: ${url} (${String(err)})`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function dedupeStrings(values: string[], maxItems?: number): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of values) {
+        const v = String(item || "").trim();
+        if (!v || seen.has(v)) continue;
+        seen.add(v);
+        out.push(v);
+        if (maxItems && out.length >= maxItems) break;
+    }
+    return out;
+}
+
+function isHttpLike(value: string): boolean {
+    return value.startsWith("http://") || value.startsWith("https://");
+}
+
+function isAbsoluteLikePath(value: string): boolean {
+    return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+async function resolveInboundImageRefs(imageRefs: string[]): Promise<{ mediaPaths: string[]; mediaUrls: string[] }> {
+    const mediaPaths: string[] = [];
+    const mediaUrls: string[] = [];
+    for (const raw of dedupeStrings(imageRefs, INBOUND_IMAGE_LIMIT)) {
+        const value = raw.trim();
+        if (!value) continue;
+        if (value.startsWith("base64://")) {
+            const savedPath = await writeBase64ImageToInboundMedia(value);
+            if (savedPath) mediaPaths.push(savedPath);
+            continue;
+        }
+        if (value.startsWith("file://")) {
+            const localPath = toLocalPathIfAny(value);
+            if (localPath) mediaPaths.push(localPath);
+            continue;
+        }
+        if (isAbsoluteLikePath(value)) {
+            mediaPaths.push(value);
+            continue;
+        }
+        if (isHttpLike(value)) {
+            const downloaded = await downloadQqImageToInboundMedia(value, QQ_IMAGE_DOWNLOAD_TIMEOUT_MS);
+            if (downloaded) {
+                mediaPaths.push(downloaded);
+            } else {
+                mediaUrls.push(value);
+            }
+            continue;
+        }
+        mediaUrls.push(value);
+    }
+    return {
+        mediaPaths: dedupeStrings(mediaPaths, INBOUND_IMAGE_LIMIT),
+        mediaUrls: dedupeStrings(mediaUrls, INBOUND_IMAGE_LIMIT),
+    };
+}
+
+function extractImageUrls(message: OneBotMessage | string | undefined, maxImages = INBOUND_IMAGE_LIMIT): string[] {
     const urls: string[] = [];
 
     if (Array.isArray(message)) {
@@ -268,6 +460,28 @@ function cleanCQCodes(text: string | undefined): string {
     }
 
     return result;
+}
+
+function buildQQBodyForAgent(params: {
+    currentText: string;
+    extractedTextFromSegments: string;
+    replyToBody: string;
+    replyToSender: string;
+    mentionedByAt: boolean;
+}): string {
+    const currentBody = cleanCQCodes(params.currentText);
+    if (!params.replyToBody) return currentBody;
+
+    const replyBlock = `[Replying to ${params.replyToSender || "unknown"}]\n${params.replyToBody}\n[/Replying]`;
+    const plainCurrentText = cleanCQCodes(params.extractedTextFromSegments);
+    if (plainCurrentText) {
+        return [currentBody, replyBlock].filter(Boolean).join("\n\n");
+    }
+
+    const implicitReplyLead = params.mentionedByAt
+        ? "The sender @mentioned you while replying to the quoted message. Treat the quoted message as the main thing to respond to unless the current turn says otherwise."
+        : "The sender replied to the quoted message without additional text. Treat the quoted message as the main thing to respond to unless the current turn says otherwise.";
+    return `${implicitReplyLead}\n\n${replyBlock}`;
 }
 
 function splitLongText(input: string, maxLength = 2800): string[] {
@@ -397,6 +611,57 @@ function buildModelProbeUrls(rawBaseUrl: string): string[] {
     return [...new Set(out)];
 }
 
+type LoadedOpenClawConfig = {
+    parsed: any;
+    usedPath: string;
+};
+
+function resolveOpenClawConfigCandidates(): string[] {
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    return [
+        process.env.OPENCLAW_CONFIG,
+        process.env.OPENCLAW_CONFIG_PATH,
+        home ? path.join(home, ".openclaw", "openclaw.json") : "",
+    ].filter((value): value is string => Boolean(value && value.trim()));
+}
+
+async function loadOpenClawConfig(): Promise<LoadedOpenClawConfig | null> {
+    const candidates = resolveOpenClawConfigCandidates();
+    for (const cfgPath of candidates) {
+        try {
+            const raw = await fs.readFile(cfgPath, "utf-8");
+            return { parsed: JSON.parse(raw), usedPath: cfgPath };
+        } catch { }
+    }
+    return null;
+}
+
+function parseConfiguredModelIds(cfgModels: any[]): string[] {
+    const out: string[] = [];
+    for (const model of cfgModels) {
+        if (typeof model === "string" && model.trim()) {
+            out.push(model.trim());
+            continue;
+        }
+        if (model && typeof model === "object") {
+            const id = typeof model.id === "string" ? model.id.trim() : "";
+            if (id) out.push(id);
+        }
+    }
+    return [...new Set(out)];
+}
+
+function buildDefaultModelAliasMap(parsed: any): Map<string, string> {
+    const aliasMap = new Map<string, string>();
+    const defaults = parsed?.agents?.defaults?.models;
+    if (!defaults || typeof defaults !== "object") return aliasMap;
+    for (const [fullId, cfg] of Object.entries(defaults as Record<string, any>)) {
+        const alias = typeof (cfg as any)?.alias === "string" ? (cfg as any).alias.trim() : "";
+        if (alias) aliasMap.set(fullId, alias);
+    }
+    return aliasMap;
+}
+
 async function fetchProviderModelIdsDynamic(baseUrl: string, apiKey?: string): Promise<{ ids: string[]; source: string } | null> {
     const probeUrls = buildModelProbeUrls(baseUrl);
     for (const url of probeUrls) {
@@ -418,27 +683,11 @@ async function fetchProviderModelIdsDynamic(baseUrl: string, apiKey?: string): P
 }
 
 async function buildModelCatalogText(): Promise<string> {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const candidates = [
-        process.env.OPENCLAW_CONFIG,
-        process.env.OPENCLAW_CONFIG_PATH,
-        home ? path.join(home, ".openclaw", "openclaw.json") : "",
-    ].filter((value): value is string => Boolean(value && value.trim()));
-
-    let parsed: any = null;
-    let usedPath = "";
-    for (const cfgPath of candidates) {
-        try {
-            const raw = await fs.readFile(cfgPath, "utf-8");
-            parsed = JSON.parse(raw);
-            usedPath = cfgPath;
-            break;
-        } catch { }
-    }
-
-    if (!parsed) {
+    const loaded = await loadOpenClawConfig();
+    if (!loaded) {
         return "[OpenClawd QQ]\n无法读取模型配置文件。请在服务器执行：openclaw status";
     }
+    const { parsed, usedPath } = loaded;
 
     const providers = parsed?.models?.providers as Record<string, any> | undefined;
     const currentModel =
@@ -468,6 +717,215 @@ async function buildModelCatalogText(): Promise<string> {
         }
     }
     lines.push(`Config: ${usedPath}`);
+    return lines.join("\n");
+}
+
+async function buildConfiguredModelCatalogText(): Promise<string> {
+    const loaded = await loadOpenClawConfig();
+    if (!loaded) {
+        return "[OpenClawd QQ]\n无法读取模型配置文件。请在服务器执行：openclaw status";
+    }
+    const { parsed, usedPath } = loaded;
+
+    const providers = parsed?.models?.providers as Record<string, any> | undefined;
+    const currentModel =
+        (typeof parsed?.agents?.defaults?.model?.primary === "string" && parsed.agents.defaults.model.primary.trim())
+        || (typeof parsed?.agent?.model === "string" && parsed.agent.model.trim())
+        || "unknown";
+    if (!providers || typeof providers !== "object") {
+        return `[OpenClawd QQ]\nCurrent: ${currentModel}\n未找到 models.providers 配置。`;
+    }
+
+    const aliasMap = buildDefaultModelAliasMap(parsed);
+    const lines: string[] = [`[OpenClawd QQ]`, `Current: ${currentModel}`, `Providers (config only):`];
+    let index = 1;
+    for (const [providerName, providerValue] of Object.entries(providers)) {
+        const cfgModels = Array.isArray((providerValue as any)?.models) ? (providerValue as any).models : [];
+        const modelIds = parseConfiguredModelIds(cfgModels);
+        const apiType = typeof (providerValue as any)?.api === "string" ? (providerValue as any).api.trim() : "";
+        lines.push(`- ${providerName} (${modelIds.length})${apiType ? ` [api: ${apiType}]` : ""}`);
+        if (modelIds.length === 0) {
+            lines.push("  (none)");
+            continue;
+        }
+        for (const modelId of modelIds) {
+            const fullId = `${providerName}/${modelId}`;
+            const alias = aliasMap.get(fullId);
+            lines.push(`  ${index}. ${fullId}${alias ? ` (alias: ${alias})` : ""}`);
+            index += 1;
+        }
+    }
+    lines.push(`Config: ${usedPath}`);
+    return lines.join("\n");
+}
+
+function maskApiKey(apiKey: string): string {
+    const key = String(apiKey || "").trim();
+    if (!key) return "none";
+    if (key.length <= 12) return key;
+    return `${key.slice(0, 8)}...${key.slice(-8)}`;
+}
+
+function formatTokenCap(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return "unknown";
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+    if (value >= 1000) return `${Math.round(value / 1000)}k`;
+    return String(Math.round(value));
+}
+
+function formatRelativeTime(ts: number | null | undefined): string {
+    if (!Number.isFinite(Number(ts)) || Number(ts) <= 0) return "unknown";
+    const deltaMs = Date.now() - Number(ts);
+    if (deltaMs < 5000) return "just now";
+    const sec = Math.floor(deltaMs / 1000);
+    if (sec < 60) return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hour = Math.floor(min / 60);
+    if (hour < 24) return `${hour}h ago`;
+    const day = Math.floor(hour / 24);
+    return `${day}d ago`;
+}
+
+function parsePrimaryModel(providerSlashModel: string): { provider: string; model: string } {
+    const raw = String(providerSlashModel || "").trim();
+    const idx = raw.indexOf("/");
+    if (idx <= 0) return { provider: "", model: raw };
+    return { provider: raw.slice(0, idx), model: raw.slice(idx + 1) };
+}
+
+function resolveAgentPrimaryModel(parsed: any, agentId: string): { provider: string; model: string } {
+    const list = Array.isArray(parsed?.agents?.list) ? parsed.agents.list : [];
+    const agentEntry = list.find((item: any) => item?.id === agentId);
+    const fromAgent = typeof agentEntry?.model?.primary === "string" ? agentEntry.model.primary.trim() : "";
+    if (fromAgent) return parsePrimaryModel(fromAgent);
+    const fromDefaults = typeof parsed?.agents?.defaults?.model?.primary === "string"
+        ? parsed.agents.defaults.model.primary.trim()
+        : "";
+    if (fromDefaults) return parsePrimaryModel(fromDefaults);
+    return { provider: "", model: "" };
+}
+
+function resolveProviderModelConfig(parsed: any, provider: string, model: string): any {
+    const p = parsed?.models?.providers?.[provider];
+    const models = Array.isArray(p?.models) ? p.models : [];
+    for (const item of models) {
+        if (typeof item === "string") {
+            if (item === model) return { id: item };
+            continue;
+        }
+        if (item && typeof item === "object" && typeof item.id === "string" && item.id.trim() === model) return item;
+    }
+    return null;
+}
+
+async function readSessionByKey(storePath: string, sessionKey: string): Promise<any | null> {
+    try {
+        const raw = await fs.readFile(storePath, "utf-8");
+        const store = JSON.parse(raw) as Record<string, any>;
+        if (!store || typeof store !== "object") return null;
+        const value = store[sessionKey];
+        return value && typeof value === "object" ? value : null;
+    } catch {
+        return null;
+    }
+}
+
+let openClawBannerCache: { value: string; expireAt: number } = { value: "", expireAt: 0 };
+
+async function resolveOpenClawBannerLine(): Promise<string> {
+    if (openClawBannerCache.value && openClawBannerCache.expireAt > Date.now()) return openClawBannerCache.value;
+    const commandCandidates: Array<{ bin: string; args: string[] }> = [
+        { bin: "openclaw", args: ["--help"] },
+        { bin: "npx", args: ["openclaw", "--help"] },
+    ];
+    let out = "🦞 OpenClaw";
+    for (const candidate of commandCandidates) {
+        try {
+            const result = await execFileAsync(candidate.bin, candidate.args, {
+                timeout: 12000,
+                maxBuffer: 512 * 1024,
+                env: process.env,
+            });
+            const text = `${String(result.stdout || "")}\n${String(result.stderr || "")}`;
+            const line = text.split(/\r?\n/).map((v) => v.trim()).find((v) => v.includes("OpenClaw"));
+            if (line) {
+                out = line.replace(/\s+—.*$/, "").trim();
+                break;
+            }
+        } catch { }
+    }
+    openClawBannerCache = { value: out, expireAt: Date.now() + 5 * 60 * 1000 };
+    return out;
+}
+
+type CompactOpStatusInput = {
+    cfg: QQConfig;
+    agentId: string;
+    sessionKey: string;
+    session: any | null;
+    senderName: string;
+    isGroup: boolean;
+    queueDepth: number;
+};
+
+async function buildCompactOpenClawStatusText(input: CompactOpStatusInput): Promise<string> {
+    const banner = await resolveOpenClawBannerLine();
+    const loaded = await loadOpenClawConfig();
+    const parsed = loaded?.parsed ?? {};
+
+    const fallbackModel = resolveAgentPrimaryModel(parsed, input.agentId);
+    const selectedProvider = String(
+        input.session?.providerOverride || input.session?.modelProvider || fallbackModel.provider || "",
+    ).trim();
+    const selectedModel = String(
+        input.session?.modelOverride || input.session?.model || fallbackModel.model || "",
+    ).trim();
+    const activeProvider = String(input.session?.modelProvider || selectedProvider || "").trim();
+    const activeModel = String(input.session?.model || selectedModel || "").trim();
+    const selectedLabel = selectedProvider && selectedModel
+        ? `${selectedProvider}/${selectedModel}`
+        : (selectedModel || "unknown");
+    const activeLabel = activeProvider && activeModel
+        ? `${activeProvider}/${activeModel}`
+        : (activeModel || "unknown");
+    const activeDiffers = selectedProvider !== activeProvider || selectedModel !== activeModel;
+
+    const providerCfg = selectedProvider ? parsed?.models?.providers?.[selectedProvider] : null;
+    const apiKeyMasked = maskApiKey(typeof providerCfg?.apiKey === "string" ? providerCfg.apiKey : "");
+
+    const modelCfg = activeProvider && activeModel
+        ? resolveProviderModelConfig(parsed, activeProvider, activeModel)
+        : null;
+    const contextCap = Number(input.session?.contextTokens || modelCfg?.contextWindow || 0);
+    const contextUsed = Number(input.session?.totalTokens || 0);
+    const contextPct = contextCap > 0 ? Math.max(0, Math.min(100, Math.round((contextUsed / contextCap) * 100))) : 0;
+
+    const queueMode = (input.cfg.queueDebounceMs ?? 3000) > 0 ? "collect" : "direct";
+    const activationMode = input.cfg.requireMention ? "mention" : "open";
+    const runtimeMode = "direct";
+    const thinking = "off";
+    const compactions = 0;
+    const mediaInfo = "image off · audio none · video none";
+    const updated = formatRelativeTime(Number(input.session?.updatedAt || 0));
+
+    const lines: string[] = [];
+    if (input.isGroup) {
+        const sender = String(input.senderName || "").replace(/\s+/g, " ").trim();
+        if (sender) lines.push(`@${sender} ${banner}`);
+        else lines.push(banner);
+    } else {
+        lines.push(banner);
+    }
+    lines.push(`🧠 Model: ${selectedLabel}${activeDiffers ? " (selected)" : ""} · 🔑 api-key ${apiKeyMasked} (models.json)`);
+    if (activeDiffers) {
+        lines.push(`🏃 Active: ${activeLabel} (runtime)`);
+    }
+    lines.push(`📚 Context: ${contextUsed}/${formatTokenCap(contextCap)} (${contextPct}%) · 🧹 Compactions: ${compactions}`);
+    lines.push(`📎 Media: ${mediaInfo}`);
+    lines.push(`🧵 Session: ${input.sessionKey} • updated ${updated}`);
+    lines.push(`⚙️ Runtime: ${runtimeMode} · Think: ${thinking}`);
+    lines.push(`👥 Activation: ${activationMode} · 🪢 Queue: ${queueMode} (depth ${Math.max(0, input.queueDepth)})`);
     return lines.join("\n");
 }
 
@@ -2335,7 +2793,15 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         if (!isAdmin) return;
                         text = inlineCommand;
                         forceTriggered = true;
+                    } else if (isGroup && /^\/md\b/i.test(inlineCommand)) {
+                        if (!isAdmin) return;
+                        text = inlineCommand;
+                        forceTriggered = true;
                     } else if (isGroup && /^\/model\b/i.test(inlineCommand)) {
+                        if (!isAdmin) return;
+                        text = inlineCommand;
+                        forceTriggered = true;
+                    } else if (isGroup && /^\/opstatus\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
                         text = inlineCommand;
                         forceTriggered = true;
@@ -2509,6 +2975,51 @@ ${current}
                             }
                             return;
                         }
+                        if (cmd === '/md') {
+                            const catalog = await buildConfiguredModelCatalogText();
+                            const chunks = splitLongText(catalog, 2800);
+                            for (const chunk of chunks) {
+                                if (isGroup) client.sendGroupMsg(groupId, chunk);
+                                else client.sendPrivateMsg(userId, chunk);
+                                if (config.rateLimitMs > 0) await sleep(Math.min(config.rateLimitMs, 800));
+                            }
+                            return;
+                        }
+                        if (cmd === '/opstatus') {
+                            const runtimeForStatus = getQQRuntime();
+                            const fromIdForStatus = buildEffectiveFromId(baseFromIdForCommand, activeTempSlot);
+                            const routeForStatus = runtimeForStatus.channel.routing.resolveAgentRoute({
+                                cfg,
+                                channel: "qq",
+                                accountId: account.accountId,
+                                peer: {
+                                    kind: isGuild ? "channel" : (isGroup ? "group" : "direct"),
+                                    id: fromIdForStatus,
+                                },
+                            });
+                            const storePathForStatus = runtimeForStatus.channel.session.resolveStorePath(
+                                cfg.session?.store,
+                                { agentId: routeForStatus.agentId },
+                            );
+                            const sessionForStatus = await readSessionByKey(storePathForStatus, routeForStatus.sessionKey);
+                            const senderNameForStatus = String(
+                                event?.sender?.card || event?.sender?.nickname || event?.sender?.user_id || userId || "",
+                            ).trim();
+                            const queueState = sessionQueues.get(routeForStatus.sessionKey);
+                            const queueDepth = queueState
+                                ? queueState.pendingPayloads.length + (queueState.isProcessing ? 1 : 0)
+                                : 0;
+                            const statusText = await buildCompactOpenClawStatusText({
+                                cfg: config,
+                                agentId: routeForStatus.agentId,
+                                sessionKey: routeForStatus.sessionKey,
+                                session: sessionForStatus,
+                                senderName: senderNameForStatus,
+                                isGroup,
+                                queueDepth,
+                            });
+                            const chunks = splitLongText(statusText, 2800);
+                        }
                         if (cmd === '/modelsync') {
                             const startMsg = `[OpenClawd QQ]\n开始同步模型 allowlist（来源：provider /models）...`;
                             if (isGroup) client.sendGroupMsg(groupId, startMsg);
@@ -2580,6 +3091,8 @@ ${current}
                         if (cmd === '/help') {
                             const helpMsg = `[OpenClawd QQ]
 /status - 状态
+/opstatus - OpenClaw 完整状态
+/md - 仅配置模型列表
 /临时 <名称> - 进入临时会话
 /临时重命名 <新名称> - 重命名当前临时会话
 /退出临时 - 回到主会话
@@ -2937,6 +3450,14 @@ ${current}
                     }
 
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
+                    const bodyForAgent = buildQQBodyForAgent({
+                        currentText: text,
+                        extractedTextFromSegments,
+                        replyToBody,
+                        replyToSender,
+                        mentionedByAt,
+                    });
+                    const commandBody = text;
                     let bodyWithReply = cleanCQCodes(text) + replySuffix;
                     let systemBlock = "";
                     if (config.injectGatewayMeta !== false) {
@@ -2990,21 +3511,27 @@ ${current}
                     }
                     bodyWithReply = systemBlock + bodyWithReply;
 
-                    const inboundMediaUrls = Array.from(new Set([
-                        ...extractImageUrls(event.message),
+                    const inboundImageRefs = dedupeStrings([
+                        ...extractImageUrls(event.message, INBOUND_IMAGE_LIMIT),
                         ...imageHints,
                         ...layeredContext.imageUrls,
-                    ])).slice(0, 5);
+                    ], INBOUND_IMAGE_LIMIT);
+                    const inboundResolvedMedia = await resolveInboundImageRefs(inboundImageRefs);
+                    if (inboundResolvedMedia.mediaPaths.length > 0) {
+                        console.log(`[QQ] Passing ${inboundResolvedMedia.mediaPaths.length} image(s) via MediaPaths: ${inboundResolvedMedia.mediaPaths.join(", ")}`);
+                    }
 
                     const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                         Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
+                        BodyForAgent: bodyForAgent, CommandBody: commandBody,
                         SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
-                        OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
-                        ...(inboundMediaUrls.length > 0 && { MediaUrls: inboundMediaUrls }),
+                        OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized, WasMentioned: mentionedByAt || mentionedByReply,
+                        ...(inboundResolvedMedia.mediaPaths.length > 0 && { MediaPaths: inboundResolvedMedia.mediaPaths }),
+                        ...(inboundResolvedMedia.mediaUrls.length > 0 && { MediaUrls: inboundResolvedMedia.mediaUrls }),
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
                     });
 
