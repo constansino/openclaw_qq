@@ -43,6 +43,7 @@ interface SessionQueue {
 }
 
 const sessionQueues = new Map<string, SessionQueue>();
+const recentQQSessionRepairAt = new Map<string, number>();
 
 function normalizeOneBotHttpToken(raw: string | undefined | null): string {
     const value = String(raw || "").trim();
@@ -957,17 +958,191 @@ function splitTmpSuffix(raw: string): { base: string; tmpSuffix: string } {
     };
 }
 
-function normalizeLegacyQQPeerId(raw: string): string {
-    const { base, tmpSuffix } = splitTmpSuffix(raw);
-    const trimmed = base.trim();
-    if (!trimmed) return trimmed;
-    const withoutProvider = trimmed.replace(/^qq:/i, "");
-    const peerMatch = withoutProvider.match(/^(?:user|group):(\d{5,12})$/i);
-    if (peerMatch) return `${peerMatch[1]}${tmpSuffix}`;
-    return `${trimmed}${tmpSuffix}`;
+function stripQQProviderPrefixes(raw: string): string {
+    let value = String(raw || "").trim();
+    for (let i = 0; i < 8; i += 1) {
+        const next = value.replace(/^qq:/i, "").trim();
+        if (next === value) break;
+        value = next;
+    }
+    return value;
 }
 
-function normalizeQQSessionStoreKey(raw: string): string {
+function parseQQPeerReference(raw: string): { kind: "direct" | "group" | "channel" | null; id: string | null; normalizedBase: string } {
+    let value = stripQQProviderPrefixes(raw);
+    let inferredKind: "direct" | "group" | "channel" | null = null;
+
+    for (let i = 0; i < 8; i += 1) {
+        value = stripQQProviderPrefixes(value);
+        if (/^guild:[^:]+:[^:]+$/i.test(value)) {
+            return { kind: "channel", id: value, normalizedBase: value };
+        }
+        const match = value.match(/^(user|u|dm|direct|group|g|channel):(.*)$/i);
+        if (!match) break;
+        const prefix = match[1].toLowerCase();
+        value = match[2].trim();
+        if (["user", "u", "dm", "direct"].includes(prefix)) {
+            inferredKind = "direct";
+            continue;
+        }
+        if (prefix === "channel") {
+            inferredKind = "channel";
+            continue;
+        }
+        if (prefix === "group" || prefix === "g") {
+            if (inferredKind !== "direct") inferredKind = "group";
+            continue;
+        }
+    }
+
+    value = stripQQProviderPrefixes(value);
+    if (/^guild:[^:]+:[^:]+$/i.test(value)) {
+        return { kind: "channel", id: value, normalizedBase: value };
+    }
+    if (/^\d{5,12}$/.test(value)) {
+        return { kind: inferredKind, id: value, normalizedBase: value };
+    }
+    return { kind: inferredKind, id: null, normalizedBase: value };
+}
+
+function inferQQSessionPeerKindFromEntry(sessionKey: string, entry: any): "direct" | "group" | "channel" | null {
+    const keyKind = inferQQSessionPeerKind(sessionKey);
+    const deliveryTo = typeof entry?.deliveryContext?.to === "string"
+        ? normalizeQQDeliveryTarget(entry.deliveryContext.to)
+        : typeof entry?.lastTo === "string"
+            ? normalizeQQDeliveryTarget(entry.lastTo)
+            : "";
+    const { base } = splitTmpSuffix(deliveryTo);
+    if (/^user:/i.test(base)) return "direct";
+    if (/^group:/i.test(base)) return "group";
+    if (/^guild:/i.test(base)) return "channel";
+    const chatType = typeof entry?.chatType === "string" ? entry.chatType.trim().toLowerCase() : "";
+    if (chatType === "direct" || chatType === "group" || chatType === "channel") {
+        return chatType as "direct" | "group" | "channel";
+    }
+    return keyKind;
+}
+
+async function pathExists(filePath: string | null | undefined): Promise<boolean> {
+    if (!filePath) return false;
+    try {
+        await fs.access(filePath, fsConstants.F_OK);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function resolveQQTranscriptFile(storePath: string, entry: any): string | null {
+    const sessionId = typeof entry?.sessionId === "string" ? entry.sessionId.trim() : "";
+    if (!sessionId) return null;
+    const sessionsDir = path.dirname(path.resolve(storePath));
+    const sessionFile = typeof entry?.sessionFile === "string" ? entry.sessionFile.trim() : "";
+    if (sessionFile) {
+        return path.isAbsolute(sessionFile) ? sessionFile : path.resolve(sessionsDir, sessionFile);
+    }
+    return path.resolve(sessionsDir, `${sessionId}.jsonl`);
+}
+
+async function readQQTranscriptPayloadLines(filePath: string): Promise<string[]> {
+    const raw = await fs.readFile(filePath, "utf-8");
+    const out: string[] = [];
+    for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (parsed?.message || parsed?.type === "compaction") out.push(trimmed);
+        } catch { }
+    }
+    return out;
+}
+
+async function mergeQQSessionTranscriptFiles(storePath: string, targetEntry: any, sourceEntry: any): Promise<void> {
+    const targetFile = resolveQQTranscriptFile(storePath, targetEntry);
+    const sourceFile = resolveQQTranscriptFile(storePath, sourceEntry);
+    if (!targetFile || !sourceFile || targetFile === sourceFile) return;
+    if (!(await pathExists(targetFile)) || !(await pathExists(sourceFile))) return;
+
+    const [targetLines, sourceLines] = await Promise.all([
+        readQQTranscriptPayloadLines(targetFile),
+        readQQTranscriptPayloadLines(sourceFile),
+    ]);
+    if (sourceLines.length === 0) return;
+
+    const seen = new Set(targetLines);
+    const appendLines = sourceLines.filter((line) => !seen.has(line));
+    if (appendLines.length > 0) {
+        const payload = `${appendLines.join("\n")}\n`;
+        await fs.appendFile(targetFile, payload, "utf-8");
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    try {
+        await fs.rename(sourceFile, `${sourceFile}.bak.qq-route-merge.${stamp}`);
+    } catch { }
+}
+
+async function mergeQQSessionEntries(params: {
+    storePath: string;
+    normalizedKey: string;
+    current: any;
+    currentSourceKey: string;
+    incoming: any;
+    incomingSourceKey: string;
+}): Promise<any> {
+    const { storePath, normalizedKey, current, currentSourceKey, incoming, incomingSourceKey } = params;
+    if (!current) return incoming;
+    if (!incoming) return current;
+
+    const currentUpdatedAt = Number(current?.updatedAt ?? 0);
+    const incomingUpdatedAt = Number(incoming?.updatedAt ?? 0);
+    const currentCanonical = currentSourceKey === normalizedKey;
+    const incomingCanonical = incomingSourceKey === normalizedKey;
+
+    let primary = current;
+    let secondary = incoming;
+    if (incomingCanonical && !currentCanonical) {
+        primary = incoming;
+        secondary = current;
+    } else if (!incomingCanonical && currentCanonical) {
+        primary = current;
+        secondary = incoming;
+    } else if (incomingUpdatedAt > currentUpdatedAt) {
+        primary = incoming;
+        secondary = current;
+    }
+
+    const primaryFile = resolveQQTranscriptFile(storePath, primary);
+    const secondaryFile = resolveQQTranscriptFile(storePath, secondary);
+    const primaryFileExists = await pathExists(primaryFile);
+    const secondaryFileExists = await pathExists(secondaryFile);
+    let sessionIdentity = primary;
+
+    if (!primaryFileExists && secondaryFileExists) {
+        sessionIdentity = secondary;
+    } else if (primaryFileExists && secondaryFileExists) {
+        await mergeQQSessionTranscriptFiles(storePath, primary, secondary);
+    }
+
+    const merged = incomingUpdatedAt >= currentUpdatedAt ? { ...current, ...incoming } : { ...incoming, ...current };
+    if (typeof sessionIdentity?.sessionId === "string" && sessionIdentity.sessionId.trim()) {
+        merged.sessionId = sessionIdentity.sessionId;
+    }
+    if (typeof sessionIdentity?.sessionFile === "string" && sessionIdentity.sessionFile.trim()) {
+        merged.sessionFile = sessionIdentity.sessionFile;
+    }
+    return merged;
+}
+
+function normalizeLegacyQQPeerId(raw: string): string {
+    const { base, tmpSuffix } = splitTmpSuffix(raw);
+    const parsed = parseQQPeerReference(base);
+    if (parsed.id && /^\d{5,12}$/.test(parsed.id)) return `${parsed.id}${tmpSuffix}`;
+    return `${parsed.normalizedBase}${tmpSuffix}`;
+}
+
+function normalizeQQSessionStoreKey(raw: string, entry?: any): string {
     const trimmed = String(raw || "").trim();
     if (!trimmed.toLowerCase().startsWith("agent:")) return trimmed;
     const { base, tmpSuffix } = splitTmpSuffix(trimmed);
@@ -978,8 +1153,17 @@ function normalizeQQSessionStoreKey(raw: string): string {
     const kindIndex = parts.findIndex((part, idx) => idx >= 3 && /^(direct|group|channel)$/i.test(part));
     if (kindIndex < 0 || kindIndex >= parts.length - 1) return trimmed;
 
-    const normalizedPeer = normalizeLegacyQQPeerId(parts.slice(kindIndex + 1).join(":"));
-    const next = [...parts.slice(0, kindIndex + 1), normalizedPeer].join(":");
+    const peerRaw = parts.slice(kindIndex + 1).join(":");
+    const parsedPeer = parseQQPeerReference(peerRaw);
+    const normalizedPeer = normalizeLegacyQQPeerId(peerRaw);
+    const entryKind = inferQQSessionPeerKindFromEntry(trimmed, entry);
+    let normalizedKind = parts[kindIndex]!.toLowerCase();
+
+    if (parsedPeer.kind === "direct" || entryKind === "direct") normalizedKind = "direct";
+    else if (parsedPeer.kind === "group" || entryKind === "group") normalizedKind = "group";
+    else if (parsedPeer.kind === "channel" || entryKind === "channel") normalizedKind = "channel";
+
+    const next = [...parts.slice(0, kindIndex), normalizedKind, normalizedPeer].join(":");
     return `${next}${tmpSuffix}`;
 }
 
@@ -987,12 +1171,13 @@ function normalizeQQDeliveryTarget(raw: string): string {
     const trimmed = String(raw || "").trim();
     if (!trimmed) return trimmed;
     const { base, tmpSuffix } = splitTmpSuffix(trimmed);
-    const withoutProvider = base.replace(/^qq:/i, "");
-    const directMatch = withoutProvider.match(/^user:(\d{5,12})$/i);
-    if (directMatch) return `user:${directMatch[1]}${tmpSuffix}`;
-    const groupMatch = withoutProvider.match(/^group:(\d{5,12})$/i);
-    if (groupMatch) return `group:${groupMatch[1]}${tmpSuffix}`;
-    return `${withoutProvider}${tmpSuffix}`;
+    const parsed = parseQQPeerReference(base);
+    if (parsed.kind === "channel" && /^guild:/i.test(parsed.normalizedBase)) return `${parsed.normalizedBase}${tmpSuffix}`;
+    if (parsed.id && /^\d{5,12}$/.test(parsed.id)) {
+        if (parsed.kind === "group") return `group:${parsed.id}${tmpSuffix}`;
+        return `user:${parsed.id}${tmpSuffix}`;
+    }
+    return `${parsed.normalizedBase}${tmpSuffix}`;
 }
 
 function inferQQSessionPeerKind(sessionKey: string): "direct" | "group" | "channel" | null {
@@ -1036,6 +1221,10 @@ function normalizeQQSessionStoreEntry(entry: any, sessionKey: string): any {
             next.deliveryContext.to = normalizeQQDeliveryTargetForSession(next.deliveryContext.to, sessionKey);
         }
     }
+    const sessionKind = inferQQSessionPeerKind(sessionKey);
+    if (sessionKind === "direct" || sessionKind === "group" || sessionKind === "channel") {
+        next.chatType = sessionKind;
+    }
     return next;
 }
 
@@ -1047,12 +1236,28 @@ async function migrateLegacyQQSessionStore(storePath: string): Promise<number> {
 
         let changed = 0;
         const nextStore: Record<string, any> = {};
+        const nextStoreSources = new Map<string, string>();
         for (const [key, value] of Object.entries(parsed)) {
-            const normalizedKey = normalizeQQSessionStoreKey(key);
+            const normalizedKey = normalizeQQSessionStoreKey(key, value);
             const normalizedEntry = normalizeQQSessionStoreEntry(value, normalizedKey);
             if (normalizedKey !== key) changed += 1;
             if (JSON.stringify(normalizedEntry) !== JSON.stringify(value)) changed += 1;
-            nextStore[normalizedKey] = pickPreferredSessionEntry(nextStore[normalizedKey], normalizedEntry);
+            const existing = nextStore[normalizedKey];
+            if (!existing) {
+                nextStore[normalizedKey] = normalizedEntry;
+                nextStoreSources.set(normalizedKey, key);
+                continue;
+            }
+
+            nextStore[normalizedKey] = await mergeQQSessionEntries({
+                storePath,
+                normalizedKey,
+                current: existing,
+                currentSourceKey: nextStoreSources.get(normalizedKey) || normalizedKey,
+                incoming: normalizedEntry,
+                incomingSourceKey: key,
+            });
+            changed += 1;
         }
 
         if (changed <= 0) return 0;
@@ -1065,6 +1270,15 @@ async function migrateLegacyQQSessionStore(storePath: string): Promise<number> {
         console.warn(`[QQ] Failed to migrate legacy session store ${storePath}: ${String(err)}`);
         return 0;
     }
+}
+
+async function maybeRepairQQSessionStore(storePath: string, scopeKey: string): Promise<void> {
+    const cacheKey = `${storePath}:${scopeKey}`;
+    const now = Date.now();
+    const last = recentQQSessionRepairAt.get(cacheKey) ?? 0;
+    if (now - last < 15000) return;
+    recentQQSessionRepairAt.set(cacheKey, now);
+    await migrateLegacyQQSessionStore(storePath);
 }
 
 let legacyQQSessionMigrationPromise: Promise<void> | null = null;
@@ -3047,8 +3261,13 @@ ${current}
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
                     });
 
+                    const sessionStorePath = runtime.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
+                    if (!isGroup && !isGuild) {
+                        await maybeRepairQQSessionStore(sessionStorePath, `${route.agentId}:direct:${userId}`);
+                    }
+
                     await runtime.channel.session.recordInboundSession({
-                        storePath: runtime.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId }),
+                        storePath: sessionStorePath,
                         sessionKey: ctxPayload.SessionKey!, ctx: ctxPayload,
                         updateLastRoute: undefined,
                         onRecordError: (err) => console.error("QQ Session Error:", err)
@@ -3491,15 +3710,18 @@ ${current}
         normalizeTarget,
         targetResolver: {
             looksLikeId: (raw, normalized) => {
-                const value = String(normalized || raw || "").trim();
-                return /^user:\d{5,12}$/i.test(value) || /^group:\d{5,12}$/i.test(value) || /^guild:/i.test(value);
+                const rawValue = String(raw || "").trim();
+                if (!rawValue) return false;
+                return /^user:\d{5,12}$/i.test(rawValue)
+                    || /^group:\d{5,12}$/i.test(rawValue)
+                    || /^guild:[^:]+:[^:]+$/i.test(rawValue);
             },
-            hint: "私聊用 user:QQ号，群聊用 group:群号，频道用 guild:id:channel（不要只写纯数字）",
+            hint: "Use official QQ target prefixes only: user:<qq>, group:<group>, guild:<guildId>:<channelId>. Do not use bare numbers, qq:user:, dm:, or direct:.",
         }
     },
     agentPrompt: {
         messageToolHints: () => [
-            "QQ 发送目标必须带类型前缀：私聊 `user:<QQ号>`，群聊 `group:<群号>`，频道 `guild:<guildId>:<channelId>`；不要只写纯数字。",
+            "QQ targets must use official forms: `user:<qq>` for direct chats, `group:<group>` for groups, and `guild:<guildId>:<channelId>` for guild channels. Avoid bare numbers, `qq:user:`, `dm:`, or `direct:`.",
         ],
     }
 };
