@@ -280,6 +280,22 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_list", {});
   }
 
+  async getGroupInfo(groupId: number, noCache: boolean = true): Promise<any> {
+    const tries = [
+      { action: "get_group_info", params: { group_id: groupId, no_cache: noCache } },
+      { action: "get_group_detail_info", params: { group_id: groupId } },
+    ];
+    let lastErr: unknown;
+    for (const attempt of tries) {
+      try {
+        return await this.sendWithResponse(attempt.action, attempt.params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr ?? new Error("get_group_info failed");
+  }
+
   // --- Guild (Channel) Extension APIs ---
   sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
     this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
