@@ -3003,6 +3003,7 @@ ${current}
                         SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
+                        ...(event.message_id !== undefined && { MessageSid: String(event.message_id) }),
                         OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
                         ...(inboundMediaUrls.length > 0 && { MediaUrls: inboundMediaUrls }),
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
