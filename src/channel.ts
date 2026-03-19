@@ -1931,10 +1931,20 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 } catch (e) { }
                             } else if (seg.type === "file") {
-                                if (!seg.data?.url && isGroup) {
+                                if (!seg.data?.url && seg.data?.file_id) {
                                     try {
-                                        const info = await (client as any).sendWithResponse("get_group_file_url", { group_id: groupId, file_id: seg.data?.file_id, busid: seg.data?.busid });
-                                        if (info?.url) seg.data.url = info.url;
+                                        if (isGroup) {
+                                            const info = await (client as any).sendWithResponse("get_group_file_url", { group_id: groupId, file_id: seg.data.file_id, busid: seg.data?.busid });
+                                            if (info?.url) seg.data.url = info.url;
+                                        } else {
+                                            const info = await (client as any).sendWithResponse("get_file", { file_id: seg.data.file_id });
+                                            if (info?.url) seg.data.url = info.url;
+                                            else if (typeof info?.file === "string") {
+                                                seg.data.url = info.file.startsWith("/") || info.file.match(/^[a-zA-Z]:\\/) 
+                                                    ? `file://${info.file}` 
+                                                    : info.file;
+                                            }
+                                        }
                                     } catch (e) { }
                                 }
                                 const fileName = seg.data?.name || seg.data?.file || "未命名";
@@ -2272,14 +2282,24 @@ ${current}
                             const replySegments = Array.isArray(repliedMsg.message) ? repliedMsg.message : [];
                             for (const seg of replySegments) {
                                 if (seg?.type !== "file") continue;
-                                if (!seg.data?.url && isGroup && seg.data?.file_id) {
+                                if (!seg.data?.url && seg.data?.file_id) {
                                     try {
-                                        const info = await (client as any).sendWithResponse("get_group_file_url", {
-                                            group_id: groupId,
-                                            file_id: seg.data.file_id,
-                                            busid: seg.data.busid,
-                                        });
-                                        if (info?.url) seg.data.url = info.url;
+                                        if (isGroup) {
+                                            const info = await (client as any).sendWithResponse("get_group_file_url", {
+                                                group_id: groupId,
+                                                file_id: seg.data.file_id,
+                                                busid: seg.data.busid,
+                                            });
+                                            if (info?.url) seg.data.url = info.url;
+                                        } else {
+                                            const info = await (client as any).sendWithResponse("get_file", { file_id: seg.data.file_id });
+                                            if (info?.url) seg.data.url = info.url;
+                                            else if (typeof info?.file === "string") {
+                                                seg.data.url = info.file.startsWith("/") || info.file.match(/^[a-zA-Z]:\\/) 
+                                                    ? `file://${info.file}` 
+                                                    : info.file;
+                                            }
+                                        }
                                     } catch { }
                                 }
                                 const fileName = seg.data?.name || seg.data?.file || "未命名";
