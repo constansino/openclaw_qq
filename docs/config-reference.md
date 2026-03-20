@@ -11,6 +11,8 @@
 
 - `requireMention`：群聊触发门槛（@ / 回复 / 关键词）。
 - `keywordOnlyTrigger`：群聊是否只接受关键词触发（忽略 @ / 回复）。
+- `keywordTriggers`：群聊唤醒词列表。
+- `allowBareGroupCommands`：是否允许群聊裸 `/model` 这类 slash 指令直接触发（默认关闭）。
 - `admins`：管理员 QQ 列表。
 - `adminOnlyChat`：仅管理员可触发聊天。
 - `allowedGroups`：群白名单。
@@ -47,6 +49,7 @@
 - `showReplySessionSource`：给回复附加来源会话标记（临时会话场景很有用）。
 - `forwardLongReplyThreshold`：最终长回复自动合并转发阈值（默认 `300`，仅对 `final_answer` 生效）。
 - `forwardNodeCharLimit`：合并转发时单节点字符上限（默认 `0`，表示不按长度拆节点）。
+- `enableDynamicModelCatalog`：本地 `/model` 是否主动探测 provider `/models` 全量目录（默认关闭）。
 
 ## G. 多媒体与频道
 
@@ -63,6 +66,7 @@
       "wsUrl": "ws://127.0.0.1:3001",
       "accessToken": "your_token",
       "requireMention": true,
+      "keywordTriggers": "椰子",
       "admins": "10000001",
       "adminOnlyChat": true,
       "allowedGroups": "20000001",
@@ -73,10 +77,12 @@
       "queueDebounceMs": 0,
       "injectGatewayMeta": false,
       "interruptOnNewMessage": false,
+      "allowBareGroupCommands": false,
       "blockStreaming": true,
       "blockStreamingBreak": "message_end",
       "forwardLongReplyThreshold": 300,
-      "forwardNodeCharLimit": 0
+      "forwardNodeCharLimit": 0,
+      "enableDynamicModelCatalog": false
     }
   }
 }
@@ -88,6 +94,8 @@
 - `final_answer` 超过 `300` 字时，默认自动改用 QQ 合并转发。
 - 默认不会把同一轮长回复继续按节点长度拆开；`forwardNodeCharLimit=0` 就是“不拆节点”。
 - 默认不因同会话新消息而打断当前任务；只有把 `interruptOnNewMessage` 显式设为 `true` 才会启用。
+- 默认不允许群聊裸 slash 指令直接触发；请用 `椰子 /model` 这类“唤醒词 + 指令”形式。
+- 本地 `/model` 默认不主动探测 provider `/models` 全量目录；只在你显式开启 `enableDynamicModelCatalog=true` 时才做动态聚合。
 
 ## 恢复旧体验示例
 
@@ -98,6 +106,8 @@
   "channels": {
     "qq": {
       "interruptOnNewMessage": true,
+      "allowBareGroupCommands": true,
+      "enableDynamicModelCatalog": true,
       "blockStreamingBreak": "text_end",
       "forwardLongReplyThreshold": 800,
       "forwardNodeCharLimit": 1000

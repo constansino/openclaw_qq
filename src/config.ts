@@ -99,6 +99,8 @@ export const QQConfigSchema = z.object({
   historyLimit: NumberInputSchema(0).describe("群历史注入条数。默认0（推荐，依赖会话系统）；需强保留原文时可设 3~5。"),
   keywordOnlyTrigger: BooleanInputSchema(false).describe("群聊仅关键词触发开关。开启后，@机器人/回复机器人消息不再触发；建议配合 keywordTriggers 一起使用。适合与其他机器人共用同一 QQ 账号时避免双重回复。"),
   keywordTriggers: KeywordTriggersSchema.describe("关键词触发（字符串）。Web表单填：小助手, 帮我；Raw JSON 填：\"小助手, 帮我\"。当 requireMention=true 时，命中关键词可不@直接触发；当 requireMention=false 时，关键词不是必需条件；当 keywordOnlyTrigger=true 时，群聊里只有命中这些关键词才会触发。"),
+  allowBareGroupCommands: BooleanInputSchema(false).describe("群聊里是否允许只发 /model 这类裸 slash 指令就直接触发。默认关闭；关闭后需配合关键词触发，例如“椰子 /model”。"),
+  enableDynamicModelCatalog: BooleanInputSchema(false).describe("是否让本地 /model 列表主动探测各 provider 的 /models 并展示全量模型。默认关闭，保持更接近原版 OpenClaw 的 /model；如需动态聚合模型目录再手动开启。"),
   enableTTS: BooleanInputSchema(false).describe("是否启用语音回复（依赖 OneBot 服务端支持）。"),
   sharedMediaHostDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("可选：宿主机共享媒体目录（供 NapCat 容器访问）。示例：/Users/xxx/openclaw_qq/deploy/napcat/shared_media。"),
   sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),

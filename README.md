@@ -28,6 +28,8 @@
 - 默认启用 `blockStreaming=true` + `blockStreamingBreak=message_end`，让 commentary / final 按完整 assistant message 落地，减少 QQ 侧碎片化输出。
 - 默认 `forwardLongReplyThreshold=300`，长 `final_answer` 超过阈值时自动改用 QQ 合并转发；commentary 仍按普通消息发送。
 - 默认 `forwardNodeCharLimit=0`，转发时不按长度拆节点，尽量把同一轮长回复合并成一个转发。
+- 默认 `allowBareGroupCommands=false`，群聊里裸 `/model` 不再直接触发；推荐使用 `椰子 /model` 这类“唤醒词 + 指令”形式。
+- 默认 `enableDynamicModelCatalog=false`，本地 `/model` 不主动探测 provider `/models` 全量目录，保持更保守的默认行为。
 - reply / forward 上下文解析已补强，QQ 引用消息与合并转发中的文本线索可继续注入给模型。
 - 仓库文档现统一维护中文版本，仓库内英文 Markdown 已清理。
 - 新增 OneBot HTTP 模式文档，支持通过 HTTP API + webhook 接入，说明见 `docs/http-transport.md`。

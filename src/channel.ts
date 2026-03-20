@@ -463,7 +463,7 @@ async function fetchProviderModelIdsDynamic(baseUrl: string, apiKey?: string): P
     return null;
 }
 
-async function buildModelCatalogText(): Promise<string> {
+async function buildModelCatalogText(enableDynamicLookup: boolean): Promise<string> {
     const home = process.env.HOME || process.env.USERPROFILE || "";
     const candidates = [
         process.env.OPENCLAW_CONFIG,
@@ -504,7 +504,7 @@ async function buildModelCatalogText(): Promise<string> {
             .filter((id: string) => Boolean(id));
         const baseUrl = typeof (providerValue as any)?.baseUrl === "string" ? (providerValue as any).baseUrl.trim() : "";
         const apiKey = typeof (providerValue as any)?.apiKey === "string" ? (providerValue as any).apiKey : "";
-        const dynamic = baseUrl ? await fetchProviderModelIdsDynamic(baseUrl, apiKey) : null;
+        const dynamic = enableDynamicLookup && baseUrl ? await fetchProviderModelIdsDynamic(baseUrl, apiKey) : null;
         const modelIds = dynamic?.ids ?? cfgModelIds;
         const source = dynamic ? `dynamic: ${dynamic.source}` : "config";
         lines.push(`- ${providerName} (${modelIds.length}) [${source}]`);
@@ -986,6 +986,41 @@ function markAndCheckRecentCommandDuplicate(key: string, ttlMs = 2500): boolean 
 function normalizeSlashVariants(input: string): string {
     if (!input) return "";
     return input.replace(/[／⁄∕]/g, "/");
+}
+
+function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractLeadingInlineCommand(input: string, keywordTriggers: string[]): {
+    command: string;
+    keywordPrefixed: boolean;
+    bareCommand: boolean;
+} {
+    const normalized = normalizeSlashVariants(input).trim();
+    if (!normalized) {
+        return { command: "", keywordPrefixed: false, bareCommand: false };
+    }
+    if (normalized.startsWith("/")) {
+        return { command: normalized, keywordPrefixed: false, bareCommand: true };
+    }
+
+    const sortedKeywords = [...keywordTriggers]
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length);
+    for (const keyword of sortedKeywords) {
+        const escapedKeyword = escapeRegExp(keyword);
+        const match = normalized.match(new RegExp(`^${escapedKeyword}(?:[\\s,，:：]+)?(\\/.*)$`));
+        if (!match) continue;
+        return {
+            command: match[1].trim(),
+            keywordPrefixed: true,
+            bareCommand: false,
+        };
+    }
+
+    return { command: "", keywordPrefixed: false, bareCommand: false };
 }
 
 function buildTempThreadKey(accountId: string, isGroup: boolean, isGuild: boolean, groupId?: number, guildId?: string, channelId?: string, userId?: number): string {
@@ -1697,33 +1732,57 @@ async function sendLongTextAsForwardMessage(params: {
     nodeUin: string;
     nodeCharLimit: number;
 }): Promise<boolean> {
-    const nodeLimitRaw = Number(params.nodeCharLimit);
-    const shouldSplitNodes = Number.isFinite(nodeLimitRaw) && nodeLimitRaw > 0;
-    const safeNodeLimit = shouldSplitNodes ? Math.max(200, Math.floor(nodeLimitRaw)) : 0;
     const rawTexts = (Array.isArray(params.texts) ? params.texts : [params.text ?? ""])
         .filter((text): text is string => typeof text === "string" && text.trim().length > 0);
-    const chunks = shouldSplitNodes
-        ? rawTexts.flatMap((text) => splitMessage(text, safeNodeLimit))
-        : (rawTexts.length > 0 ? [rawTexts.join("")] : []);
-    if (chunks.length === 0) return false;
-    const messages = chunks.map((chunk) => ({
-        type: "node",
-        data: {
-            name: params.nodeName,
-            uin: params.nodeUin,
-            content: chunk,
-        },
-    }));
-    const tries: Array<{ action: string; params: Record<string, unknown> }> = [
-        { action: "send_group_forward_msg", params: { group_id: params.groupId, messages } },
-        { action: "send_forward_msg", params: { group_id: params.groupId, messages } },
-    ];
-    for (const attempt of tries) {
-        try {
-            await (params.client as any).sendWithResponse(attempt.action, attempt.params, 15000);
+    if (rawTexts.length === 0) return false;
+
+    const buildForwardMessages = (nodeCharLimit: number) => {
+        const shouldSplitNodes = Number.isFinite(nodeCharLimit) && nodeCharLimit > 0;
+        const safeNodeLimit = shouldSplitNodes ? Math.max(200, Math.floor(nodeCharLimit)) : 0;
+        const chunks = shouldSplitNodes
+            ? rawTexts.flatMap((text) => splitMessage(text, safeNodeLimit))
+            : [rawTexts.join("")];
+        return chunks
+            .filter((chunk) => typeof chunk === "string" && chunk.trim().length > 0)
+            .map((chunk) => ({
+                type: "node",
+                data: {
+                    name: params.nodeName,
+                    uin: params.nodeUin,
+                    content: chunk,
+                },
+            }));
+    };
+
+    const attemptForwardSend = async (messages: Array<Record<string, unknown>>, label: string): Promise<boolean> => {
+        const tries: Array<{ action: string; params: Record<string, unknown> }> = [
+            { action: "send_group_forward_msg", params: { group_id: params.groupId, messages } },
+            { action: "send_forward_msg", params: { group_id: params.groupId, messages } },
+        ];
+        for (const attempt of tries) {
+            try {
+                await (params.client as any).sendWithResponse(attempt.action, attempt.params, 15000);
+                console.log(`[QQ] forward-send success mode=${label} nodes=${messages.length} group=${params.groupId} action=${attempt.action}`);
+                return true;
+            } catch (err) {
+                console.warn(`[QQ] forward-send failed mode=${label} nodes=${messages.length} group=${params.groupId} action=${attempt.action} err=${String(err)}`);
+            }
+        }
+        return false;
+    };
+
+    const preferredNodeLimitRaw = Number(params.nodeCharLimit);
+    const preferredNodeLimit = Number.isFinite(preferredNodeLimitRaw) ? preferredNodeLimitRaw : 0;
+    const preferredMessages = buildForwardMessages(preferredNodeLimit);
+    if (preferredMessages.length > 0 && await attemptForwardSend(preferredMessages, preferredNodeLimit > 0 ? `split_${Math.floor(preferredNodeLimit)}` : "single_node")) {
+        return true;
+    }
+
+    if (preferredNodeLimit <= 0) {
+        const fallbackNodeLimit = 2400;
+        const fallbackMessages = buildForwardMessages(fallbackNodeLimit);
+        if (fallbackMessages.length > 1 && await attemptForwardSend(fallbackMessages, `fallback_split_${fallbackNodeLimit}`)) {
             return true;
-        } catch (err) {
-            // Try next action name for different OneBot implementations.
         }
     }
     return false;
@@ -1908,6 +1967,10 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 keywordOnlyTrigger: {
                     label: "群聊仅关键词触发",
                     help: "开启后会忽略 @ 和回复触发；群聊里只有命中关键词才会触发。",
+                },
+                allowBareGroupCommands: {
+                    label: "允许群聊裸 slash 指令",
+                    help: "默认关闭。关闭后，/model 这类群聊指令需要配合关键词触发；如果想恢复旧体验再手动开启。",
                 },
             },
         };
@@ -2428,11 +2491,12 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                             .join(" ")
                             .trim()
                         : "";
+                    const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
                     // Some OneBot variants may not emit text segments for plain messages.
                     // Fall back to already-normalized text to avoid losing slash commands.
                     const commandTextCandidate = normalizeSlashVariants(extractedTextFromSegments || text.trim());
-                    const inlineCommandMatch = commandTextCandidate.match(/(?:^|\s)(\/[\s\S]*)$/);
-                    const inlineCommand = inlineCommandMatch ? inlineCommandMatch[1].trim() : "";
+                    const extractedInlineCommand = extractLeadingInlineCommand(commandTextCandidate, keywordTriggers);
+                    const inlineCommand = extractedInlineCommand.command;
                     if (inlineCommand) {
                         const shortInline = inlineCommand.replace(/\s+/g, " ").slice(0, 160);
                         console.log(`[QQCMD] inbound user=${userId} group=${groupId ?? "-"} admin=${isAdmin} cmd="${shortInline}"`);
@@ -2440,24 +2504,32 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     const normalizedCommandKey = inlineCommand
                         ? `${account.accountId}:${event.message_type ?? ""}:${String(groupId ?? "")}:${String(guildId ?? "")}:${String(channelId ?? "")}:${String(userId ?? "")}:${inlineCommand.replace(/\s+/g, " ").toLowerCase()}`
                         : "";
+                    const hasKeywordTriggerInCommandText = extractedInlineCommand.keywordPrefixed;
+                    const allowBareGroupCommands = config.allowBareGroupCommands === true;
+                    const allowGroupInlineCommand = !isGroup || allowBareGroupCommands || hasKeywordTriggerInCommandText;
+                    const bareInlineCommandOnly = Boolean(inlineCommand) && extractedInlineCommand.bareCommand;
                     if (normalizedCommandKey && markAndCheckRecentCommandDuplicate(normalizedCommandKey)) {
                         console.log(`[QQ] dropped duplicate command key=${normalizedCommandKey}`);
                         return;
                     }
+                    if (isGroup && inlineCommand && !allowGroupInlineCommand && bareInlineCommandOnly) {
+                        const shortInline = inlineCommand.replace(/\s+/g, " ").slice(0, 160);
+                        console.log(`[QQCMD] ignored bare group command without keyword user=${userId} group=${groupId ?? "-"} cmd="${shortInline}"`);
+                        return;
+                    }
 
                     let forceTriggered = false;
+                    if (inlineCommand && (!isGroup || allowGroupInlineCommand)) {
+                        text = inlineCommand;
+                        forceTriggered = true;
+                    }
                     if (isGroup && /^\/models\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
-                        text = inlineCommand;
-                        forceTriggered = true;
                     } else if (isGroup && /^\/model\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
-                        text = inlineCommand;
-                        forceTriggered = true;
                     } else if (isGroup && /^\/newsession\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
                         text = "/newsession";
-                        forceTriggered = true;
                     }
                     else if (isGroup && /^\/(临时|tmp|退出临时|exittemp|临时状态|tmpstatus|临时列表|tmplist|临时结束|tmpend|临时重命名|tmprename)\b/i.test(inlineCommand)) {
                         if (!isAdmin) {
@@ -2468,21 +2540,20 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                             return;
                         }
                         text = inlineCommand;
-                        forceTriggered = true;
                         console.log(`[QQCMD] temp command accepted user=${userId} group=${groupId ?? "-"}`);
                     }
                     else if (isGroup && /^\/grok_draw\b/i.test(inlineCommand)) {
+                        if (!isAdmin) return;
                         text = inlineCommand;
-                        forceTriggered = true;
                     }
                     else if (isGroup && /^\/modelsync\b/i.test(inlineCommand)) {
                         if (!isAdmin) return;
                         text = "/modelsync";
-                        forceTriggered = true;
                     }
 
                     const normalizedTextForCommand = normalizeSlashVariants(text).trim();
-                    if (!isGuild && isAdmin && normalizedTextForCommand.startsWith('/')) {
+                    const allowLocalSlashCommandExecution = !isGroup || forceTriggered || allowBareGroupCommands;
+                    if (!isGuild && isAdmin && normalizedTextForCommand.startsWith('/') && allowLocalSlashCommandExecution) {
                         const parts = normalizedTextForCommand.split(/\s+/);
                         const cmd = parts[0];
                         const baseFromIdForCommand = isGroup
@@ -2615,7 +2686,20 @@ ${current}
                             return;
                         }
                         if (cmd === '/models' || (cmd === '/model' && (!parts[1] || /^list$/i.test(parts[1])))) {
-                            const catalog = await buildModelCatalogText();
+                            const dynamicModelCatalogEnabled = config.enableDynamicModelCatalog === true;
+                            console.log(`[QQCMD] local model catalog user=${userId} group=${groupId ?? "-"} dynamic=${String(dynamicModelCatalogEnabled)}`);
+                            const catalog = await buildModelCatalogText(dynamicModelCatalogEnabled);
+                            if (isGroup) {
+                                const sentAsForward = await sendLongTextAsForwardMessage({
+                                    client,
+                                    groupId,
+                                    text: catalog,
+                                    nodeName: (config.forwardNodeName || "OpenClaw").trim() || "OpenClaw",
+                                    nodeUin: String(client.getSelfId() || userId),
+                                    nodeCharLimit: 0,
+                                });
+                                if (sentAsForward) return;
+                            }
                             const chunks = splitLongText(catalog, 2800);
                             for (const chunk of chunks) {
                                 if (isGroup) client.sendGroupMsg(groupId, chunk);
@@ -2817,7 +2901,6 @@ ${current}
                     const keywordOnlyTrigger = Boolean(config.keywordOnlyTrigger) && isGroup;
                     let isTriggered = forceTriggered || !isGroup || text.includes("[动作] 用户戳了你一下");
                     let keywordTriggered = false;
-                    const keywordTriggers = parseKeywordTriggersInput(config.keywordTriggers as string | string[] | undefined);
                     if (!isTriggered && keywordTriggers.length > 0) {
                         for (const kw of keywordTriggers) {
                             if (text.includes(kw)) {

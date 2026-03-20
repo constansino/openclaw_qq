@@ -367,9 +367,10 @@ openclaw setup qq
 仅配置在 `admins` 列表中的用户可用：
 
 *   群聊模型命令支持（仅管理员）：
-    *   `@机器人 /models` 可直接触发模型列表（仅管理员）。
-    *   `@机器人 /model`、`@机器人 /model 28` 也仅管理员可触发。
-    *   `@机器人 /newsession` 或 `唤醒词 /newsession` 可重置**当前会话槽**（仅管理员）。
+    *   默认不允许群聊里直接裸发 `/models`、`/model`、`/newsession` 触发。
+    *   推荐用法是 `唤醒词 /models`、`唤醒词 /model`、`唤醒词 /model 28`、`唤醒词 /newsession`。
+    *   例如：`椰子 /model`。
+    *   如果你确实想恢复“群里直接发 `/model` 就执行”的旧体验，可手动把 `allowBareGroupCommands=true`。
 
 *   临时会话槽（同群分话题，类似 tmux，仅管理员）：
     *   `/临时 <名称>` 进入/创建临时会话（示例：`/临时 检查ssh`，会保留完整名称，不再被截成 `ssh`）。

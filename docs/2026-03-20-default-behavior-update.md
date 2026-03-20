@@ -46,7 +46,29 @@
 
 这更符合 QQ 使用场景，因为既然已经转发了，就没必要再人为拆成多个节点。
 
-### 5. reply / forward 上下文读取补强
+### 5. 默认关闭群聊裸 slash 指令
+
+- `allowBareGroupCommands=false`
+
+默认情况下，群聊里单独发送 `/model`、`/models`、`/newsession` 这类 slash 指令不会直接触发。
+
+当前更推荐的默认用法是：
+
+- `椰子 /model`
+- `椰子 /models`
+- `椰子 /newsession`
+
+这样可以避免群里普通讨论里夹带 `/xxx` 时误触发本地命令，也更符合“先唤醒，再执行管理指令”的使用习惯。
+
+### 6. 默认关闭 `/model` 的动态全量模型探测
+
+- `enableDynamicModelCatalog=false`
+
+这项配置关闭时，本地 `/model` 列表不会主动去探测各 provider 的 `/models` 接口拉取全量目录，而是优先按本地配置展示。
+
+这样做的目的是让默认行为更保守，也更接近 OpenClaw 原本“按现有配置/allowlist 工作”的思路；如果你确实需要插件层动态聚合所有模型目录，再手动开启即可。
+
+### 7. reply / forward 上下文读取补强
 
 这轮还补强了 QQ 消息里的上下文解析：
 
@@ -64,6 +86,8 @@
 | `blockStreamingBreak` | `message_end` | 每条 assistant message 完整后再发 |
 | `forwardLongReplyThreshold` | `300` | 长 `final_answer` 超过 300 字自动走合并转发 |
 | `forwardNodeCharLimit` | `0` | 转发时不按长度拆节点，尽量合并成一个转发 |
+| `allowBareGroupCommands` | `false` | 群聊裸 `/model` 默认不触发，需配合唤醒词 |
+| `enableDynamicModelCatalog` | `false` | `/model` 默认不主动探测 provider `/models` 全量目录 |
 
 ## 推荐理解方式
 
@@ -82,6 +106,8 @@
   "channels": {
     "qq": {
       "interruptOnNewMessage": true,
+      "allowBareGroupCommands": true,
+      "enableDynamicModelCatalog": true,
       "blockStreamingBreak": "text_end",
       "forwardLongReplyThreshold": 800,
       "forwardNodeCharLimit": 1000
@@ -93,6 +119,8 @@
 这会更接近旧体验：
 
 - 新消息可以打断旧回复。
+- 群聊里裸 `/model` 这类命令又可以直接触发。
+- `/model` 会重新主动探测 provider `/models` 全量目录。
 - 输出边界更碎。
 - 长文要到更长才转发。
 - 转发节点会继续按长度切分。
