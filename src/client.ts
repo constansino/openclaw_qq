@@ -322,6 +322,29 @@ export class OneBotClient extends EventEmitter {
     this.send("set_group_card", { group_id: groupId, user_id: userId, card });
   }
 
+  async setInputStatus(groupId: number, userId?: number | null): Promise<boolean> {
+    const resolvedUserId = userId ?? this.selfId;
+    if (!resolvedUserId) return false;
+
+    const tries = [
+      { group_id: groupId, user_id: resolvedUserId, event_type: 1 },
+      { user_id: resolvedUserId, event_type: 1 },
+      { group_id: groupId, user_id: resolvedUserId },
+    ];
+
+    let lastErr: unknown;
+    for (const params of tries) {
+      try {
+        await this.sendWithResponse("set_input_status", params, 5000);
+        return true;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw lastErr ?? new Error("set_input_status failed");
+  }
+
   private sendWithResponse(action: string, params: any, timeoutMs: number = 5000): Promise<any> {
     if (this.transportMode === "http") {
       return this.sendHttpRequest(action, params, timeoutMs);
