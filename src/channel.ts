@@ -2,7 +2,7 @@ import { promises as fs, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { homedir } from "node:os";
 import { execFile as execFileCallback } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 declare const process: any;
@@ -230,7 +230,7 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
     if (Array.isArray(message)) {
         for (const segment of message) {
             if (segment.type === "image") {
-                const url = segment.data?.url || (typeof segment.data?.file === 'string' && (segment.data.file.startsWith('http') || segment.data.file.startsWith('base64://')) ? segment.data.file : undefined);
+                const url = segment.data?.url || (typeof segment.data?.file === 'string' && (segment.data.file.startsWith('http') || segment.data.file.startsWith('base64://') || segment.data.file.startsWith('file:')) ? segment.data.file : undefined);
                 if (url) {
                     urls.push(url);
                     if (urls.length >= maxImages) break;
@@ -242,7 +242,7 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
         let match;
         while ((match = imageRegex.exec(message)) !== null) {
             const val = match[1].replace(/&amp;/g, "&");
-            if (val.startsWith("http") || val.startsWith("base64://")) {
+            if (val.startsWith("http") || val.startsWith("base64://") || val.startsWith("file:")) {
                 urls.push(val);
                 if (urls.length >= maxImages) break;
             }
@@ -263,7 +263,7 @@ function cleanCQCodes(text: string | undefined): string {
     let match;
     while ((match = imageRegex.exec(text)) !== null) {
         const val = match[1].replace(/&amp;/g, "&");
-        if (val.startsWith("http")) {
+        if (val.startsWith("http") || val.startsWith("file:")) {
             imageUrls.push(val);
         }
     }
@@ -2405,6 +2405,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         size?: number;
                     }> = [];
                     const imageHints: string[] = [];
+                    const audioHints: string[] = [];
 
                     if (Array.isArray(event.message)) {
                         let resolvedText = "";
@@ -2424,7 +2425,26 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 }
                                 resolvedText += ` @${name} `;
-                            } else if (seg.type === "record") resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
+                            } else if (seg.type === "record") {
+                                let audioUrl = typeof seg.data?.url === "string" ? seg.data.url.trim() : "";
+                                let audioHint = "";
+                                if (!audioUrl && typeof seg.data?.file === "string") {
+                                    const fileRef = seg.data.file.trim();
+                                    if (fileRef.startsWith("http") || fileRef.startsWith("base64://") || fileRef.startsWith("file:")) {
+                                        audioUrl = fileRef;
+                                    } else if (fileRef.length > 0) {
+                                        const localRef = toLocalPathIfAny(fileRef);
+                                        audioHint = localRef ? pathToFileURL(localRef).toString() : fileRef;
+                                    }
+                                }
+                                if (audioUrl) {
+                                    audioHints.push(audioUrl);
+                                }
+                                const recordRef = audioUrl || audioHint;
+                                resolvedText += recordRef
+                                    ? ` [voice:${recordRef}]${seg.data?.text ? `(${seg.data.text})` : ""}`
+                                    : ` [voice]${seg.data?.text ? `(${seg.data.text})` : ""}`;
+                            }
                             else if (seg.type === "image") {
                                 let imageUrl: string | undefined;
                                 const segUrl = typeof seg.data?.url === "string" ? seg.data.url.trim() : "";
@@ -3382,7 +3402,7 @@ ${current}
                         console.log(`[QQLayerTrace] blockLen=${layeredContext.block.length} imageCount=${layeredContext.imageUrls.length}`);
                     }
                     if (layeredContext.block) systemBlock += layeredContext.block;
-                    if (fileHints.length > 0 || imageHints.length > 0) {
+                    if (fileHints.length > 0 || imageHints.length > 0 || audioHints.length > 0) {
                         systemBlock += `<attachments>\n`;
                         for (const hint of fileHints) {
                             const parts = [`name=${hint.name}`];
@@ -3394,6 +3414,9 @@ ${current}
                         }
                         for (const imageUrl of imageHints.slice(0, 5)) {
                             systemBlock += `- qq_image url=${imageUrl}\n`;
+                        }
+                        for (const audioUrl of audioHints.slice(0, 5)) {
+                            systemBlock += `- qq_audio url=${audioUrl}\n`;
                         }
                         systemBlock += `</attachments>\n\n`;
                     }
