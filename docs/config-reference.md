@@ -44,6 +44,9 @@
 
 - `maxMessageLength`：单条消息最大长度。
 - `rateLimitMs`：多段发送间隔。
+- `showProcessingStatus`：忙碌状态可视化；NapCat 下优先使用原生输入中状态，不支持时回退到群名片后缀。
+- `processingStatusDelayMs`：延迟显示忙碌状态。
+- `processingStatusText`：回退到群名片后缀时使用的文本。
 - `blockStreaming`：是否按 assistant message 分块发送回复。
 - `blockStreamingBreak`：分块发送边界（推荐 `message_end`）。
 - `formatMarkdown`：Markdown 转纯文本。
@@ -58,6 +61,12 @@
 - `enableTTS`：语音回复开关。
 - `enableGuilds`：QQ 频道消息支持。
 - `sharedMediaHostDir` / `sharedMediaContainerDir`：媒体共享路径（容器部署时常用）。
+
+## H. 当前上下文注入补充
+
+- 群聊 `ConversationLabel` 会优先使用真实群名，失败时才回退群号。
+- 入站消息若包含 OneBot `message_id`，会同步注入 `MessageSid`。
+- 开启 `injectGatewayMeta` 后，隐藏 `<qq_context>` 现会额外透传 `senderRole`。
 
 ## 推荐最小生产配置
 

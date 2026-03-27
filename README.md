@@ -41,6 +41,9 @@
 - 新增 `showReplySessionSource`：回复前可标注来源会话，方便区分主会话与 `/临时` 会话。
 - 主 README 补充 `/临时` 会话槽说明，便于快速理解“同群分话题”的实际用法。
 - 自动重试 / Fast Fail / 并发合并 / 新消息打断 / 隐藏网关元数据等高级控制现已默认关闭，按需开启即可。
+- 群聊 `ConversationLabel` 现会优先使用真实群名，减少模型只看到群号时的歧义。
+- 入站上下文现会补充 `MessageSid`；开启 `injectGatewayMeta` 时，隐藏 `<qq_context>` 也会透传 `senderRole`。
+- NapCat 下“处理中”状态现优先使用原生 `set_input_status`；不支持时才回退到群名片后缀。
 - WebUI 参数说明已补强；复杂配置说明统一下沉到 `docs/advanced.md` 与 `docs/config-reference.md`。
 
 ## 最近更新（2026-02）
@@ -83,11 +86,13 @@
 
 - [x] reply/forward 递归解析与分层上下文注入
 - [x] 隐藏 QQ 网关元数据注入（`injectGatewayMeta`）
+- [x] 入站上下文补充 `MessageSid` / `senderRole`
 - [x] 同群临时会话槽（`/临时` / `/退出临时` / `/临时列表` 等）
 - [x] 可选回复来源会话标记（`showReplySessionSource`）
 - [x] 同会话并发防漏吞队列（`queueDebounceMs`）
 - [x] 新消息打断旧回复（`interruptOnNewMessage`）
 - [x] 长回复自动合并转发（`forwardLongReplyThreshold`）
+- [x] NapCat 原生输入中状态优先，自动回退群名片后缀
 
 ### 管理与安全
 

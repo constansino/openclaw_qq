@@ -157,6 +157,7 @@ function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, conf
 }
 
 const memberCache = new Map<string, { name: string, time: number }>();
+const groupInfoCache = new Map<string, { name: string, time: number }>();
 const execFile = promisify(execFileCallback);
 const QQ_INBOUND_MEDIA_DIR = path.join(process.env.HOME || homedir(), ".openclaw", "media", "inbound", "qq");
 const QQ_INBOUND_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
@@ -282,6 +283,19 @@ function getCachedMemberName(groupId: string, userId: string): string | null {
 
 function setCachedMemberName(groupId: string, userId: string, name: string) {
     memberCache.set(`${groupId}:${userId}`, { name, time: Date.now() });
+}
+
+function getCachedGroupName(accountId: string, groupId: string): string | null {
+    const key = `${accountId}:${groupId}`;
+    const cached = groupInfoCache.get(key);
+    if (cached && Date.now() - cached.time < 3600000) {
+        return cached.name;
+    }
+    return null;
+}
+
+function setCachedGroupName(accountId: string, groupId: string, name: string) {
+    groupInfoCache.set(`${accountId}:${groupId}`, { name, time: Date.now() });
 }
 
 function normalizeOneBotMediaUrlCandidate(value: unknown): string | undefined {
@@ -1375,6 +1389,7 @@ const blockedNotifyCache = new Map<string, number>();
 const activeTaskIds = new Set<string>();
 const groupBusyCounters = new Map<string, number>();
 const groupBaseCards = new Map<string, string>();
+const groupBusySuffixes = new Map<string, string>();
 
 function normalizeNumericId(value: string | number | undefined | null): number | null {
     if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
@@ -1932,15 +1947,16 @@ async function setGroupTypingCard(client: OneBotClient, accountId: string, group
     const selfId = client.getSelfId();
     if (!selfId) return;
     const groupKey = `${accountId}:group:${groupId}`;
+    const suffix = (busySuffix || "输入中").trim() || "输入中";
     const current = groupBusyCounters.get(groupKey) || 0;
     const next = current + 1;
     groupBusyCounters.set(groupKey, next);
+    groupBusySuffixes.set(groupKey, suffix);
 
     if (current > 0) return;
 
     try {
         const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: selfId, no_cache: true });
-        const suffix = (busySuffix || "输入中").trim();
         const currentCard = (info?.card || info?.nickname || "").trim();
         const baseCard = stripTrailingBusySuffixes(currentCard, suffix);
         groupBaseCards.set(groupKey, baseCard);
@@ -1951,16 +1967,32 @@ async function setGroupTypingCard(client: OneBotClient, accountId: string, group
     }
 }
 
-function clearGroupTypingCard(client: OneBotClient, accountId: string, groupId: number): void {
+async function activateGroupTypingIndicator(client: OneBotClient, accountId: string, groupId: number, busySuffix: string): Promise<boolean> {
+    const selfId = client.getSelfId();
+    if (selfId) {
+        try {
+            const activated = await client.setInputStatus(groupId, selfId);
+            if (activated) return false;
+        } catch (err) {
+            console.warn(`[QQ] Native typing indicator unavailable, falling back to group card: ${String(err)}`);
+        }
+    }
+
+    await setGroupTypingCard(client, accountId, groupId, busySuffix);
+    return true;
+}
+
+function clearGroupTypingCard(client: OneBotClient, accountId: string, groupId: number, busySuffix?: string): void {
     const selfId = client.getSelfId();
     if (!selfId) return;
     const groupKey = `${accountId}:group:${groupId}`;
     const current = groupBusyCounters.get(groupKey) || 0;
     if (current <= 1) {
         groupBusyCounters.delete(groupKey);
-        const suffix = "输入中";
+        const suffix = (groupBusySuffixes.get(groupKey) || busySuffix || "输入中").trim() || "输入中";
         const baseCard = stripTrailingBusySuffixes(groupBaseCards.get(groupKey) || "", suffix);
         groupBaseCards.delete(groupKey);
+        groupBusySuffixes.delete(groupKey);
         try {
             client.setGroupCard(groupId, selfId, baseCard);
         } catch (err) {
@@ -2190,6 +2222,7 @@ function buildQQHiddenMetaBlock(params: {
     conversationLabel: string;
     sessionLabel: string;
     senderName?: string;
+    senderRole?: string;
     isAdmin: boolean;
     activeTempSlot: string | null;
     mentionedByAt: boolean;
@@ -2211,6 +2244,7 @@ function buildQQHiddenMetaBlock(params: {
         params.isGuild ? `guildId=${String(params.guildId ?? "")}` : "",
         params.isGuild ? `channelId=${String(params.channelId ?? "")}` : "",
         `senderName=${params.senderName || "unknown"}`,
+        `senderRole=${params.senderRole || "unknown"}`,
         `isAdmin=${String(params.isAdmin)}`,
         `trigger=${triggerSummary || "normal"}`,
         `tempSession=${params.activeTempSlot || "none"}`,
@@ -3444,7 +3478,23 @@ ${current}
                     let conversationLabel = `QQ User ${userId}`;
                     if (isGroup) {
                         baseFromId = String(groupId);
-                        conversationLabel = `QQ Group ${groupId}`;
+                        const cachedGroupName = getCachedGroupName(account.accountId, String(groupId));
+                        let resolvedGroupName = cachedGroupName || "";
+                        if (!resolvedGroupName) {
+                            try {
+                                const groupInfo = await client.getGroupInfo(groupId);
+                                const groupName = typeof groupInfo?.group_name === "string"
+                                    ? groupInfo.group_name.trim()
+                                    : (typeof groupInfo?.data?.group_name === "string" ? groupInfo.data.group_name.trim() : "");
+                                if (groupName) {
+                                    resolvedGroupName = groupName;
+                                    setCachedGroupName(account.accountId, String(groupId), groupName);
+                                }
+                            } catch (err) {
+                                console.warn(`[QQ] Failed to resolve group name for ${groupId}: ${String(err)}`);
+                            }
+                        }
+                        conversationLabel = resolvedGroupName ? `QQ Group "${resolvedGroupName}"` : `QQ Group ${groupId}`;
                     } else if (isGuild) {
                         baseFromId = `guild:${guildId}:${channelId}`;
                         conversationLabel = `QQ Guild ${guildId} Channel ${channelId}`;
@@ -3759,6 +3809,7 @@ ${current}
                             conversationLabel,
                             sessionLabel,
                             senderName: event.sender?.nickname || event.sender?.card || "Unknown",
+                            senderRole: event.sender?.role,
                             isAdmin,
                             activeTempSlot,
                             mentionedByAt,
@@ -3828,9 +3879,10 @@ ${current}
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
                         Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
-                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: sessionLabel, ThreadLabel: sessionLabel,
+                        SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
+                        ...(event.message_id !== undefined && { MessageSid: String(event.message_id) }),
                         OriginatingChannel: "qq", OriginatingTo: deliveryTo, CommandAuthorized: commandAuthorized,
                         ...inboundMediaPayload,
                         ...(replyMsgId && { ReplyToId: replyMsgId, ReplyToBody: replyToBody, ReplyToSender: replyToSender }),
@@ -3872,8 +3924,14 @@ ${current}
                             const delayMs = Math.max(100, Number(config.processingStatusDelayMs ?? 500));
                             processingDelayTimer = setTimeout(() => {
                                 if (isGroup) {
-                                    typingCardActivated = true;
-                                    void setGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
+                                    void activateGroupTypingIndicator(
+                                        client,
+                                        account.accountId,
+                                        groupId,
+                                        (config.processingStatusText || "输入中").trim() || "输入中",
+                                    ).then((fallbackActivated) => {
+                                        typingCardActivated = fallbackActivated;
+                                    });
                                 }
                             }, delayMs);
                         }
@@ -4041,7 +4099,7 @@ ${current}
                             clearProcessingTimers();
                             activeTaskIds.delete(taskKey);
                             if (typingCardActivated && isGroup) {
-                                clearGroupTypingCard(client, account.accountId, groupId);
+                                clearGroupTypingCard(client, account.accountId, groupId, (config.processingStatusText || "输入中").trim() || "输入中");
                             }
                         }
                     };

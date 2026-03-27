@@ -280,6 +280,24 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_list", {});
   }
 
+  async getGroupInfo(groupId: number, noCache: boolean = true): Promise<any> {
+    const tries = [
+      { action: "get_group_info", params: { group_id: groupId, no_cache: noCache } },
+      { action: "get_group_detail_info", params: { group_id: groupId } },
+    ];
+
+    let lastErr: unknown;
+    for (const attempt of tries) {
+      try {
+        return await this.sendWithResponse(attempt.action, attempt.params);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw lastErr ?? new Error("get_group_info failed");
+  }
+
   // --- Guild (Channel) Extension APIs ---
   sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
     this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
@@ -320,6 +338,29 @@ export class OneBotClient extends EventEmitter {
 
   setGroupCard(groupId: number, userId: number, card: string) {
     this.send("set_group_card", { group_id: groupId, user_id: userId, card });
+  }
+
+  async setInputStatus(groupId: number, userId?: number | null): Promise<boolean> {
+    const resolvedUserId = userId ?? this.selfId;
+    if (!resolvedUserId) return false;
+
+    const tries = [
+      { group_id: groupId, user_id: resolvedUserId, event_type: 1 },
+      { user_id: resolvedUserId, event_type: 1 },
+      { group_id: groupId, user_id: resolvedUserId },
+    ];
+
+    let lastErr: unknown;
+    for (const params of tries) {
+      try {
+        await this.sendWithResponse("set_input_status", params, 5000);
+        return true;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    throw lastErr ?? new Error("set_input_status failed");
   }
 
   private sendWithResponse(action: string, params: any, timeoutMs: number = 5000): Promise<any> {
