@@ -175,6 +175,7 @@ openclaw setup qq
       "enableTTS": false,
       "sharedMediaHostDir": "/Users/yourname/openclaw_qq/deploy/napcat/shared_media",
       "sharedMediaContainerDir": "/openclaw_media",
+      "cacheInboundImagesToLocal": true,
       "rateLimitMs": 1000,
       "formatMarkdown": true,
       "antiRiskMode": false,
@@ -219,7 +220,7 @@ openclaw setup qq
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `wsUrl` | string | **必填** | OneBot v11 WebSocket 地址 |
+| `wsUrl` | string | **必填** | OneBot v11 WebSocket 地址。当前版本仅维护 WebSocket 接入。 |
 | `accessToken` | string | - | 连接鉴权 Token |
 | `admins` | string | `""` | **管理员 QQ 号列表（字符串）**。Web表单直接填：`10000001,123456789`；Raw JSON 填：`"10000001,123456789"`。用于 `/status`, `/kick` 等管理员指令权限。 |
 | `adminOnlyChat` | boolean | `false` | **仅管理员可触发聊天回复**。开启后，非管理员即使 @ 机器人也不会触发对话（适合防止 Token 被刷）。 |
@@ -250,6 +251,7 @@ openclaw setup qq
 | `systemPrompt` | string | - | **人设设定**。注入到 AI 上下文的系统提示词。 |
 | `historyLimit` | number | `0` | **历史消息条数**。默认依赖 OpenClaw 会话系统管理上下文；仅在你需要强制携带群内最近原文时才建议设为 `>0`。 |
 | `enrichReplyForwardContext` | boolean | `true` | 是否启用多层 reply/forward 上下文解析与注入。 |
+| `cacheInboundImagesToLocal` | boolean | `true` | 是否把当前消息及 reply / forward 中识别到的图片缓存到本地 `MediaPaths`。默认开启，便于 ACP 与多模态 agent 实际读图；关闭后仅保留 URL 提示。 |
 | `maxReplyLayers` | number | `5` | reply 链最大递归层数。 |
 | `maxForwardLayers` | number | `5` | forward 链最大递归层数。 |
 | `maxForwardMessagesPerLayer` | number | `8` | 每层 forward 最多展开的子消息数。 |
@@ -258,11 +260,6 @@ openclaw setup qq
 | `includeSenderInLayers` | boolean | `true` | 分层上下文中是否包含发送者昵称/ID。 |
 | `includeCurrentOutline` | boolean | `true` | 是否附加“当前消息概要层”。 |
 | `debugLayerTrace` | boolean | `false` | 调试日志开关。开启后打印分层解析链路。 |
-
-> 推荐：默认保持 `historyLimit = 0`。这与 Telegram 通道行为更一致，能减少重复上下文注入和日志噪音。
-> 仅当你明确希望每轮都附带“群内原始近几条消息”时，再开启 `historyLimit`（例如设为 `3~5`）。
->
-> 安全建议：若你担心群内高频 @ 导致 Token 消耗过快，建议配置 `admins` 并开启 `adminOnlyChat = true`。
 | `keywordTriggers` | string | `""` | **关键词触发（字符串）**。Web表单填：`小助手, 帮我`；Raw JSON 填：`"小助手, 帮我"`。当 `requireMention=true` 时，命中关键词可不@触发；当 `requireMention=false` 时，关键词不是必需条件；当 `keywordOnlyTrigger=true` 时，群聊里只有命中这些关键词才会触发。 |
 | `autoApproveRequests` | boolean | `false` | 是否自动通过好友申请和群邀请。 |
 | `enableGuilds` | boolean | `true` | 是否开启 QQ 频道 (Guild) 支持。 |
@@ -273,6 +270,13 @@ openclaw setup qq
 | `formatMarkdown` | boolean | `false` | 是否将 Markdown 表格/列表转换为易读的纯文本排版。 |
 | `antiRiskMode` | boolean | `false` | 是否开启风控规避（如给 URL 加空格）。 |
 | `maxMessageLength` | number | `4000` | 单条消息最大长度，超过将自动分片发送。 |
+
+> 推荐：默认保持 `historyLimit = 0`。这与 Telegram 通道行为更一致，能减少重复上下文注入和日志噪音。
+> 仅当你明确希望每轮都附带“群内原始近几条消息”时，再开启 `historyLimit`（例如设为 `3~5`）。
+>
+> 安全建议：若你担心群内高频 @ 导致 Token 消耗过快，建议配置 `admins` 并开启 `adminOnlyChat = true`。
+>
+> 运维建议：入站图片、群文件和语音会缓存到本地状态目录（如 `~/.openclaw/media/inbound/qq`），生产环境建议自行加定期清理策略。
 
 ### 4. 多层 reply/forward 调参建议
 

@@ -5,6 +5,7 @@
 ## A. 必需项
 
 - `wsUrl`：OneBot WebSocket 地址。
+- 当前版本仅支持 OneBot WebSocket 接入；旧版 `transport` / `httpUrl` / `httpWebhook*` 已移除。
 - `accessToken`：OneBot 访问令牌（如启用鉴权）。
 
 ## B. 基础触发与访问控制
@@ -35,6 +36,7 @@
 
 - `historyLimit`：注入群历史条数（推荐默认 0）。
 - `enrichReplyForwardContext`：是否递归解析 reply/forward。
+- `cacheInboundImagesToLocal`：是否把当前消息及 reply / forward 里的图片缓存到本地 `MediaPaths`。
 - `maxReplyLayers` / `maxForwardLayers`：递归深度上限。
 - `maxTotalContextChars`：注入字符预算上限。
 
@@ -80,6 +82,7 @@
       "allowBareGroupCommands": false,
       "blockStreaming": true,
       "blockStreamingBreak": "message_end",
+      "cacheInboundImagesToLocal": true,
       "forwardLongReplyThreshold": 300,
       "forwardNodeCharLimit": 0,
       "enableDynamicModelCatalog": false
@@ -96,6 +99,7 @@
 - 默认不因同会话新消息而打断当前任务；只有把 `interruptOnNewMessage` 显式设为 `true` 才会启用。
 - 默认不允许群聊裸 slash 指令直接触发；请用 `椰子 /model` 这类“唤醒词 + 指令”形式。
 - 本地 `/model` 默认不主动探测 provider `/models` 全量目录；只在你显式开启 `enableDynamicModelCatalog=true` 时才做动态聚合。
+- 默认会把识别到的入站图片缓存到本地 `MediaPaths`；如果你只想保留 URL 提示，可把 `cacheInboundImagesToLocal` 设为 `false`。
 
 ## 恢复旧体验示例
 

@@ -64,12 +64,8 @@ const KeywordTriggersSchema = z.preprocess((value) => {
 }, z.string().optional().default(""));
 
 export const QQConfigSchema = z.object({
-  transport: z.preprocess((value) => normalizeLooseString(value)?.toLowerCase(), z.enum(["ws", "http"]).optional().default("ws")).describe("OneBot transport mode. ws = WebSocket; http = HTTP API + plugin webhook."),
-  wsUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url().optional()).describe("OneBot WebSocket URL. Example: ws://127.0.0.1:3001"),
-  httpUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url().optional()).describe("OneBot HTTP API URL. Example: http://127.0.0.1:3000"),
-  httpWebhookPath: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("")).describe("Plugin webhook path used to receive OneBot events in HTTP mode."),
-  httpWebhookToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("Webhook auth token for HTTP mode. Falls back to accessToken when empty."),
-  accessToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("OneBot access token. Must match the OneBot/NapCat server configuration."),
+  wsUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url()).describe("OneBot WebSocket 地址。示例：ws://127.0.0.1:3001"),
+  accessToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("OneBot 访问令牌（Token）。需与 NapCat/OneBot 配置一致。"),
   admins: IdListStringSchema.describe("管理员QQ号（字符串）。Web表单直接填：10000001,123456789；Raw JSON 填：\"10000001,123456789\"。"),
   requireMention: BooleanInputSchema(true).describe("群聊触发门槛（含命令）。true=仅在被@/回复机器人/命中关键词时触发；若同时开启 keywordOnlyTrigger，则群聊只认关键词。false=群内普通消息与命令都可能触发（容易被刷，谨慎关闭）。"),
   systemPrompt: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("系统提示词。示例：你是一个高效、礼貌的助理。"),
@@ -106,6 +102,7 @@ export const QQConfigSchema = z.object({
   sharedMediaContainerDir: z.preprocess((value) => normalizeLooseString(value), z.string().optional().default("/openclaw_media")).describe("可选：共享目录在 NapCat 容器内的挂载路径。默认 /openclaw_media。"),
   enableGuilds: BooleanInputSchema(true).describe("是否启用 QQ 频道（Guild）支持。"),
   enrichReplyForwardContext: BooleanInputSchema(true).describe("是否递归解析 reply/forward 并注入多层上下文。默认开启。"),
+  cacheInboundImagesToLocal: BooleanInputSchema(true).describe("是否将当前消息以及引用/转发上下文里识别到的图片缓存到本地 MediaPaths。默认开启，便于 ACP 与多模态 agent 实际读图；关闭后仅保留 URL 提示，部分 agent 可能只能看到文字。"),
   blockStreaming: BooleanInputSchema(true).describe("是否按 assistant message 分块发送回复。默认开启，推荐配合 message_end，让 commentary/final 按完整消息落地。"),
   blockStreamingBreak: z.preprocess((value) => normalizeLooseString(value)?.toLowerCase(), z.enum(["text_end", "message_end"]).optional().default("message_end")).describe("分块发送的边界。默认 message_end：等单条 assistant message 完整生成后再发，更适合 QQ 群聊。"),
   maxReplyLayers: NumberInputSchema(5).describe("reply 最大递归层数。默认 5。"),

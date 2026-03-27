@@ -23,6 +23,7 @@
 ## 最近更新（2026-03）
 
 - 新增专题说明：[2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)。
+- 新增专题说明：[2026-03-27 媒体链路与传输模式更新](./docs/2026-03-27-media-transport-update.md)。
 - 本轮以“QQ 插件默认值/默认输出策略调整”为主，不改 OpenClaw core 的既有设计；如果你更喜欢旧体验，仍可通过配置项手动恢复。
 - 默认关闭 `interruptOnNewMessage`，且仅在显式设为 `true` 时才会用“新消息打断旧回复”。
 - 默认启用 `blockStreaming=true` + `blockStreamingBreak=message_end`，让 commentary / final 按完整 assistant message 落地，减少 QQ 侧碎片化输出。
@@ -31,8 +32,10 @@
 - 默认 `allowBareGroupCommands=false`，群聊里裸 `/model` 不再直接触发；推荐使用 `椰子 /model` 这类“唤醒词 + 指令”形式。
 - 默认 `enableDynamicModelCatalog=false`，本地 `/model` 不主动探测 provider `/models` 全量目录，保持更保守的默认行为。
 - reply / forward 上下文解析已补强，QQ 引用消息与合并转发中的文本线索可继续注入给模型。
+- QQ 插件现统一走 OneBot WebSocket，插件侧 HTTP + webhook 传输模式已移除。
+- 新增入站图片/文件/语音本地缓存链路，reply / forward 里的媒体也会尽量注入 `MediaPaths` / `MediaUrls`。
+- 新增 `cacheInboundImagesToLocal`，默认把当前消息及引用链里的图片缓存到本地，便于 ACP 与多模态 agent 读图。
 - 仓库文档现统一维护中文版本，仓库内英文 Markdown 已清理。
-- 新增 OneBot HTTP 模式文档，支持通过 HTTP API + webhook 接入，说明见 `docs/http-transport.md`。
 - QQ 私聊 session key 已回归官方命名风格：peer id 使用纯 QQ 号，不再写成 `qq:user:<id>`；旧本机会话会在启动时自动规范化。
 - 新增 `keywordOnlyTrigger`：群聊可切换为“仅关键词触发”，忽略 @ / 回复触发，适合与其他机器人共用同一 QQ 账号。
 - 新增 `showReplySessionSource`：回复前可标注来源会话，方便区分主会话与 `/临时` 会话。
@@ -102,9 +105,10 @@
 
 1. [3 分钟快速开始](./docs/quickstart.md)
 2. [配置参考（分组版）](./docs/config-reference.md)
-3. [2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)
-4. [高级能力与完整参数](./docs/advanced.md)
-5. [NapCat 部署说明（GitHub）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
+3. [2026-03-27 媒体链路与传输模式更新](./docs/2026-03-27-media-transport-update.md)
+4. [2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)
+5. [高级能力与完整参数](./docs/advanced.md)
+6. [NapCat 部署说明（GitHub）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
 
 ## `/临时` 会话槽是什么
 

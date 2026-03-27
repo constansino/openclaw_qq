@@ -8,6 +8,7 @@
 
 - [3 分钟快速开始](./quickstart.md)
 - [配置参考（分组版）](./config-reference.md)
+- [2026-03-27 媒体链路与传输模式更新](./2026-03-27-media-transport-update.md)
 - [2026-03-20 默认行为调整](./2026-03-20-default-behavior-update.md)
 - [部署指引（NapCat）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
 - [高级能力与完整参数](./advanced.md)
@@ -25,8 +26,9 @@
 
 1. [快速开始](./quickstart.md)
 2. [配置参考](./config-reference.md)
-3. [2026-03-20 默认行为调整](./2026-03-20-default-behavior-update.md)
-4. [部署指引（NapCat）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
+3. [2026-03-27 媒体链路与传输模式更新](./2026-03-27-media-transport-update.md)
+4. [2026-03-20 默认行为调整](./2026-03-20-default-behavior-update.md)
+5. [部署指引（NapCat）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
 
 ## 交流与支持
 
@@ -34,6 +36,6 @@
   - https://aiya.de5.net/c/25-category/25
 - 不建立 QQ 群，问题与经验统一沉淀在论坛，便于检索与追踪。
 
-## HTTP 模式
+## 传输模式
 
-- [OneBot HTTP 模式说明](./http-transport.md)
+- 当前版本仅维护 OneBot WebSocket 接入；插件侧 HTTP + webhook 模式已移除。
