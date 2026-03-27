@@ -11,14 +11,13 @@ import {
     type ChannelAccountSnapshot,
     type OpenClawConfig,
     buildChannelConfigSchema,
-    DEFAULT_ACCOUNT_ID,
-    normalizeAccountId,
     type ReplyPayload,
     applyAccountNameToChannelSection,
     migrateBaseNameToDefaultAccount,
     normalizeWebhookPath,
     registerPluginHttpRoute,
 } from "openclaw/plugin-sdk";
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime } from "./runtime.js";
