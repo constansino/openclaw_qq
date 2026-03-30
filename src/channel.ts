@@ -3454,8 +3454,32 @@ ${current}
                         try {
                             const matchedAgentId = route.agentId;
                             const matchedAgentConfig = ((cfg as any).agents?.list || []).find((a: any) => a.id === matchedAgentId);
-                            const rawModelConfig = matchedAgentConfig?.model || (cfg as any).agents?.defaults?.model;
-                            const fallbacks = (typeof rawModelConfig === 'object' && Array.isArray(rawModelConfig.fallbacks)) ? rawModelConfig.fallbacks : [];
+                            // OpenClaw accepts either "provider/model" or
+                            // { primary, fallbacks } for agent model config.
+                            const normalizeModelConfig = (value: any) => {
+                                if (typeof value === "string") {
+                                    const primary = value.trim();
+                                    return primary ? { primary, fallbacks: [] as string[] } : undefined;
+                                }
+                                if (!value || typeof value !== "object") {
+                                    return undefined;
+                                }
+                                const primary = typeof value.primary === "string" ? value.primary.trim() : "";
+                                const fallbacks = Array.isArray(value.fallbacks)
+                                    ? value.fallbacks
+                                        .map((entry: any) => (typeof entry === "string" ? entry.trim() : ""))
+                                        .filter((entry: string) => Boolean(entry))
+                                    : [];
+                                if (!primary && fallbacks.length === 0) {
+                                    return undefined;
+                                }
+                                return { primary, fallbacks };
+                            };
+                            const rawModelConfig =
+                                normalizeModelConfig(matchedAgentConfig?.model) ||
+                                normalizeModelConfig((cfg as any).agents?.defaults?.model) ||
+                                { primary: "", fallbacks: [] as string[] };
+                            const fallbacks = rawModelConfig.fallbacks;
 
                             const modelsToTry = [null, ...fallbacks];
                             let globalDispatchError: any = null;
@@ -3467,6 +3491,12 @@ ${current}
                                 const modelToTest = modelsToTry[modelIndex] || rawModelConfig.primary;
                                 let currentCfg = cfg as any;
                                 if (runState.isStale()) {
+                                    break out_loop;
+                                }
+
+                                if (!modelToTest) {
+                                    globalDispatchError = new Error("[QQ] No model resolved for this route; check agents.<id>.model or agents.defaults.model");
+                                    console.error(globalDispatchError);
                                     break out_loop;
                                 }
 
