@@ -3610,6 +3610,12 @@ ${current}
                     });
 
                     let deliveredAnything = false;
+                    // Track generated visible output separately from delivery completion.
+                    // Unknown block text may be flushed by a short debounce timer; if that
+                    // async flush races with dispatch completion, deliveredAnything can still
+                    // be false even though a real reply is already queued/sending. Do not send
+                    // the empty-reply fallback in that case.
+                    let sawReplyContent = false;
                     let dispatcherError: any = null;
                     let currentRunState: { isStale: () => boolean } | null = null;
                     const forwardThreshold = Number(config.forwardLongReplyThreshold ?? 0);
@@ -3804,6 +3810,7 @@ ${current}
                             const processed = await prepareOutgoingText(payload.text);
                             if (currentRunState?.isStale()) return;
                             if (processed.trim()) {
+                                sawReplyContent = true;
                                 const isUnknownBlockText = !phase && info?.kind === "block";
                                 if (isUnknownBlockText) {
                                     const flushedBufferedFinal = await flushBufferedFinalTexts();
@@ -3829,6 +3836,9 @@ ${current}
                             }
                         }
                         if (payload.files) {
+                            if (Array.isArray(payload.files) && payload.files.length > 0) {
+                                sawReplyContent = true;
+                            }
                             const flushedUnknownText = await flushBufferedUnknownTexts("before_files");
                             if (flushedUnknownText) deliveredAnything = true;
                             const flushedBufferedText = await flushBufferedFinalTexts();
@@ -4117,11 +4127,12 @@ ${current}
                                         }
 
                                         const dispatchStartTime = Date.now();
+                                        let dispatchResult: any = null;
                                         try {
                                             resetBufferedFinalTexts();
                                             resetBufferedUnknownTexts();
                                             const replyCfg = buildQQReplyConfig(currentCfg as OpenClawConfig, config);
-                                            const dispatchResult = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+                                            dispatchResult = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
                                                 ctx: mergedCtx,
                                                 cfg: replyCfg,
                                                 dispatcherOptions: {
@@ -4172,7 +4183,13 @@ ${current}
                                             const flushedBufferedText = await flushBufferedFinalTexts();
                                             if (flushedBufferedText) deliveredAnything = true;
                                             const shouldFallback = config.enableEmptyReplyFallback !== false && !text.trim().startsWith('/');
-                                            if (deliveredAnything || !shouldFallback) {
+                                            const dispatchCounts = (dispatchResult?.counts && typeof dispatchResult.counts === "object") ? dispatchResult.counts : {};
+                                            const sawDispatcherOutput = Boolean(
+                                                dispatchResult?.queuedFinal ||
+                                                Number(dispatchCounts.block || 0) > 0 ||
+                                                Number(dispatchCounts.final || 0) > 0
+                                            );
+                                            if (deliveredAnything || sawReplyContent || sawDispatcherOutput || !shouldFallback) {
                                                 break out_loop;
                                             }
 
