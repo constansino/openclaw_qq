@@ -55,7 +55,7 @@ type InboundMediaEntry = {
 };
 
 type QQInboundAttachmentHint = {
-    kind: "file" | "audio";
+    kind: "file" | "audio" | "video";
     name: string;
     url?: string;
     localPath?: string;
@@ -162,6 +162,7 @@ const execFile = promisify(execFileCallback);
 const QQ_INBOUND_MEDIA_DIR = path.join(process.env.HOME || homedir(), ".openclaw", "media", "inbound", "qq");
 const QQ_INBOUND_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 const QQ_INBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const QQ_INBOUND_VIDEO_MAX_BYTES = 200 * 1024 * 1024;
 const QQ_INBOUND_MEDIA_FETCH_TIMEOUT_MS = 15000;
 const DEFAULT_QQ_IMAGE_MIME = "image/jpeg";
 const DEFAULT_QQ_BINARY_MIME = "application/octet-stream";
@@ -198,6 +199,14 @@ const GENERIC_EXT_TO_MIME = new Map<string, string>([
     [".oga", "audio/ogg"],
     [".flac", "audio/flac"],
     [".aac", "audio/aac"],
+    [".mp4", "video/mp4"],
+    [".m4v", "video/mp4"],
+    [".mov", "video/quicktime"],
+    [".mkv", "video/x-matroska"],
+    [".webm", "video/webm"],
+    [".avi", "video/x-msvideo"],
+    [".flv", "video/x-flv"],
+    [".3gp", "video/3gpp"],
     [".pdf", "application/pdf"],
     [".txt", "text/plain"],
     [".md", "text/markdown"],
@@ -221,6 +230,13 @@ const GENERIC_MIME_TO_EXT = new Map<string, string>([
     ["audio/ogg", ".ogg"],
     ["audio/flac", ".flac"],
     ["audio/aac", ".aac"],
+    ["video/mp4", ".mp4"],
+    ["video/quicktime", ".mov"],
+    ["video/x-matroska", ".mkv"],
+    ["video/webm", ".webm"],
+    ["video/x-msvideo", ".avi"],
+    ["video/x-flv", ".flv"],
+    ["video/3gpp", ".3gp"],
     ["application/pdf", ".pdf"],
     ["text/plain", ".txt"],
     ["text/markdown", ".md"],
@@ -695,6 +711,39 @@ function buildInboundMediaPayloadFromEntries(entries: InboundMediaEntry[]): Reco
     };
 }
 
+function parseOneBotFileSize(value: unknown): number | undefined {
+    if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) return Number.parseInt(value.trim(), 10);
+    return undefined;
+}
+
+function attachmentHintToInboundMediaEntry(hint: QQInboundAttachmentHint): InboundMediaEntry | null {
+    const url = hint.url?.trim();
+    const pathValue = hint.localPath?.trim();
+    if (!url && !pathValue) return null;
+    return {
+        ...(url ? { url } : {}),
+        ...(pathValue ? { path: pathValue } : {}),
+        type: hint.mimeType || inferGenericMimeType(hint.name) || DEFAULT_QQ_BINARY_MIME,
+    };
+}
+
+function collectAttachmentMediaEntries(hints: QQInboundAttachmentHint[]): InboundMediaEntry[] {
+    const entries: InboundMediaEntry[] = [];
+    for (const hint of hints) {
+        const entry = attachmentHintToInboundMediaEntry(hint);
+        if (entry) entries.push(entry);
+    }
+    return entries;
+}
+
+function rememberAttachmentHint(hints: QQInboundAttachmentHint[], hint: QQInboundAttachmentHint | null | undefined): void {
+    if (!hint) return;
+    const nextKey = `${hint.kind}|${hint.localPath || hint.url || hint.fileId || hint.name}`;
+    if (hints.some((item) => `${item.kind}|${item.localPath || item.url || item.fileId || item.name}` === nextKey)) return;
+    hints.push(hint);
+}
+
 async function resolveOneBotImageUrl(client: OneBotClient, segment: any): Promise<string | undefined> {
     if (!segment || String(segment?.type || "").toLowerCase() !== "image") return undefined;
 
@@ -735,6 +784,12 @@ async function hydrateOneBotMessageMedia(
             await resolveOneBotImageUrl(client, segment);
             continue;
         }
+        if (segType === "video" && !segment?.data?.url) {
+            const resolved = normalizeOneBotMediaUrlCandidate(segment?.data?.file)
+                ?? normalizeOneBotMediaUrlCandidate(segment?.data?.path);
+            if (resolved) segment.data.url = resolved;
+            continue;
+        }
         if (segType === "file" && opts?.groupId !== undefined && !segment?.data?.url && segment?.data?.file_id) {
             try {
                 const info = await (client as any).sendWithResponse("get_group_file_url", {
@@ -772,12 +827,7 @@ async function collectFileHintFromOneBotSegment(
     const fileId = segment.data?.file_id ? String(segment.data.file_id) : undefined;
     const busid = segment.data?.busid !== undefined ? String(segment.data.busid) : undefined;
     const fileUrl = typeof segment.data?.url === "string" ? segment.data.url : undefined;
-    const rawSize = segment.data?.file_size;
-    const parsedSize = typeof rawSize === "number"
-        ? rawSize
-        : typeof rawSize === "string" && /^\d+$/.test(rawSize)
-            ? Number.parseInt(rawSize, 10)
-            : undefined;
+    const parsedSize = parseOneBotFileSize(segment.data?.file_size);
     let mimeType = inferGenericMimeType(fileName) ?? DEFAULT_QQ_BINARY_MIME;
     let localPath: string | undefined;
     if (fileUrl) {
@@ -804,6 +854,50 @@ async function collectFileHintFromOneBotSegment(
     };
 }
 
+async function collectVideoHintFromOneBotSegment(segment: any): Promise<QQInboundAttachmentHint | null> {
+    if (!segment || String(segment?.type || "").toLowerCase() !== "video") return null;
+
+    const candidates = [
+        normalizeOneBotMediaUrlCandidate(segment.data?.url),
+        normalizeOneBotMediaUrlCandidate(segment.data?.file),
+        normalizeOneBotMediaUrlCandidate(segment.data?.path),
+    ].filter((value): value is string => Boolean(value));
+    const videoUrl = candidates.find((value) => /^https?:\/\//i.test(value) || /^base64:\/\//i.test(value) || /^file:\/\//i.test(value));
+    const fileName = guessFileName(
+        typeof segment.data?.name === "string"
+            ? segment.data.name
+            : typeof segment.data?.file === "string"
+                ? segment.data.file
+                : typeof segment.data?.path === "string"
+                    ? segment.data.path
+                    : videoUrl || "video.mp4"
+    );
+    const parsedSize = parseOneBotFileSize(segment.data?.file_size);
+    let mimeType = inferGenericMimeType(fileName) ?? inferGenericMimeType(videoUrl) ?? "video/mp4";
+    let localPath: string | undefined;
+
+    if (videoUrl) {
+        try {
+            const cached = await cacheInboundAttachmentLocally(videoUrl, { fileName, mimeType }, QQ_INBOUND_VIDEO_MAX_BYTES);
+            if (cached?.path) {
+                localPath = cached.path;
+                mimeType = cached.mimeType || mimeType;
+            }
+        } catch (err) {
+            console.warn(`[QQ] Failed to cache inbound video: ${String(err)}`);
+        }
+    }
+
+    return {
+        kind: "video",
+        name: fileName,
+        ...(videoUrl ? { url: videoUrl } : {}),
+        ...(localPath ? { localPath } : {}),
+        ...(parsedSize !== undefined ? { size: parsedSize } : {}),
+        ...(mimeType ? { mimeType } : {}),
+    };
+}
+
 async function collectAudioHintFromOneBotSegment(segment: any): Promise<QQInboundAttachmentHint | null> {
     if (!segment || String(segment?.type || "").toLowerCase() !== "record") return null;
 
@@ -820,12 +914,7 @@ async function collectAudioHintFromOneBotSegment(segment: any): Promise<QQInboun
                 ? segment.data.path
                 : audioUrl || "voice.amr"
     );
-    const rawSize = segment.data?.file_size;
-    const parsedSize = typeof rawSize === "number"
-        ? rawSize
-        : typeof rawSize === "string" && /^\d+$/.test(rawSize)
-            ? Number.parseInt(rawSize, 10)
-            : undefined;
+    const parsedSize = parseOneBotFileSize(segment.data?.file_size);
     let mimeType = inferGenericMimeType(fileName) ?? "audio/amr";
     let localPath: string | undefined;
     if (audioUrl) {
@@ -875,6 +964,17 @@ function cleanCQCodes(text: string | undefined): string {
     result = result.replace(/\[CQ:[^\]]+\]/g, (match) => {
         if (match.startsWith("[CQ:image")) {
             return "[图片]";
+        }
+        if (match.startsWith("[CQ:video")) {
+            return "[视频]";
+        }
+        if (match.startsWith("[CQ:record")) {
+            return "[语音]";
+        }
+        if (match.startsWith("[CQ:file")) {
+            const nameMatch = match.match(/(?:^|,)(?:name|file)=([^,\]]+)/);
+            const name = nameMatch?.[1] ? nameMatch[1].replace(/&amp;/g, "&") : "文件";
+            return `[文件:${name}]`;
         }
         return "";
     });
@@ -1170,7 +1270,7 @@ function summarizeOneBotSegments(message: OneBotMessage | string | undefined, ma
             else if (seg.type === "at") text += ` @${seg.data?.qq || "unknown"} `;
             else if (seg.type === "record") text += ` [语音${seg.data?.text ? `:${seg.data.text}` : ""}]`;
             else if (seg.type === "image") text += " [图片]";
-            else if (seg.type === "video") text += " [视频]";
+            else if (seg.type === "video") text += seg.data?.url ? ` [视频:${seg.data.url}]` : " [视频]";
             else if (seg.type === "json") text += " [卡片]";
             else if (seg.type === "file") {
                 const fileName = seg.data?.name || seg.data?.file || "未命名";
@@ -2910,7 +3010,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 }
                                 resolvedText += ` @${name} `;
-                            } else if (seg.type === "record") resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
+                            } else if (seg.type === "record") {
+                                const audioHint = await collectAudioHintFromOneBotSegment(seg);
+                                rememberAttachmentHint(audioHints, audioHint);
+                                resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
+                            }
                             else if (seg.type === "image") {
                                 const imageUrl = await resolveOneBotImageUrl(client, seg);
                                 if (imageUrl) {
@@ -2924,7 +3028,12 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     resolvedText += " [图片]";
                                 }
                             }
-                            else if (seg.type === "video") resolvedText += " [视频消息]";
+                            else if (seg.type === "video") {
+                                const videoHint = await collectVideoHintFromOneBotSegment(seg);
+                                rememberAttachmentHint(fileHints, videoHint);
+                                if (videoHint?.url) resolvedText += ` [视频: ${videoHint.url}]`;
+                                else resolvedText += " [视频消息]";
+                            }
                             else if (seg.type === "json") resolvedText += " [卡片消息]";
                             else if (seg.type === "forward" && seg.data?.id) {
                                 try {
@@ -2937,30 +3046,13 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 } catch (e) { }
                             } else if (seg.type === "file") {
-                                if (!seg.data?.url && isGroup) {
-                                    try {
-                                        const info = await (client as any).sendWithResponse("get_group_file_url", { group_id: groupId, file_id: seg.data?.file_id, busid: seg.data?.busid });
-                                        if (info?.url) seg.data.url = info.url;
-                                    } catch (e) { }
-                                }
-                                const fileName = seg.data?.name || seg.data?.file || "未命名";
-                                const fileId = seg.data?.file_id ? String(seg.data.file_id) : undefined;
-                                const busid = seg.data?.busid !== undefined ? String(seg.data.busid) : undefined;
-                                const fileUrl = typeof seg.data?.url === "string" ? seg.data.url : undefined;
-                                const fileSize = typeof seg.data?.file_size === "number" ? seg.data.file_size : undefined;
-                                fileHints.push({
-                                    kind: "file",
-                                    name: fileName,
-                                    ...(fileUrl ? { url: fileUrl } : {}),
-                                    ...(fileId ? { fileId } : {}),
-                                    ...(busid ? { busid } : {}),
-                                    ...(fileSize !== undefined ? { size: fileSize } : {}),
-                                });
-                                const shortHint = fileUrl
-                                    ? ` [文件: ${fileName}, 下载=${fileUrl}]`
-                                    : fileId
-                                        ? ` [文件: ${fileName}, file_id=${fileId}${busid ? `, busid=${busid}` : ""}]`
-                                        : ` [文件: ${fileName}]`;
+                                const fileHint = await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined });
+                                rememberAttachmentHint(fileHints, fileHint);
+                                const shortHint = fileHint?.url
+                                    ? ` [文件: ${fileHint.name}, 下载=${fileHint.url}]`
+                                    : fileHint?.fileId
+                                        ? ` [文件: ${fileHint.name}, file_id=${fileHint.fileId}${fileHint.busid ? `, busid=${fileHint.busid}` : ""}]`
+                                        : ` [文件: ${fileHint?.name || "未命名"}]`;
                                 resolvedText += shortHint;
                             }
                         }
@@ -3361,34 +3453,20 @@ ${current}
                         } catch { }
                     }
 
-                    if (fileHints.length === 0 && repliedMsg) {
+                    if (repliedMsg) {
                         try {
                             const replySegments = Array.isArray(repliedMsg.message) ? repliedMsg.message : [];
                             for (const seg of replySegments) {
-                                if (seg?.type !== "file") continue;
-                                if (!seg.data?.url && isGroup && seg.data?.file_id) {
-                                    try {
-                                        const info = await (client as any).sendWithResponse("get_group_file_url", {
-                                            group_id: groupId,
-                                            file_id: seg.data.file_id,
-                                            busid: seg.data.busid,
-                                        });
-                                        if (info?.url) seg.data.url = info.url;
-                                    } catch { }
+                                if (seg?.type === "file") {
+                                    rememberAttachmentHint(
+                                        fileHints,
+                                        await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined }),
+                                    );
+                                } else if (seg?.type === "video") {
+                                    rememberAttachmentHint(fileHints, await collectVideoHintFromOneBotSegment(seg));
+                                } else if (seg?.type === "record") {
+                                    rememberAttachmentHint(audioHints, await collectAudioHintFromOneBotSegment(seg));
                                 }
-                                const fileName = seg.data?.name || seg.data?.file || "未命名";
-                                const fileId = seg.data?.file_id ? String(seg.data.file_id) : undefined;
-                                const busid = seg.data?.busid !== undefined ? String(seg.data.busid) : undefined;
-                                const fileUrl = typeof seg.data?.url === "string" ? seg.data.url : undefined;
-                                const fileSize = typeof seg.data?.file_size === "number" ? seg.data.file_size : undefined;
-                                fileHints.push({
-                                    kind: "file",
-                                    name: fileName,
-                                    ...(fileUrl ? { url: fileUrl } : {}),
-                                    ...(fileId ? { fileId } : {}),
-                                    ...(busid ? { busid } : {}),
-                                    ...(fileSize !== undefined ? { size: fileSize } : {}),
-                                });
                             }
 
                             if (fileHints.length === 0 && typeof repliedMsg.raw_message === "string") {
@@ -3832,15 +3910,18 @@ ${current}
                         console.log(`[QQLayerTrace] blockLen=${layeredContext.block.length} imageCount=${layeredContext.imageUrls.length}`);
                     }
                     if (layeredContext.block) systemBlock += layeredContext.block;
-                    if (fileHints.length > 0 || imageHints.length > 0) {
+                    if (fileHints.length > 0 || audioHints.length > 0 || imageHints.length > 0) {
                         systemBlock += `<attachments>\n`;
-                        for (const hint of fileHints) {
+                        for (const hint of [...fileHints, ...audioHints]) {
+                            const tag = hint.kind === "video" ? "qq_video" : hint.kind === "audio" ? "qq_audio" : "qq_file";
                             const parts = [`name=${hint.name}`];
                             if (hint.url) parts.push(`url=${hint.url}`);
+                            if (hint.localPath) parts.push(`local_path=${hint.localPath}`);
                             if (hint.fileId) parts.push(`file_id=${hint.fileId}`);
                             if (hint.busid) parts.push(`busid=${hint.busid}`);
                             if (hint.size !== undefined) parts.push(`size=${hint.size}`);
-                            systemBlock += `- qq_file ${parts.join(" ")}\n`;
+                            if (hint.mimeType) parts.push(`mime=${hint.mimeType}`);
+                            systemBlock += `- ${tag} ${parts.join(" ")}\n`;
                         }
                         for (const imageUrl of imageHints.slice(0, 5)) {
                             systemBlock += `- qq_image url=${imageUrl}\n`;
@@ -3857,7 +3938,11 @@ ${current}
                     const cachedInboundImages = config.cacheInboundImagesToLocal !== false
                         ? await cacheImageHintsLocally(inboundMediaUrls, imageHintMeta)
                         : { entries: inboundMediaUrls.map((url) => ({ url, type: imageHintMeta.get(url)?.mimeType ?? inferImageMimeType(url) ?? DEFAULT_QQ_IMAGE_MIME })), failures: [] as Array<{ url: string; error: string }> };
-                    const inboundMediaPayload = buildInboundMediaPayloadFromEntries(cachedInboundImages.entries);
+                    const attachmentMediaEntries = collectAttachmentMediaEntries([...fileHints, ...audioHints]);
+                    const inboundMediaPayload = buildInboundMediaPayloadFromEntries([
+                        ...cachedInboundImages.entries,
+                        ...attachmentMediaEntries,
+                    ]);
                     if (config.debugLayerTrace) {
                         const mediaPathCount = Array.isArray((inboundMediaPayload as any).MediaPaths)
                             ? (inboundMediaPayload as any).MediaPaths.length
@@ -3866,7 +3951,7 @@ ${current}
                             ? (inboundMediaPayload as any).MediaUrls.length
                             : ((inboundMediaPayload as any).MediaUrl ? 1 : 0);
                         console.log(
-                            `[QQLayerTrace] inbound media urls=${inboundMediaUrls.length} ctxUrls=${mediaUrlCount} ctxPaths=${mediaPathCount} cacheFailures=${cachedInboundImages.failures.length}`
+                            `[QQLayerTrace] inbound media urls=${inboundMediaUrls.length} attachments=${attachmentMediaEntries.length} ctxUrls=${mediaUrlCount} ctxPaths=${mediaPathCount} cacheFailures=${cachedInboundImages.failures.length}`
                         );
                         if (cachedInboundImages.failures.length > 0) {
                             console.warn(

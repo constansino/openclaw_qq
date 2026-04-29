@@ -2,7 +2,7 @@ export type OneBotMessageSegment =
   | { type: "text"; data: { text: string } }
   | { type: "image"; data: { file: string; url?: string } }
   | { type: "record"; data: { file: string; text?: string } }
-  | { type: "video"; data: { file: string } }
+  | { type: "video"; data: { file: string; url?: string; path?: string; file_size?: number | string; name?: string } }
   | {
       type: "file";
       data: {
