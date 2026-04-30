@@ -2432,10 +2432,11 @@ function splitMessage(text: string, limit: number): string[] {
 function resolveOutboundMessageId(...candidates: Array<unknown>): string {
     for (const candidate of candidates) {
         if (candidate && typeof candidate === "object") {
-            const fromAck = (candidate as any).message_id ?? (candidate as any).messageId;
+            const fromAck = (candidate as any).message_id ?? (candidate as any).messageId ?? (candidate as any).file_id ?? (candidate as any).fileId;
             if (fromAck !== undefined && fromAck !== null && String(fromAck).trim()) {
                 return String(fromAck).trim();
             }
+            continue;
         }
         if (candidate !== undefined && candidate !== null && String(candidate).trim()) {
             return String(candidate).trim();
