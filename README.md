@@ -20,6 +20,17 @@
 > **官方交流论坛（唯一）：** https://aiya.de5.net/c/25-category/25  
 > 问题反馈、配置经验、更新公告统一在论坛沉淀，便于检索和追踪。
 
+## 最近更新（2026-04）
+
+- 新增专题说明：[2026-04-30 原生文件 / 媒体收发更新](./docs/2026-04-30-native-media-file-update.md)。
+- QQ 普通文件附件现在默认只进入 `<attachments>` 元数据，不再自动展开 TXT 正文污染模型上下文。
+- 入站文件会保留 `name`、`url`、`local_path`、`file_id`、`size`、`mime` 等元数据；需要读正文时再按 `local_path` 显式读取。
+- 出站图片、语音、视频、压缩包已收进 QQ 插件原生逻辑，不再依赖旧的发文件 skill。
+- `sendMedia` 会按媒体类型自动分流到 OneBot `image` / `record` / `video` / 文件上传接口。
+- `sendPayload` 支持 `mediaUrl`、`mediaUrls`、`files`，可处理文本 + 多附件同发。
+- 普通文件优先走 `upload_group_file` / `upload_private_file`，rich media 失败时会尝试文件上传 fallback。
+- 已实测引用压缩包入站、引用 TXT metadata-only、原生发送图片、语音与 `.zip` 压缩包。
+
 ## 最近更新（2026-03）
 
 - 新增专题说明：[2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)。
@@ -110,10 +121,11 @@
 
 1. [3 分钟快速开始](./docs/quickstart.md)
 2. [配置参考（分组版）](./docs/config-reference.md)
-3. [2026-03-27 媒体链路与传输模式更新](./docs/2026-03-27-media-transport-update.md)
-4. [2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)
-5. [高级能力与完整参数](./docs/advanced.md)
-6. [NapCat 部署说明（GitHub）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
+3. [2026-04-30 原生文件 / 媒体收发更新](./docs/2026-04-30-native-media-file-update.md)
+4. [2026-03-27 媒体链路与传输模式更新](./docs/2026-03-27-media-transport-update.md)
+5. [2026-03-20 默认行为调整](./docs/2026-03-20-default-behavior-update.md)
+6. [高级能力与完整参数](./docs/advanced.md)
+7. [NapCat 部署说明（GitHub）](https://github.com/constansino/openclaw_qq/blob/main/deploy/napcat/README.md)
 
 ## `/临时` 会话槽是什么
 
