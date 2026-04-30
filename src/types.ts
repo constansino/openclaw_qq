@@ -1,17 +1,20 @@
 export type OneBotMessageSegment =
   | { type: "text"; data: { text: string } }
-  | { type: "image"; data: { file: string; url?: string } }
-  | { type: "record"; data: { file: string; text?: string } }
+  | { type: "image"; data: { file: string; url?: string; path?: string; name?: string; file_size?: number | string } }
+  | { type: "record"; data: { file: string; url?: string; path?: string; text?: string; file_size?: number | string } }
   | { type: "video"; data: { file: string; url?: string; path?: string; file_size?: number | string; name?: string } }
   | {
       type: "file";
       data: {
         file?: string;
         name?: string;
+        file_name?: string;
         url?: string;
         file_id?: string;
+        file_uuid?: string;
+        fileUuid?: string;
         busid?: number | string;
-        file_size?: number;
+        file_size?: number | string;
       };
     }
   | { type: "json"; data?: Record<string, unknown> }

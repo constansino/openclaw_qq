@@ -65,6 +65,25 @@ type QQInboundAttachmentHint = {
     mimeType?: string;
 };
 
+type QQOutboundMediaItem = {
+    url: string;
+    name?: string;
+};
+
+type QQOutboundMediaAccess = {
+    workspaceDir?: string;
+    readFile?: (filePath: string) => Promise<Buffer>;
+};
+
+type QQOutboundMediaOptions = {
+    mediaAccess?: QQOutboundMediaAccess;
+    mediaReadFile?: (filePath: string) => Promise<Buffer>;
+    mediaLocalRoots?: readonly string[] | "any";
+    fileNameHint?: string;
+    forceDocument?: boolean;
+    audioAsVoice?: boolean;
+};
+
 type QQSetupInput = ChannelSetupInput & {
     wsUrl?: string;
 };
@@ -728,9 +747,14 @@ function attachmentHintToInboundMediaEntry(hint: QQInboundAttachmentHint): Inbou
     };
 }
 
-function collectAttachmentMediaEntries(hints: QQInboundAttachmentHint[]): InboundMediaEntry[] {
+function collectAttachmentMediaEntries(hints: QQInboundAttachmentHint[], opts?: { includeFiles?: boolean }): InboundMediaEntry[] {
     const entries: InboundMediaEntry[] = [];
     for (const hint of hints) {
+        // Generic QQ files (txt/pdf/zip/etc.) must stay metadata-only in Body.
+        // If we put their local path into MediaPath, OpenClaw's runtime may auto-read
+        // text-like files into the model context, which lets arbitrary file contents
+        // pollute instructions. Users can still ask us to read local_path explicitly.
+        if (hint.kind === "file" && opts?.includeFiles !== true) continue;
         const entry = attachmentHintToInboundMediaEntry(hint);
         if (entry) entries.push(entry);
     }
@@ -742,6 +766,65 @@ function rememberAttachmentHint(hints: QQInboundAttachmentHint[], hint: QQInboun
     const nextKey = `${hint.kind}|${hint.localPath || hint.url || hint.fileId || hint.name}`;
     if (hints.some((item) => `${item.kind}|${item.localPath || item.url || item.fileId || item.name}` === nextKey)) return;
     hints.push(hint);
+}
+
+function unwrapOneBotActionData(info: any): any {
+    if (info && typeof info === "object" && info.data && typeof info.data === "object") return info.data;
+    return info;
+}
+
+async function resolveOneBotFileUrl(
+    client: OneBotClient,
+    segment: any,
+    opts?: { groupId?: number; userId?: number }
+): Promise<string | undefined> {
+    if (!segment || String(segment?.type || "").toLowerCase() !== "file") return undefined;
+
+    const existing = normalizeOneBotMediaUrlCandidate(segment?.data?.url)
+        ?? normalizeOneBotMediaUrlCandidate(segment?.data?.file);
+    if (existing && /^https?:\/\//i.test(existing)) {
+        if (!segment.data?.url) segment.data.url = existing;
+        return existing;
+    }
+
+    const fileIdCandidate = segment?.data?.file_id ?? segment?.data?.fileUuid ?? segment?.data?.file_uuid;
+    const fileId = fileIdCandidate !== undefined && fileIdCandidate !== null ? String(fileIdCandidate).trim() : "";
+    if (!fileId) return existing;
+
+    if (opts?.groupId !== undefined) {
+        try {
+            const info = unwrapOneBotActionData(await (client as any).sendWithResponse("get_group_file_url", {
+                group_id: opts.groupId,
+                file_id: fileId,
+                ...(segment.data?.busid !== undefined ? { busid: segment.data.busid } : {}),
+            }));
+            const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
+            if (resolved) {
+                segment.data.url = resolved;
+                if (!segment.data.name && (info?.file_name || info?.name)) segment.data.name = info.file_name || info.name;
+                return resolved;
+            }
+        } catch (err) {
+            console.warn(`[QQ] Failed to resolve group file URL: ${String(err)}`);
+        }
+    }
+
+    try {
+        const info = unwrapOneBotActionData(await (client as any).sendWithResponse("get_private_file_url", {
+            file_id: fileId,
+            ...(opts?.userId !== undefined ? { user_id: opts.userId } : {}),
+        }));
+        const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
+        if (resolved) {
+            segment.data.url = resolved;
+            if (!segment.data.name && (info?.file_name || info?.name)) segment.data.name = info.file_name || info.name;
+            return resolved;
+        }
+    } catch (err) {
+        console.warn(`[QQ] Failed to resolve private file URL: ${String(err)}`);
+    }
+
+    return existing;
 }
 
 async function resolveOneBotImageUrl(client: OneBotClient, segment: any): Promise<string | undefined> {
@@ -774,7 +857,7 @@ async function resolveOneBotImageUrl(client: OneBotClient, segment: any): Promis
 async function hydrateOneBotMessageMedia(
     client: OneBotClient,
     message: OneBotMessage | string | undefined,
-    opts?: { groupId?: number }
+    opts?: { groupId?: number; userId?: number }
 ): Promise<void> {
     if (!Array.isArray(message)) return;
 
@@ -790,16 +873,8 @@ async function hydrateOneBotMessageMedia(
             if (resolved) segment.data.url = resolved;
             continue;
         }
-        if (segType === "file" && opts?.groupId !== undefined && !segment?.data?.url && segment?.data?.file_id) {
-            try {
-                const info = await (client as any).sendWithResponse("get_group_file_url", {
-                    group_id: opts.groupId,
-                    file_id: segment.data.file_id,
-                    busid: segment.data.busid,
-                });
-                const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
-                if (resolved) segment.data.url = resolved;
-            } catch { }
+        if (segType === "file" && !segment?.data?.url) {
+            await resolveOneBotFileUrl(client, segment, opts);
         }
     }
 }
@@ -807,23 +882,13 @@ async function hydrateOneBotMessageMedia(
 async function collectFileHintFromOneBotSegment(
     client: OneBotClient,
     segment: any,
-    opts?: { groupId?: number }
+    opts?: { groupId?: number; userId?: number }
 ): Promise<QQInboundAttachmentHint | null> {
     if (!segment || String(segment?.type || "").toLowerCase() !== "file") return null;
 
-    if (!segment.data?.url && opts?.groupId !== undefined && segment.data?.file_id) {
-        try {
-            const info = await (client as any).sendWithResponse("get_group_file_url", {
-                group_id: opts.groupId,
-                file_id: segment.data.file_id,
-                busid: segment.data.busid,
-            });
-            const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
-            if (resolved) segment.data.url = resolved;
-        } catch { }
-    }
+    if (!segment.data?.url) await resolveOneBotFileUrl(client, segment, opts);
 
-    const fileName = segment.data?.name || segment.data?.file || "未命名";
+    const fileName = segment.data?.name || segment.data?.file_name || segment.data?.file || "未命名";
     const fileId = segment.data?.file_id ? String(segment.data.file_id) : undefined;
     const busid = segment.data?.busid !== undefined ? String(segment.data.busid) : undefined;
     const fileUrl = typeof segment.data?.url === "string" ? segment.data.url : undefined;
@@ -1280,7 +1345,7 @@ function summarizeOneBotSegments(message: OneBotMessage | string | undefined, ma
                     ...(typeof seg.data?.url === "string" ? { url: seg.data.url } : {}),
                     ...(seg.data?.file_id ? { fileId: String(seg.data.file_id) } : {}),
                     ...(seg.data?.busid !== undefined ? { busid: String(seg.data.busid) } : {}),
-                    ...(typeof seg.data?.file_size === "number" ? { size: seg.data.file_size } : {}),
+                    ...(parseOneBotFileSize(seg.data?.file_size) !== undefined ? { size: parseOneBotFileSize(seg.data?.file_size)! } : {}),
                 });
             } else if (seg.type === "forward" && seg.data?.id) {
                 text += ` [转发:${seg.data.id}]`;
@@ -2129,30 +2194,46 @@ function getClientForAccount(accountId: string | undefined | null) {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isImageFile(url: string): boolean {
-    const lower = url.toLowerCase();
+    const lower = (toLocalPathIfAny(url) || url).split("?")[0].split("#")[0].toLowerCase();
+    const mime = inferGenericMimeType(url);
+    if (mime?.startsWith("image/")) return true;
     return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
 }
 
 function isAudioFile(url: string): boolean {
-    const lower = url.toLowerCase();
+    const lower = (toLocalPathIfAny(url) || url).split("?")[0].split("#")[0].toLowerCase();
+    const mime = inferGenericMimeType(url);
+    if (mime?.startsWith("audio/")) return true;
     return lower.endsWith('.wav') || lower.endsWith('.mp3') || lower.endsWith('.m4a') || lower.endsWith('.ogg') || lower.endsWith('.flac') || lower.endsWith('.aac');
 }
 
 function isVideoFile(url: string): boolean {
-    const lower = url.toLowerCase();
+    const lower = (toLocalPathIfAny(url) || url).split("?")[0].split("#")[0].toLowerCase();
+    const mime = inferGenericMimeType(url);
+    if (mime?.startsWith("video/")) return true;
     return lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".mkv") || lower.endsWith(".avi") || lower.endsWith(".webm") || lower.endsWith(".m4v");
 }
 
 type MediaKind = "image" | "audio" | "video" | "file";
 
 function detectMediaKind(...values: Array<string | undefined | null>): MediaKind {
+    let sawNonMediaFileExtension = false;
     for (const value of values) {
         if (!value) continue;
-        if (value.startsWith("base64://")) return "image";
         if (isImageFile(value)) return "image";
         if (isAudioFile(value)) return "audio";
         if (isVideoFile(value)) return "video";
+        if (/^data:image\//i.test(value)) return "image";
+        if (/^data:audio\//i.test(value)) return "audio";
+        if (/^data:video\//i.test(value)) return "video";
+        if (!/^base64:\/\//i.test(value)) {
+            const local = toLocalPathIfAny(value) || value;
+            const ext = path.extname(local.split("?")[0].split("#")[0]);
+            if (ext) sawNonMediaFileExtension = true;
+        }
     }
+    if (sawNonMediaFileExtension) return "file";
+    if (values.some((value) => typeof value === "string" && value.startsWith("base64://"))) return "image";
     return "file";
 }
 
@@ -2185,10 +2266,24 @@ function parseUserIdFromTarget(to: string): number | null {
 }
 
 function guessFileName(input: string): string {
+    try {
+        if (/^https?:\/\//i.test(input)) {
+            const parsed = new URL(input);
+            const fname = parsed.searchParams.get("fname") || parsed.searchParams.get("filename") || parsed.searchParams.get("name");
+            if (fname && fname.trim()) return path.basename(decodeURIComponent(fname.trim()));
+        }
+    } catch { }
     const local = toLocalPathIfAny(input);
     const name = path.basename(local || input.split("?")[0].split("#")[0]);
     if (!name || name === "." || name === "/") return `media_${Date.now()}.bin`;
     return name;
+}
+
+function sanitizeQQFileName(input: string | undefined | null, fallback = "file.bin"): string {
+    const raw = String(input || "").trim() || fallback;
+    const base = path.basename(raw.replace(/\\/g, "/"));
+    const cleaned = base.replace(/[\u0000-\u001f<>:"|?*]/g, "_").trim();
+    return cleaned || fallback;
 }
 
 async function stageLocalFileForContainer(localPath: string, hostSharedDir: string, containerSharedDir: string): Promise<string | null> {
@@ -2218,6 +2313,43 @@ async function uploadGroupFile(
     } catch (err) {
         return { ok: false, error: String(err) };
     }
+}
+
+async function uploadPrivateFile(
+    client: OneBotClient,
+    userId: number,
+    filePath: string,
+    fileName: string,
+): Promise<{ ok: boolean; data?: any; error?: string }> {
+    try {
+        const data = await (client as any).sendWithResponse("upload_private_file", {
+            user_id: userId,
+            file: filePath,
+            name: fileName,
+        }, 30000);
+        return { ok: true, data };
+    } catch (err) {
+        return { ok: false, error: String(err) };
+    }
+}
+
+async function uploadFileToTarget(
+    client: OneBotClient,
+    to: string,
+    filePath: string,
+    fileName: string,
+): Promise<{ ok: boolean; data?: any; error?: string; transport?: "upload_group_file" | "upload_private_file" }> {
+    const groupId = parseGroupIdFromTarget(to);
+    if (groupId) {
+        const result = await uploadGroupFile(client, groupId, filePath, fileName);
+        return { ...result, transport: "upload_group_file" };
+    }
+    const userId = parseUserIdFromTarget(to);
+    if (userId) {
+        const result = await uploadPrivateFile(client, userId, filePath, fileName);
+        return { ...result, transport: "upload_private_file" };
+    }
+    return { ok: false, error: `File upload unsupported for target: ${to}` };
 }
 
 async function findRecentAudioFallback(preferredExt?: string): Promise<string | null> {
@@ -2251,9 +2383,10 @@ async function findRecentAudioFallback(preferredExt?: string): Promise<string | 
     }
 }
 
-async function readLocalFileAsBase64(localPath: string): Promise<string> {
-    const data = await fs.readFile(localPath);
-    return `base64://${data.toString("base64")}`;
+async function readLocalFileAsBase64(localPath: string, readFile?: (filePath: string) => Promise<Buffer>): Promise<string> {
+    const data = readFile ? await readFile(localPath) : await fs.readFile(localPath);
+    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+    return `base64://${buffer.toString("base64")}`;
 }
 
 async function ensureFileInSharedMedia(localPath: string, hostSharedDir: string): Promise<string> {
@@ -2265,7 +2398,7 @@ async function ensureFileInSharedMedia(localPath: string, hostSharedDir: string)
     return baseName;
 }
 
-function toLocalPathIfAny(value: string): string | null {
+function toLocalPathIfAny(value: string, workspaceDir?: string): string | null {
     if (!value) return null;
     if (value.startsWith("file:")) {
         try {
@@ -2280,7 +2413,7 @@ function toLocalPathIfAny(value: string): string | null {
         value.startsWith("../") ||
         /^[A-Za-z]:[\\/]/.test(value)
     ) {
-        return path.isAbsolute(value) ? value : path.resolve(process.cwd(), value);
+        return path.isAbsolute(value) ? value : path.resolve(workspaceDir || process.cwd(), value);
     }
     return null;
 }
@@ -2472,18 +2605,18 @@ function processAntiRisk(text: string): string {
     return text.replace(/(https?:\/\/)/gi, "$1 ");
 }
 
-async function resolveMediaUrl(url: string): Promise<string> {
+async function resolveMediaUrl(url: string, opts?: { workspaceDir?: string; readFile?: (filePath: string) => Promise<Buffer> }): Promise<string> {
     if (url.startsWith("file:")) {
         try {
             const localPath = fileURLToPath(url);
-            return await readLocalFileAsBase64(localPath);
+            return await readLocalFileAsBase64(localPath, opts?.readFile);
         } catch (e) {
             const preferredExt = path.extname(url);
             const fallback = await findRecentAudioFallback(preferredExt);
             if (fallback) {
                 try {
                     console.warn(`[QQ] Local media missing, fallback to recent audio: ${fallback}`);
-                    return await readLocalFileAsBase64(fallback);
+                    return await readLocalFileAsBase64(fallback, opts?.readFile);
                 } catch { }
             }
             console.warn(`[QQ] Failed to convert local file to base64: ${e}`);
@@ -2498,8 +2631,8 @@ async function resolveMediaUrl(url: string): Promise<string> {
         /^[A-Za-z]:[\\/]/.test(url);
     if (looksLocalPath) {
         try {
-            const absolutePath = path.isAbsolute(url) ? url : path.resolve(process.cwd(), url);
-            return await readLocalFileAsBase64(absolutePath);
+            const absolutePath = path.isAbsolute(url) ? url : path.resolve(opts?.workspaceDir || process.cwd(), url);
+            return await readLocalFileAsBase64(absolutePath, opts?.readFile);
         } catch (e) {
             if (isAudioFile(url)) {
                 const preferredExt = path.extname(url);
@@ -2507,7 +2640,7 @@ async function resolveMediaUrl(url: string): Promise<string> {
                 if (fallback) {
                     try {
                         console.warn(`[QQ] Local audio path unavailable, fallback to ${fallback}`);
-                        return await readLocalFileAsBase64(fallback);
+                        return await readLocalFileAsBase64(fallback, opts?.readFile);
                     } catch { }
                 }
             }
@@ -2561,6 +2694,233 @@ async function sendOneBotMessageWithAck(client: OneBotClient, to: string, messag
     } catch (err) {
         return { ok: false, error: String(err) };
     }
+}
+
+function collectOutboundMediaItemsFromPayload(payload: any): QQOutboundMediaItem[] {
+    const items: QQOutboundMediaItem[] = [];
+    const push = (url: unknown, name?: unknown) => {
+        if (typeof url !== "string") return;
+        const trimmed = url.trim();
+        if (!trimmed) return;
+        items.push({ url: trimmed, ...(typeof name === "string" && name.trim() ? { name: name.trim() } : {}) });
+    };
+
+    if (Array.isArray(payload?.mediaUrls)) {
+        for (const url of payload.mediaUrls) push(url);
+    }
+    push(payload?.mediaUrl);
+
+    if (Array.isArray(payload?.files)) {
+        for (const file of payload.files) {
+            if (typeof file === "string") {
+                push(file);
+                continue;
+            }
+            if (!file || typeof file !== "object") continue;
+            push(
+                file.url ?? file.mediaUrl ?? file.localPath ?? file.path ?? file.filePath ?? file.file,
+                file.name ?? file.filename ?? file.fileName,
+            );
+        }
+    }
+
+    const unique: QQOutboundMediaItem[] = [];
+    const seen = new Set<string>();
+    for (const item of items) {
+        const key = `${item.url}|${item.name || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(item);
+    }
+    return unique;
+}
+
+function resolveOutboundReadFile(opts?: QQOutboundMediaOptions): ((filePath: string) => Promise<Buffer>) | undefined {
+    return opts?.mediaReadFile || opts?.mediaAccess?.readFile;
+}
+
+function resolveOutboundWorkspaceDir(opts?: QQOutboundMediaOptions): string | undefined {
+    const workspaceDir = opts?.mediaAccess?.workspaceDir;
+    return typeof workspaceDir === "string" && workspaceDir.trim() ? workspaceDir.trim() : undefined;
+}
+
+function getRuntimeCfgForAccount(accountId: string | undefined | null): Partial<QQConfig> {
+    const lookupId = normalizeAccountLookupId(accountId || DEFAULT_ACCOUNT_ID);
+    return (accountConfigs.get(lookupId)
+        || accountConfigs.get(normalizeAccountId(lookupId))
+        || accountConfigs.get(DEFAULT_ACCOUNT_ID)
+        || {}) as Partial<QQConfig>;
+}
+
+async function sendQQTextMessage(params: {
+    client: OneBotClient;
+    to: string;
+    text: string;
+    replyToId?: string | null;
+    delayBetweenChunksMs?: number;
+}): Promise<any> {
+    const normalizedText = await resolveInlineCqRecord(params.text || "");
+    if (!normalizedText.trim()) return null;
+    const chunks = splitMessage(normalizedText, 4000);
+    let lastAck: any = null;
+    for (let i = 0; i < chunks.length; i += 1) {
+        let message: OneBotMessage | string = chunks[i];
+        if (params.replyToId && i === 0) {
+            message = [{ type: "reply", data: { id: String(params.replyToId) } }, { type: "text", data: { text: chunks[i] } }];
+        }
+        const ack = await sendOneBotMessageWithAck(params.client, params.to, message);
+        if (!ack.ok) throw new Error(ack.error || "Failed to send text");
+        lastAck = ack.data;
+        if (chunks.length > 1) await sleep(params.delayBetweenChunksMs ?? 1000);
+    }
+    return lastAck;
+}
+
+async function buildUploadableMediaRef(params: {
+    mediaUrl: string;
+    localSourcePath?: string | null;
+    stagedSharedPath?: string | null;
+    workspaceDir?: string;
+    readFile?: (filePath: string) => Promise<Buffer>;
+}): Promise<string> {
+    if (params.stagedSharedPath) return params.stagedSharedPath;
+    const localPath = params.localSourcePath || toLocalPathIfAny(params.mediaUrl, params.workspaceDir);
+    if (localPath) return readLocalFileAsBase64(localPath, params.readFile);
+    return params.mediaUrl;
+}
+
+async function sendQQMediaMessage(params: {
+    client: OneBotClient;
+    to: string;
+    text?: string;
+    mediaUrl: string;
+    accountId?: string | null;
+    replyToId?: string | null;
+} & QQOutboundMediaOptions): Promise<any> {
+    const mediaUrl = String(params.mediaUrl || "").trim();
+    if (!mediaUrl) {
+        if (params.text?.trim()) {
+            const textAck = await sendQQTextMessage({ client: params.client, to: params.to, text: params.text, replyToId: params.replyToId });
+            return {
+                channel: "qq",
+                messageId: resolveOutboundMessageId(textAck),
+                timestamp: Date.now(),
+                meta: { textSent: Boolean(textAck), mediaSent: false },
+            };
+        }
+        throw new Error("mediaUrl is required");
+    }
+
+    const runtimeCfg = getRuntimeCfgForAccount(params.accountId || DEFAULT_ACCOUNT_ID);
+    const hostSharedDir = typeof runtimeCfg.sharedMediaHostDir === "string" ? runtimeCfg.sharedMediaHostDir.trim() : "";
+    const containerSharedDirRaw = typeof runtimeCfg.sharedMediaContainerDir === "string" ? runtimeCfg.sharedMediaContainerDir.trim() : "";
+    const containerSharedDir = containerSharedDirRaw || "/openclaw_media";
+    const workspaceDir = resolveOutboundWorkspaceDir(params);
+    const readFile = resolveOutboundReadFile(params);
+
+    const localSourcePath = toLocalPathIfAny(mediaUrl, workspaceDir);
+    let stagedSharedPath: string | null = null;
+    if (localSourcePath && hostSharedDir) {
+        stagedSharedPath = await stageLocalFileForContainer(localSourcePath, hostSharedDir, containerSharedDir);
+    }
+
+    const fileName = sanitizeQQFileName(params.fileNameHint || guessFileName(mediaUrl));
+    const sourceKind = params.forceDocument ? "file" : detectMediaKind(params.fileNameHint, mediaUrl);
+
+    let textAck: any = null;
+    if (params.text && params.text.trim()) {
+        textAck = await sendQQTextMessage({ client: params.client, to: params.to, text: params.text, replyToId: params.replyToId });
+    }
+
+    const uploadableFileRef = await buildUploadableMediaRef({
+        mediaUrl,
+        localSourcePath,
+        stagedSharedPath,
+        workspaceDir,
+        readFile,
+    });
+
+    const mediaMessage: OneBotMessage = [];
+    if (params.replyToId && !(params.text && params.text.trim())) mediaMessage.push({ type: "reply", data: { id: String(params.replyToId) } });
+
+    const mediaKind = sourceKind;
+    const audioLike = mediaKind === "audio";
+    const imageLike = mediaKind === "image";
+    const videoLike = mediaKind === "video";
+    const fileLike = mediaKind === "file" || params.forceDocument === true;
+
+    if (audioLike && textAck) {
+        const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
+        const delayMs = Number.isFinite(configuredDelay) ? Math.max(1200, configuredDelay) : 1200;
+        await sleep(delayMs);
+    }
+
+    if (fileLike) {
+        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
+        if (uploadAck.ok) {
+            return {
+                channel: "qq",
+                messageId: resolveOutboundMessageId(uploadAck.data, textAck),
+                timestamp: Date.now(),
+                meta: {
+                    textSent: Boolean(textAck),
+                    mediaSent: true,
+                    transport: uploadAck.transport || "file_segment",
+                    mediaKind: "file",
+                    fileName,
+                },
+            };
+        }
+        console.warn(`[QQ] file upload failed, falling back to file segment: ${uploadAck.error || "unknown"}`);
+        mediaMessage.push({ type: "file", data: { file: uploadableFileRef, name: fileName } });
+    } else if (imageLike) {
+        const imageFile = stagedSharedPath || await resolveMediaUrl(mediaUrl, { workspaceDir, readFile });
+        mediaMessage.push({ type: "image", data: { file: imageFile } });
+    } else if (audioLike) {
+        const recordFile = stagedSharedPath || await resolveMediaUrl(mediaUrl, { workspaceDir, readFile });
+        mediaMessage.push({ type: "record", data: { file: recordFile } });
+    } else if (videoLike) {
+        mediaMessage.push({ type: "video", data: { file: uploadableFileRef } });
+    } else {
+        mediaMessage.push({ type: "file", data: { file: uploadableFileRef, name: fileName } });
+    }
+
+    const mediaAck = await sendOneBotMessageWithAck(params.client, params.to, mediaMessage);
+    if (!mediaAck.ok) {
+        const primaryError = mediaAck.error || "unknown";
+        const errorClass = classifyMediaError(primaryError);
+        const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
+        if (uploadAck.ok) {
+            return {
+                channel: "qq",
+                messageId: resolveOutboundMessageId(uploadAck.data, textAck),
+                timestamp: Date.now(),
+                meta: {
+                    textSent: Boolean(textAck),
+                    mediaSent: true,
+                    fallbackSent: true,
+                    fallbackType: uploadAck.transport || "upload_file",
+                    mediaKind,
+                    fileName,
+                    errorClass,
+                    note: `Primary media path failed; fallback upload succeeded. reason=${primaryError}`,
+                },
+            };
+        }
+        throw new Error(`Media send failed: ${primaryError} [${errorClass}]`);
+    }
+
+    return {
+        channel: "qq",
+        messageId: resolveOutboundMessageId(mediaAck.data, textAck),
+        timestamp: Date.now(),
+        meta: {
+            textSent: Boolean(textAck),
+            mediaSent: true,
+            mediaKind,
+            fileName,
+        },
+    };
 }
 
 export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
@@ -3046,7 +3406,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 } catch (e) { }
                             } else if (seg.type === "file") {
-                                const fileHint = await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined });
+                                const fileHint = await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined, userId });
                                 rememberAttachmentHint(fileHints, fileHint);
                                 const shortHint = fileHint?.url
                                     ? ` [文件: ${fileHint.name}, 下载=${fileHint.url}]`
@@ -3445,6 +3805,7 @@ ${current}
                         try {
                             await hydrateOneBotMessageMedia(client, Array.isArray(repliedMsg.message) ? repliedMsg.message : undefined, {
                                 groupId: repliedMsg?.group_id ?? groupId,
+                                userId: repliedMsg?.user_id ?? userId,
                             });
                             const replyImageHints = extractImageHints(Array.isArray(repliedMsg.message) ? repliedMsg.message : repliedMsg.raw_message, 5);
                             for (const hint of replyImageHints) {
@@ -3460,7 +3821,7 @@ ${current}
                                 if (seg?.type === "file") {
                                     rememberAttachmentHint(
                                         fileHints,
-                                        await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined }),
+                                        await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined, userId }),
                                     );
                                 } else if (seg?.type === "video") {
                                     rememberAttachmentHint(fileHints, await collectVideoHintFromOneBotSegment(seg));
@@ -3835,8 +4196,9 @@ ${current}
                                 }
                             }
                         }
-                        if (payload.files) {
-                            if (Array.isArray(payload.files) && payload.files.length > 0) {
+                        const outboundMediaItems = collectOutboundMediaItemsFromPayload(payload);
+                        if (outboundMediaItems.length > 0) {
+                            if (outboundMediaItems.length > 0) {
                                 sawReplyContent = true;
                             }
                             const flushedUnknownText = await flushBufferedUnknownTexts("before_files");
@@ -3847,30 +4209,20 @@ ${current}
                                 const sentPrefix = await sendSessionSourcePrefixOnly();
                                 if (sentPrefix) deliveredAnything = true;
                             }
-                            for (const f of payload.files) {
+                            for (const f of outboundMediaItems) {
                                 if (currentRunState?.isStale()) return;
-                                if (f.url) {
-                                    const url = await resolveMediaUrl(f.url);
-                                    if (currentRunState?.isStale()) return;
-                                    if (isImageFile(url)) {
-                                        const imgMsg = `[CQ:image,file=${url}]`;
-                                        if (isGroup) client.sendGroupMsg(groupId, imgMsg);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, imgMsg);
-                                        else client.sendPrivateMsg(userId, imgMsg);
-                                    } else if (isAudioFile(url) || isAudioFile(f.url)) {
-                                        const audioMsg = `[CQ:record,file=${url}]`;
-                                        if (isGroup) client.sendGroupMsg(groupId, audioMsg);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, `[语音] ${url}`);
-                                        else client.sendPrivateMsg(userId, audioMsg);
-                                    } else {
-                                        const txtMsg = `[CQ:file,file=${url},name=${f.name || 'file'}]`;
-                                        if (isGroup) client.sendGroupMsg(groupId, txtMsg);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, `[文件] ${url}`);
-                                        else client.sendPrivateMsg(userId, txtMsg);
-                                    }
-                                    deliveredAnything = true;
-                                    if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
-                                }
+                                const result = await sendQQMediaMessage({
+                                    client,
+                                    to: deliveryTo,
+                                    mediaUrl: f.url,
+                                    fileNameHint: f.name,
+                                    accountId: account.accountId,
+                                    replyToId: payload.replyToId || undefined,
+                                    audioAsVoice: payload.audioAsVoice,
+                                });
+                                if (currentRunState?.isStale()) return;
+                                if (result) deliveredAnything = true;
+                                if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                             }
                         }
                     };
@@ -4285,200 +4637,68 @@ ${current}
         sendText: async ({ to, text, accountId, replyToId }) => {
             const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
             if (!client) throw new Error("QQ client not connected");
-            const normalizedText = await resolveInlineCqRecord(text);
-            const chunks = splitMessage(normalizedText, 4000);
-            let lastAck: any = null;
-            for (let i = 0; i < chunks.length; i++) {
-                let message: OneBotMessage | string = chunks[i];
-                if (replyToId && i === 0) message = [{ type: "reply", data: { id: String(replyToId) } }, { type: "text", data: { text: chunks[i] } }];
-                const ack = await sendOneBotMessageWithAck(client, to, message);
-                if (!ack.ok) {
-                    throw new Error(ack.error || "Failed to send text");
-                }
-                lastAck = ack.data;
-
-                if (chunks.length > 1) await sleep(1000);
-            }
+            const lastAck = await sendQQTextMessage({ client, to, text, replyToId });
             return {
                 channel: "qq",
                 messageId: resolveOutboundMessageId(lastAck),
                 timestamp: Date.now(),
             };
         },
-        sendMedia: async ({ to, text, mediaUrl, accountId, replyToId }) => {
+        sendMedia: async (ctx) => {
+            const { to, text, mediaUrl, accountId, replyToId } = ctx;
+            const extra = ctx as any;
             const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
             if (!client) throw new Error("QQ client not connected");
+            if (!mediaUrl) throw new Error("mediaUrl is required");
+            return await sendQQMediaMessage({
+                client,
+                to,
+                text,
+                mediaUrl,
+                accountId,
+                replyToId,
+                mediaAccess: extra.mediaAccess as QQOutboundMediaAccess | undefined,
+                mediaLocalRoots: extra.mediaLocalRoots,
+                mediaReadFile: extra.mediaReadFile,
+                forceDocument: extra.forceDocument,
+                audioAsVoice: extra.audioAsVoice,
+            });
+        },
+        sendPayload: async (ctx) => {
+            const { to, text, payload, accountId, replyToId } = ctx;
+            const extra = ctx as any;
+            const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
+            if (!client) throw new Error("QQ client not connected");
+            const mediaItems = collectOutboundMediaItemsFromPayload(payload);
+            const payloadText = typeof (payload as any)?.text === "string" ? (payload as any).text : text;
+            const effectiveReplyToId = (payload as any)?.replyToId || replyToId;
+            const effectiveAudioAsVoice = typeof (payload as any)?.audioAsVoice === "boolean" ? (payload as any).audioAsVoice : extra.audioAsVoice;
 
-            const runtimeCfg = (accountConfigs.get(accountId || DEFAULT_ACCOUNT_ID)
-                || accountConfigs.get(DEFAULT_ACCOUNT_ID)
-                || {}) as Partial<QQConfig>;
-
-            const hostSharedDir = typeof runtimeCfg.sharedMediaHostDir === "string" ? runtimeCfg.sharedMediaHostDir.trim() : "";
-            const containerSharedDirRaw = typeof runtimeCfg.sharedMediaContainerDir === "string" ? runtimeCfg.sharedMediaContainerDir.trim() : "";
-            const containerSharedDir = containerSharedDirRaw || "/openclaw_media";
-
-            const sourceKind = detectMediaKind(mediaUrl);
-            const groupId = parseGroupIdFromTarget(to);
-            const localSourcePath = toLocalPathIfAny(mediaUrl);
-            let stagedSharedPath: string | null = null;
-            if (localSourcePath && hostSharedDir) {
-                stagedSharedPath = await stageLocalFileForContainer(localSourcePath, hostSharedDir, containerSharedDir);
+            if (mediaItems.length === 0) {
+                const lastAck = await sendQQTextMessage({ client, to, text: payloadText || "", replyToId: effectiveReplyToId });
+                return { channel: "qq", messageId: resolveOutboundMessageId(lastAck), timestamp: Date.now() };
             }
 
-            const audioLikeSource = sourceKind === "audio";
-            let stagedAudioFile: string | null = null;
-            if (audioLikeSource && hostSharedDir) {
-                if (localSourcePath) {
-                    try {
-                        const copiedName = await ensureFileInSharedMedia(localSourcePath, hostSharedDir);
-                        stagedAudioFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                    } catch (err) {
-                        console.warn(`[QQ] Failed to stage source audio into shared media dir: ${String(err)}`);
-                    }
-                }
+            let lastResult: any = null;
+            for (let i = 0; i < mediaItems.length; i += 1) {
+                const item = mediaItems[i];
+                lastResult = await sendQQMediaMessage({
+                    client,
+                    to,
+                    text: i === 0 ? payloadText : "",
+                    mediaUrl: item.url,
+                    accountId,
+                    replyToId: effectiveReplyToId,
+                    mediaAccess: extra.mediaAccess as QQOutboundMediaAccess | undefined,
+                    mediaLocalRoots: extra.mediaLocalRoots,
+                    mediaReadFile: extra.mediaReadFile,
+                    fileNameHint: item.name,
+                    forceDocument: extra.forceDocument,
+                    audioAsVoice: effectiveAudioAsVoice,
+                });
+                if (i < mediaItems.length - 1) await sleep(1000);
             }
-            const finalUrl = sourceKind === "image" || sourceKind === "audio"
-                ? await resolveMediaUrl(mediaUrl)
-                : mediaUrl;
-
-            let textAck: any = null;
-            if (text && text.trim()) {
-                const textMessage: OneBotMessage = [];
-                if (replyToId) textMessage.push({ type: "reply", data: { id: String(replyToId) } });
-                textMessage.push({ type: "text", data: { text } });
-                const ack = await sendOneBotMessageWithAck(client, to, textMessage);
-                if (!ack.ok) {
-                    throw new Error(`Text send failed: ${ack.error || "unknown"}`);
-                }
-                textAck = ack.data;
-            }
-
-            const mediaMessage: OneBotMessage = [];
-            if (replyToId && !(text && text.trim())) mediaMessage.push({ type: "reply", data: { id: String(replyToId) } });
-            const mediaKind = detectMediaKind(mediaUrl, finalUrl);
-            const audioLike = mediaKind === "audio";
-            const imageLike = mediaKind === "image";
-            const videoLike = mediaKind === "video";
-            const fileLike = mediaKind === "file";
-
-            if (audioLike && textAck) {
-                const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
-                const delayMs = Number.isFinite(configuredDelay) ? Math.max(1200, configuredDelay) : 1200;
-                await sleep(delayMs);
-            }
-
-            if (imageLike) mediaMessage.push({ type: "image", data: { file: finalUrl } });
-            else if (audioLike) {
-                let recordFile = stagedAudioFile || finalUrl;
-                if (!finalUrl.startsWith("base64://") && hostSharedDir) {
-                    try {
-                        const localPath = finalUrl.startsWith("file:") ? fileURLToPath(finalUrl) : finalUrl;
-                        const copiedName = await ensureFileInSharedMedia(localPath, hostSharedDir);
-                        recordFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                    } catch (err) {
-                        console.warn(`[QQ] Failed to stage audio into shared media dir: ${String(err)}`);
-                    }
-                }
-                mediaMessage.push({ type: "record", data: { file: recordFile } });
-            }
-            else if (videoLike) {
-                const videoFile = stagedSharedPath || finalUrl;
-                mediaMessage.push({ type: "video", data: { file: videoFile } });
-            } else {
-                if (groupId && (stagedSharedPath || localSourcePath)) {
-                    const uploadPath = stagedSharedPath || localSourcePath!;
-                    const uploadName = guessFileName(mediaUrl);
-                    const uploadAck = await uploadGroupFile(client, groupId, uploadPath, uploadName);
-                    if (uploadAck.ok) {
-                        return {
-                            channel: "qq",
-                            messageId: resolveOutboundMessageId(textAck),
-                            timestamp: Date.now(),
-                            meta: {
-                                textSent: Boolean(textAck),
-                                mediaSent: true,
-                                transport: "upload_group_file",
-                                mediaKind: "file",
-                            },
-                        };
-                    }
-                    console.warn(`[QQ] upload_group_file failed (primary path): ${uploadAck.error || "unknown"}`);
-                }
-                mediaMessage.push({ type: "file", data: { file: stagedSharedPath || finalUrl, name: guessFileName(mediaUrl) } });
-            }
-
-            const mediaAck = await sendOneBotMessageWithAck(client, to, mediaMessage);
-            if (!mediaAck.ok) {
-                const primaryError = mediaAck.error || "unknown";
-                const errorClass = classifyMediaError(primaryError);
-                if ((videoLike || fileLike) && groupId && (stagedSharedPath || localSourcePath)) {
-                    const uploadPath = stagedSharedPath || localSourcePath!;
-                    const uploadName = guessFileName(mediaUrl);
-                    const uploadAck = await uploadGroupFile(client, groupId, uploadPath, uploadName);
-                    if (uploadAck.ok) {
-                        return {
-                            channel: "qq",
-                            messageId: resolveOutboundMessageId(textAck),
-                            timestamp: Date.now(),
-                            meta: {
-                                textSent: Boolean(textAck),
-                                mediaSent: true,
-                                fallbackSent: true,
-                                fallbackType: "upload_group_file",
-                                mediaKind: videoLike ? "video" : "file",
-                                errorClass,
-                                note: `Primary media path failed; fallback upload_group_file succeeded. reason=${primaryError}`,
-                            },
-                        };
-                    }
-                }
-                if (audioLike) {
-                    const fileFallback: OneBotMessage = [];
-                    if (replyToId && !(text && text.trim())) fileFallback.push({ type: "reply", data: { id: String(replyToId) } });
-                    let fallbackFile = stagedAudioFile || finalUrl;
-                    if (fallbackFile.startsWith("base64://")) {
-                        throw new Error(`Media send failed: ${primaryError} [${errorClass}]`);
-                    }
-                    if (!finalUrl.startsWith("base64://") && hostSharedDir) {
-                        try {
-                            const localPath = finalUrl.startsWith("file:") ? fileURLToPath(finalUrl) : finalUrl;
-                            const copiedName = await ensureFileInSharedMedia(localPath, hostSharedDir);
-                            fallbackFile = path.posix.join(containerSharedDir.replace(/\\/g, "/"), copiedName);
-                        } catch (err) {
-                            console.warn(`[QQ] Failed to stage fallback audio file into shared media dir: ${String(err)}`);
-                        }
-                    }
-                    fileFallback.push({ type: "file", data: { file: fallbackFile } });
-                    const fallbackAck = await sendOneBotMessageWithAck(client, to, fileFallback);
-                    if (fallbackAck.ok) {
-                        return {
-                            channel: "qq",
-                            messageId: resolveOutboundMessageId(fallbackAck.data, textAck),
-                            timestamp: Date.now(),
-                            meta: {
-                                textSent: Boolean(textAck),
-                                mediaSent: true,
-                                fallbackSent: true,
-                                fallbackType: "file",
-                                errorClass,
-                                mediaKind: "audio",
-                                note: `Audio(record) failed; fallback file sent. reason=${primaryError}`,
-                            },
-                        };
-                    }
-                }
-                throw new Error(`Media send failed: ${primaryError} [${errorClass}]`);
-            }
-            return {
-                channel: "qq",
-                messageId: resolveOutboundMessageId(mediaAck.data, textAck),
-                timestamp: Date.now(),
-                meta: {
-                    textSent: Boolean(textAck),
-                    mediaSent: true,
-                    mediaKind,
-                },
-            };
+            return lastResult || { channel: "qq", messageId: resolveOutboundMessageId(), timestamp: Date.now() };
         },
         // @ts-ignore
         deleteMessage: async ({ messageId, accountId }) => {
