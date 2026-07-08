@@ -106,6 +106,322 @@ type QQSetupInput = ChannelSetupInput & {
 
 const sessionQueues = new Map<string, SessionQueue>();
 
+type QQConversationContextKind = "group" | "guild" | "direct";
+type QQConversationContextSource = "user" | "bot" | "system";
+
+type QQConversationContextEntry = {
+    messageId?: string;
+    userId?: string;
+    senderName?: string;
+    source: QQConversationContextSource;
+    text: string;
+    timestampMs: number;
+    recalled?: boolean;
+    recalledAtMs?: number;
+    operatorId?: string;
+};
+
+const qqConversationContextCache = new Map<string, QQConversationContextEntry[]>();
+const QQ_CONVERSATION_CONTEXT_CACHE_LIMIT = 80;
+const QQ_CONVERSATION_CONTEXT_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+function normalizeQQContextId(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const text = String(value).trim();
+    return text ? text : undefined;
+}
+
+function normalizeQQContextTimestampMs(value: unknown): number {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed < 1000000000000 ? parsed * 1000 : parsed;
+    }
+    return Date.now();
+}
+
+function buildQQConversationContextKey(params: {
+    accountId: string;
+    kind: QQConversationContextKind;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+}): string | null {
+    const accountId = normalizeQQContextId(params.accountId) || DEFAULT_ACCOUNT_ID;
+    if (params.kind === "group") {
+        const groupId = normalizeQQContextId(params.groupId);
+        return groupId ? `${accountId}:group:${groupId}` : null;
+    }
+    if (params.kind === "guild") {
+        const guildId = normalizeQQContextId(params.guildId);
+        const channelId = normalizeQQContextId(params.channelId);
+        return guildId && channelId ? `${accountId}:guild:${guildId}:${channelId}` : null;
+    }
+    const userId = normalizeQQContextId(params.userId);
+    return userId ? `${accountId}:direct:${userId}` : null;
+}
+
+function getQQConversationKind(params: { isGroup?: boolean; isGuild?: boolean }): QQConversationContextKind {
+    if (params.isGroup) return "group";
+    if (params.isGuild) return "guild";
+    return "direct";
+}
+
+function compactQQContextText(value: unknown, maxChars = 700): string {
+    const cleaned = cleanCQCodes(String(value || ""))
+        .replace(/\s+/g, " ")
+        .trim();
+    return compactTextSnippet(cleaned, maxChars);
+}
+
+function pruneQQConversationContext(entries: QQConversationContextEntry[]): QQConversationContextEntry[] {
+    const cutoff = Date.now() - QQ_CONVERSATION_CONTEXT_CACHE_TTL_MS;
+    const recent = entries.filter((entry) => entry.timestampMs >= cutoff);
+    const source = recent.length > 0 ? recent : entries;
+    return source.slice(-QQ_CONVERSATION_CONTEXT_CACHE_LIMIT);
+}
+
+function rememberQQConversationMessage(params: {
+    accountId: string;
+    isGroup?: boolean;
+    isGuild?: boolean;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+    senderName?: unknown;
+    source?: QQConversationContextSource;
+    text?: unknown;
+    messageId?: unknown;
+    timestampMs?: unknown;
+    recalled?: boolean;
+    recalledAtMs?: unknown;
+    operatorId?: unknown;
+}): void {
+    const kind = getQQConversationKind(params);
+    const key = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind,
+        groupId: params.groupId,
+        guildId: params.guildId,
+        channelId: params.channelId,
+        userId: params.userId,
+    });
+    if (!key) return;
+
+    const text = compactQQContextText(params.text, 900);
+    if (!text) return;
+
+    const messageId = normalizeQQContextId(params.messageId);
+    const nextEntry: QQConversationContextEntry = {
+        ...(messageId ? { messageId } : {}),
+        ...(normalizeQQContextId(params.userId) ? { userId: normalizeQQContextId(params.userId) } : {}),
+        ...(normalizeQQContextId(params.senderName) ? { senderName: compactTextSnippet(String(params.senderName), 80) } : {}),
+        source: params.source || "user",
+        text,
+        timestampMs: normalizeQQContextTimestampMs(params.timestampMs),
+        ...(params.recalled ? { recalled: true } : {}),
+        ...(params.recalledAtMs ? { recalledAtMs: normalizeQQContextTimestampMs(params.recalledAtMs) } : {}),
+        ...(normalizeQQContextId(params.operatorId) ? { operatorId: normalizeQQContextId(params.operatorId) } : {}),
+    };
+
+    const entries = qqConversationContextCache.get(key) || [];
+    if (messageId) {
+        const existingIndex = entries.findIndex((entry) => entry.messageId === messageId);
+        if (existingIndex >= 0) {
+            const previous = entries[existingIndex]!;
+            entries[existingIndex] = {
+                ...previous,
+                ...nextEntry,
+                recalled: previous.recalled || nextEntry.recalled,
+                recalledAtMs: previous.recalledAtMs || nextEntry.recalledAtMs,
+                operatorId: nextEntry.operatorId || previous.operatorId,
+            };
+            qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+            return;
+        }
+    }
+
+    entries.push(nextEntry);
+    qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+}
+
+function isQQRecallNotice(event: any): boolean {
+    if (event?.post_type !== "notice") return false;
+    const noticeType = String(event?.notice_type ?? "").toLowerCase();
+    return [
+        "group_recall",
+        "friend_recall",
+        "message_recall",
+        "group_msg_recall",
+        "friend_msg_recall",
+    ].includes(noticeType);
+}
+
+function summarizeQQRecallNotice(event: any): string {
+    const noticeType = String(event?.notice_type ?? "");
+    const groupId = event?.group_id ?? "-";
+    const userId = event?.user_id ?? "-";
+    const operatorId = event?.operator_id ?? "-";
+    const messageId = event?.message_id ?? event?.msg_id ?? "-";
+    return `type=${noticeType} group=${groupId} user=${userId} operator=${operatorId} msg=${messageId}`;
+}
+
+function markQQConversationMessageRecalled(params: { accountId: string; event: any }): void {
+    const messageId = normalizeQQContextId(params.event?.message_id ?? params.event?.msg_id);
+    if (!messageId) return;
+
+    const noticeType = String(params.event?.notice_type ?? "").toLowerCase();
+    const isGroup = noticeType.includes("group") || params.event?.group_id !== undefined;
+    const isGuild = params.event?.guild_id !== undefined || params.event?.channel_id !== undefined;
+    const primaryKey = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind: getQQConversationKind({ isGroup, isGuild }),
+        groupId: params.event?.group_id,
+        guildId: params.event?.guild_id,
+        channelId: params.event?.channel_id,
+        userId: params.event?.user_id ?? params.event?.operator_id,
+    });
+    const candidateKeys = new Set<string>();
+    if (primaryKey) candidateKeys.add(primaryKey);
+    for (const [key, entries] of qqConversationContextCache.entries()) {
+        if (!key.startsWith(`${params.accountId}:`)) continue;
+        if (entries.some((entry) => entry.messageId === messageId)) candidateKeys.add(key);
+    }
+
+    const recalledAtMs = Date.now();
+    const operatorId = normalizeQQContextId(params.event?.operator_id);
+    let touched = false;
+    for (const key of candidateKeys) {
+        const entries = qqConversationContextCache.get(key);
+        if (!entries) continue;
+        let changed = false;
+        for (const entry of entries) {
+            if (entry.messageId !== messageId) continue;
+            entry.recalled = true;
+            entry.recalledAtMs = recalledAtMs;
+            if (operatorId) entry.operatorId = operatorId;
+            changed = true;
+            touched = true;
+        }
+        if (changed) qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+    }
+
+    if (!touched && primaryKey) {
+        rememberQQConversationMessage({
+            accountId: params.accountId,
+            isGroup,
+            isGuild,
+            groupId: params.event?.group_id,
+            guildId: params.event?.guild_id,
+            channelId: params.event?.channel_id,
+            userId: params.event?.user_id ?? params.event?.operator_id,
+            senderName: params.event?.user_id ? `QQ ${params.event.user_id}` : "unknown",
+            source: "user",
+            text: "（撤回消息，内容未缓存）",
+            messageId,
+            timestampMs: recalledAtMs,
+            recalled: true,
+            recalledAtMs,
+            operatorId,
+        });
+    }
+}
+
+function resolveQQConversationContextLimit(config: QQConfig): number {
+    const raw = Number((config as any).conversationContextLimit ?? 10);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.min(40, Math.floor(raw)));
+}
+
+function resolveQQConversationContextMaxChars(config: QQConfig): number {
+    const raw = Number((config as any).conversationContextMaxChars ?? 2400);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.min(10000, Math.floor(raw)));
+}
+
+function formatQQConversationContextTime(timestampMs: number): string {
+    const date = new Date(normalizeQQContextTimestampMs(timestampMs));
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+}
+
+function buildQQConversationContextBlock(params: {
+    accountId: string;
+    config: QQConfig;
+    isGroup: boolean;
+    isGuild: boolean;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+    currentMessageId?: unknown;
+}): string {
+    const limit = resolveQQConversationContextLimit(params.config);
+    const maxChars = resolveQQConversationContextMaxChars(params.config);
+    if (limit <= 0 || maxChars <= 0) return "";
+
+    const key = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind: getQQConversationKind(params),
+        groupId: params.groupId,
+        guildId: params.guildId,
+        channelId: params.channelId,
+        userId: params.userId,
+    });
+    if (!key) return "";
+
+    const currentMessageId = normalizeQQContextId(params.currentMessageId);
+    const includeRecalled = (params.config as any).includeRecalledMessagesInContext !== false;
+    const prunedEntries = pruneQQConversationContext(qqConversationContextCache.get(key) || []);
+    qqConversationContextCache.set(key, prunedEntries);
+    const entries = prunedEntries
+        .filter((entry) => !currentMessageId || entry.messageId !== currentMessageId)
+        .filter((entry) => includeRecalled || !entry.recalled);
+    if (entries.length === 0) return "";
+
+    const lines: string[] = [];
+    let totalChars = 0;
+    for (const entry of entries.slice(-limit).reverse()) {
+        const text = sanitizeGroupHistoryLineForModel(entry.text);
+        if (!text) continue;
+        const timePart = formatQQConversationContextTime(entry.timestampMs);
+        const msgPart = entry.messageId ? ` msg=${entry.messageId}` : "";
+        const recalledPart = entry.recalled ? " [已撤回]" : "";
+        const speaker = entry.source === "bot"
+            ? "机器人"
+            : `${compactTextSnippet(entry.senderName || "用户", 60)}${entry.userId ? `(${entry.userId})` : ""}`;
+        const line = `[${timePart}${msgPart}] ${speaker}${recalledPart}: ${text}`;
+        if (lines.length > 0 && totalChars + line.length + 1 > maxChars) break;
+        lines.unshift(line);
+        totalChars += line.length + 1;
+    }
+    if (lines.length === 0) return "";
+
+    return [
+        "<recent_qq_context>",
+        "同一 QQ 会话最近消息，当前用户消息未重复列出；[已撤回] 表示消息后来被撤回，但内容来自收到时的缓存。",
+        ...lines,
+        "</recent_qq_context>",
+        "",
+    ].join("\n");
+}
+
+function buildQQLanguageConsistencyBlock(currentText: string): string {
+    const text = normalizeInboundTextEntities(currentText || "");
+    const cjkCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
+    const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+    const preferredLanguage = cjkCount >= Math.max(2, latinCount) ? "中文" : latinCount > cjkCount ? "English" : "用户当前消息的主要语言";
+    return [
+        "<reply_language_policy>",
+        `优先使用${preferredLanguage}回复。`,
+        "保持整段回复语言一致；除非用户明确要求翻译、术语本身只能用英文，或代码/API/模型名必须保留原文，不要在中文和英文之间无故切换。",
+        "</reply_language_policy>",
+        "",
+    ].join("\n");
+}
+
 function resolveDispatchTimeoutMs(config: QQConfig): number {
     const configured = Number((config as any).dispatchTimeoutMs ?? 180000);
     if (!Number.isFinite(configured)) return 180000;
@@ -3403,6 +3719,14 @@ function resolveOutboundMessageId(...candidates: Array<unknown>): string {
     return `qq-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function extractOutboundMessageId(candidate: unknown): string | undefined {
+    if (!candidate || typeof candidate !== "object") return normalizeQQContextId(candidate);
+    const root = (candidate as any).data && typeof (candidate as any).data === "object"
+        ? (candidate as any).data
+        : candidate as any;
+    return normalizeQQContextId(root.message_id ?? root.messageId ?? root.msg_id ?? root.msgId);
+}
+
 function buildQQHiddenMetaBlock(params: {
     accountId: string;
     userId: number;
@@ -4066,6 +4390,18 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     label: "兼容旧表情 ID",
                     help: "当随机贴表情池为空时使用这个单个 emoji_id。",
                 },
+                conversationContextLimit: {
+                    label: "近期上下文条数",
+                    help: "默认 10。即使群聊开启每条消息独立会话，也会把同一群/私聊最近消息注入给模型；设 0 关闭。",
+                },
+                conversationContextMaxChars: {
+                    label: "近期上下文最大字符数",
+                    help: "默认 2400。过长会优先保留最新消息。",
+                },
+                includeRecalledMessagesInContext: {
+                    label: "保留撤回消息上下文",
+                    help: "默认开启。已收到并缓存的撤回消息会以 [已撤回] 标记继续作为上下文。",
+                },
                 queueDebounceMs: {
                     label: "同会话消息合并窗口（毫秒）",
                     help: "默认 0（关闭）。大于 0 时，短时间连续发来的多条消息会先合并再处理。",
@@ -4522,6 +4858,12 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         return;
                     }
 
+                    if (isQQRecallNotice(event)) {
+                        markQQConversationMessageRecalled({ accountId: account.accountId, event });
+                        console.log(`[QQ] recall notice ${summarizeQQRecallNotice(event)}`);
+                        return;
+                    }
+
                     if (event.post_type === "notice" && event.notice_type === "notify" && event.sub_type === "poke") {
                         if (String(event.target_id) === String(client.getSelfId())) {
                             event.post_type = "message";
@@ -4651,6 +4993,21 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
 
                     if (blockedUserIds.includes(userId)) return;
                     if (isGroup && allowedGroupIds.length && !allowedGroupIds.includes(groupId)) return;
+
+                    rememberQQConversationMessage({
+                        accountId: account.accountId,
+                        isGroup,
+                        isGuild,
+                        groupId,
+                        guildId,
+                        channelId,
+                        userId,
+                        senderName: event.sender?.card || event.sender?.nickname || event.sender?.user_id || userId,
+                        source: "user",
+                        text,
+                        messageId: event.message_id,
+                        timestampMs: event.time,
+                    });
 
                     const isAdmin = adminIds.includes(userId);
                     await ensureTempSessionSlotsLoaded();
@@ -5341,6 +5698,25 @@ ${current}
                         });
                     };
 
+                    const rememberBotConversationReply = (replyText: string, messageId?: unknown) => {
+                        const textForContext = compactQQContextText(replyText, 900);
+                        if (!textForContext) return;
+                        rememberQQConversationMessage({
+                            accountId: account.accountId,
+                            isGroup,
+                            isGuild,
+                            groupId,
+                            guildId,
+                            channelId,
+                            userId,
+                            senderName: "机器人",
+                            source: "bot",
+                            text: textForContext,
+                            messageId,
+                            timestampMs: Date.now(),
+                        });
+                    };
+
                     const sendSessionSourcePrefixOnly = async (): Promise<boolean> => {
                         const prefix = takeReplySessionSourcePrefix();
                         if (!prefix || currentRunState?.isStale()) return false;
@@ -5350,6 +5726,7 @@ ${current}
                             return false;
                         }
                         console.log(`[QQ] text delivered phase=session_source target=${deliveryTo}`);
+                        rememberBotConversationReply(prefix, extractOutboundMessageId(result.data));
                         maybeDispatchAutoReactAfterReply("session_source");
                         return true;
                     };
@@ -5402,6 +5779,7 @@ ${current}
                             if (currentRunState?.isStale()) return false;
                             if (sentAsForward) {
                                 console.log(`[QQ] merged-forward delivered phase=single_text len=${processed.length} threshold=${forwardThreshold} target=${deliveryTo}`);
+                                rememberBotConversationReply(processed);
                                 maybeDispatchAutoReactAfterReply("merged_forward_single_text");
                                 return true;
                             }
@@ -5419,6 +5797,7 @@ ${current}
                             }
                             sentAnything = true;
                             console.log(`[QQ] text delivered phase=plain chunk=${i + 1}/${chunks.length} len=${chunk.length} target=${deliveryTo}`);
+                            rememberBotConversationReply(chunk, extractOutboundMessageId(result.data));
                             maybeDispatchAutoReactAfterReply("plain_text");
 
                             if (!isGuild && config.enableTTS && i === 0 && chunk.length < 100) {
@@ -5453,6 +5832,7 @@ ${current}
                             if (currentRunState?.isStale()) return false;
                             if (sentAsForward) {
                                 console.log(`[QQ] merged-forward delivered phase=${meta.phaseLabel} blocks=${texts.length} len=${totalLen} threshold=${forwardThreshold} target=${deliveryTo}${meta.reason ? ` reason=${meta.reason}` : ""}`);
+                                rememberBotConversationReply(texts.join("\n"));
                                 maybeDispatchAutoReactAfterReply(`merged_forward_${meta.phaseLabel}`);
                                 return true;
                             }
@@ -5597,6 +5977,12 @@ ${current}
                                 if (currentRunState?.isStale()) return;
                                 if (result) {
                                     deliveredAnything = true;
+                                    const mediaSummary = [
+                                        f.kind ? `[${f.kind}]` : "[媒体]",
+                                        f.name || "",
+                                        f.url || "",
+                                    ].filter(Boolean).join(" ");
+                                    rememberBotConversationReply(mediaSummary, extractOutboundMessageId(result));
                                     maybeDispatchAutoReactAfterReply("media");
                                 }
                                 if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
@@ -5652,8 +6038,21 @@ ${current}
                         });
                     }
                     if (config.systemPrompt) systemBlock += `<system>${config.systemPrompt}</system>\n\n`;
+                    systemBlock += buildQQLanguageConsistencyBlock(bodyForAgentText);
                     if (linkContextBlock) systemBlock += linkContextBlock;
                     if (historyContext) systemBlock += `<history>\n${historyContext}\n</history>\n\n`;
+                    const recentConversationContextBlock = buildQQConversationContextBlock({
+                        accountId: account.accountId,
+                        config,
+                        isGroup,
+                        isGuild,
+                        groupId,
+                        guildId,
+                        channelId,
+                        userId,
+                        currentMessageId: event.message_id,
+                    });
+                    if (recentConversationContextBlock) systemBlock += recentConversationContextBlock;
                     if (config.debugLayerTrace) {
                         console.log(`[QQLayerTrace] invoke buildReplyForwardContextBlock enrich=${String(config.enrichReplyForwardContext)} debug=${String(config.debugLayerTrace)} hasReply=${String(Boolean(repliedMsg))}`);
                     }
