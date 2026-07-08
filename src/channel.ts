@@ -3777,7 +3777,7 @@ function resolveReplySessionSourceLabel(activeTempSlot: string | null): string {
 }
 
 function buildReplySessionSourcePrefix(activeTempSlot: string | null): string {
-    return `(from ${resolveReplySessionSourceLabel(activeTempSlot)})`;
+    return `（来自${resolveReplySessionSourceLabel(activeTempSlot)}）`;
 }
 
 function normalizeAssistantTextPhase(value: unknown): "commentary" | "final_answer" | undefined {
@@ -4162,6 +4162,12 @@ function getRuntimeCfgForAccount(accountId: string | undefined | null): Partial<
         || {}) as Partial<QQConfig>;
 }
 
+function resolveQQMessageFont(config: Partial<QQConfig> | undefined | null): number | undefined {
+    const raw = Number((config as any)?.messageFont ?? 0);
+    if (!Number.isFinite(raw) || raw <= 0) return undefined;
+    return Math.trunc(raw);
+}
+
 async function sendQQTextMessage(params: {
     client: OneBotClient;
     to: string;
@@ -4432,7 +4438,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 },
                 showReplySessionSource: {
                     label: "回复前标注来源会话",
-                    help: "默认开启。回复前会自动加上 `(from 主会话)` 或 `(from 会话xxx)`，特别适合用了 /会话 之后快速分辨当前回复来自哪个会话。",
+                    help: "默认开启。回复前会自动加上 `（来自主会话）` 或 `（来自会话xxx）`，特别适合用了 /会话 之后快速分辨当前回复来自哪个会话。",
+                },
+                messageFont: {
+                    label: "发送字体参数",
+                    help: "默认 0 表示不显式设置。若当前 OneBot/NapCat 支持 QQ font 数字参数，可填对应字体编号，群聊和私聊都会透传。",
                 },
                 keywordOnlyTrigger: {
                     label: "群聊仅关键词触发",
@@ -4548,6 +4558,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 wsUrl: account.config.wsUrl,
                 accessToken: account.config.accessToken,
             });
+            client.setDefaultSendOptions({ font: resolveQQMessageFont(account.config) });
 
             return new Promise((resolve) => {
                 const timer = setTimeout(() => {
@@ -4787,6 +4798,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 wsUrl: config.wsUrl,
                 accessToken: config.accessToken,
             });
+            client.setDefaultSendOptions({ font: resolveQQMessageFont(config) });
 
             const isStaleGeneration = () => accountStartGeneration.get(account.accountId) !== accountGen;
 

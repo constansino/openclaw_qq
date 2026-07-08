@@ -4,6 +4,10 @@ import type { OneBotEvent, OneBotMessage } from "./types.js";
 
 type OneBotTransportMode = "ws" | "http";
 
+type OneBotSendOptions = {
+  font?: number;
+};
+
 interface OneBotClientOptions {
   wsUrl?: string;
   httpUrl?: string;
@@ -24,6 +28,7 @@ export class OneBotClient extends EventEmitter {
   private lastMessageAt = 0;
   private transportMode: OneBotTransportMode;
   private connected = false;
+  private defaultSendOptions: OneBotSendOptions = {};
 
   constructor(options: OneBotClientOptions) {
     super();
@@ -44,6 +49,17 @@ export class OneBotClient extends EventEmitter {
 
   setSelfId(id: number) {
     this.selfId = id;
+  }
+
+  setDefaultSendOptions(options: OneBotSendOptions = {}) {
+    const font = Number(options.font);
+    this.defaultSendOptions = Number.isFinite(font) && font > 0
+      ? { font: Math.trunc(font) }
+      : {};
+  }
+
+  private withDefaultSendOptions(params: Record<string, any>): Record<string, any> {
+    return { ...this.defaultSendOptions, ...params };
   }
 
   emitEvent(payload: OneBotEvent) {
@@ -194,19 +210,19 @@ export class OneBotClient extends EventEmitter {
   }
 
   sendPrivateMsg(userId: number, message: OneBotMessage | string) {
-    this.send("send_private_msg", { user_id: userId, message });
+    this.send("send_private_msg", this.withDefaultSendOptions({ user_id: userId, message }));
   }
 
   async sendPrivateMsgAck(userId: number, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_private_msg", { user_id: userId, message }, 15000);
+    return this.sendWithResponse("send_private_msg", this.withDefaultSendOptions({ user_id: userId, message }), 15000);
   }
 
   sendGroupMsg(groupId: number, message: OneBotMessage | string) {
-    this.send("send_group_msg", { group_id: groupId, message });
+    this.send("send_group_msg", this.withDefaultSendOptions({ group_id: groupId, message }));
   }
 
   async sendGroupMsgAck(groupId: number, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_group_msg", { group_id: groupId, message }, 15000);
+    return this.sendWithResponse("send_group_msg", this.withDefaultSendOptions({ group_id: groupId, message }), 15000);
   }
 
   deleteMsg(messageId: number | string) {
@@ -295,11 +311,11 @@ export class OneBotClient extends EventEmitter {
 
   // --- Guild (Channel) Extension APIs ---
   sendGuildChannelMsg(guildId: string, channelId: string, message: OneBotMessage | string) {
-    this.send("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message });
+    this.send("send_guild_channel_msg", this.withDefaultSendOptions({ guild_id: guildId, channel_id: channelId, message }));
   }
 
   async sendGuildChannelMsgAck(guildId: string, channelId: string, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_guild_channel_msg", { guild_id: guildId, channel_id: channelId, message }, 15000);
+    return this.sendWithResponse("send_guild_channel_msg", this.withDefaultSendOptions({ guild_id: guildId, channel_id: channelId, message }), 15000);
   }
 
   async getGuildList(): Promise<any[]> {
