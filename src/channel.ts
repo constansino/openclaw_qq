@@ -4390,7 +4390,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 },
                 groupAutoReactEmojiIds: {
                     label: "随机贴表情池",
-                    help: "填写 NapCat/QQ 的 emoji_id 列表，用逗号或空格分隔；随机从中选择。",
+                    help: "填写 NapCat/QQ 的 emoji_id 列表，用逗号或空格分隔；默认使用当前 NapCat QQ 表情全集。",
                 },
                 groupAutoReactEmojiId: {
                     label: "兼容旧表情 ID",
