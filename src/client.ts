@@ -15,7 +15,7 @@ export class OneBotClient extends EventEmitter {
   private ws: WebSocket | null = null;
   private options: OneBotClientOptions;
   private reconnectAttempts = 0;
-  private maxReconnectDelay = 60000; // Max 1 minute delay
+  private maxReconnectDelay = 5000; // Keep OneBot reconnect gaps short after QQ/LLBot restarts.
   private selfId: number | null = null;
   private isAlive = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -225,7 +225,7 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_login_info", {});
   }
 
-  async getMsg(messageId: number | string): Promise<any> {
+  async getMsg(messageId: number | string, timeoutMs: number = 5000): Promise<any> {
     const raw = typeof messageId === "number" ? String(messageId) : String(messageId || "").trim();
     const tries: Array<Record<string, any>> = [{ message_id: raw }, { id: raw }];
     if (/^\d+$/.test(raw)) {
@@ -236,7 +236,7 @@ export class OneBotClient extends EventEmitter {
     let lastErr: unknown;
     for (const params of tries) {
       try {
-        return await this.sendWithResponse("get_msg", params);
+        return await this.sendWithResponse("get_msg", params, timeoutMs);
       } catch (err) {
         lastErr = err;
       }
@@ -245,26 +245,21 @@ export class OneBotClient extends EventEmitter {
   }
 
   // Note: get_group_msg_history is extended API supported by go-cqhttp/napcat
-  async getGroupMsgHistory(groupId: number): Promise<any> {
-    return this.sendWithResponse("get_group_msg_history", { group_id: groupId });
+  async getGroupMsgHistory(groupId: number, timeoutMs: number = 5000): Promise<any> {
+    return this.sendWithResponse("get_group_msg_history", { group_id: groupId }, timeoutMs);
   }
 
-  async getForwardMsg(id: string): Promise<any> {
+  async getForwardMsg(id: string, timeoutMs: number = 5000): Promise<any> {
     const raw = String(id || "").trim();
     const tries: Array<Record<string, any>> = [
       { id: raw },
       { message_id: raw },
       { forward_id: raw },
     ];
-    if (/^\d+$/.test(raw)) {
-      const n = Number.parseInt(raw, 10);
-      tries.unshift({ id: n });
-      tries.push({ message_id: n }, { forward_id: n });
-    }
     let lastErr: unknown;
     for (const params of tries) {
       try {
-        return await this.sendWithResponse("get_forward_msg", params);
+        return await this.sendWithResponse("get_forward_msg", params, timeoutMs);
       } catch (err) {
         lastErr = err;
       }
@@ -280,7 +275,7 @@ export class OneBotClient extends EventEmitter {
     return this.sendWithResponse("get_group_list", {});
   }
 
-  async getGroupInfo(groupId: number, noCache: boolean = true): Promise<any> {
+  async getGroupInfo(groupId: number, noCache: boolean = true, timeoutMs: number = 5000): Promise<any> {
     const tries = [
       { action: "get_group_info", params: { group_id: groupId, no_cache: noCache } },
       { action: "get_group_detail_info", params: { group_id: groupId } },
@@ -289,7 +284,7 @@ export class OneBotClient extends EventEmitter {
     let lastErr: unknown;
     for (const attempt of tries) {
       try {
-        return await this.sendWithResponse(attempt.action, attempt.params);
+        return await this.sendWithResponse(attempt.action, attempt.params, timeoutMs);
       } catch (err) {
         lastErr = err;
       }
@@ -361,6 +356,62 @@ export class OneBotClient extends EventEmitter {
     }
 
     throw lastErr ?? new Error("set_input_status failed");
+  }
+
+  async callAction(action: string, params: any = {}, timeoutMs: number = 5000): Promise<any> {
+    return this.sendWithResponse(action, params, timeoutMs);
+  }
+
+  async setMsgEmojiLike(
+    messageId: number | string,
+    emojiId: number | string,
+    set: boolean = true,
+    timeoutMs: number = 5000,
+  ): Promise<any> {
+    return this.sendWithResponse("set_msg_emoji_like", {
+      message_id: messageId,
+      emoji_id: emojiId,
+      set,
+      is_set: set,
+    }, timeoutMs);
+  }
+
+  async getMsgEmojiLikes(
+    messageId: number | string,
+    emojiId: number | string,
+    options: {
+      groupId?: number | string;
+      emojiType?: number | string;
+      count?: number | string;
+      cookie?: string;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<any> {
+    const timeoutMs = options.timeoutMs ?? 5000;
+    const emojiIdText = String(emojiId);
+    const emojiType = options.emojiType ?? (emojiIdText.length > 3 ? "2" : "1");
+    const count = options.count ?? 0;
+    const params: Record<string, any> = {
+      message_id: String(messageId),
+      emoji_id: emojiIdText,
+      emoji_type: String(emojiType),
+      count,
+    };
+    if (options.groupId !== undefined && options.groupId !== null && String(options.groupId).trim()) {
+      params.group_id = String(options.groupId);
+    }
+
+    try {
+      return await this.sendWithResponse("get_emoji_likes", params, timeoutMs);
+    } catch (err) {
+      return this.sendWithResponse("fetch_emoji_like", {
+        message_id: messageId,
+        emojiId: emojiIdText,
+        emojiType: String(emojiType),
+        count: count || 20,
+        cookie: options.cookie ?? "",
+      }, timeoutMs);
+    }
   }
 
   private sendWithResponse(action: string, params: any, timeoutMs: number = 5000): Promise<any> {
