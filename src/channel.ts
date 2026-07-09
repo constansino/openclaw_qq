@@ -3858,6 +3858,12 @@ function normalizeQQVisibleText(input: string): string {
     return text.trim();
 }
 
+function isQQStickerLikeRequestText(input: string | undefined | null): boolean {
+    const text = cleanCQCodes(String(input || "")).toLowerCase();
+    if (!text.trim()) return false;
+    return /(?:表情包|发表情|发个表情|来个表情|斗图|梗图|动图|gif|sticker|stickers|meme|memes|reaction\s*image)/i.test(text);
+}
+
 async function sendLongTextAsForwardMessage(params: {
     client: OneBotClient;
     groupId?: number;
@@ -5260,7 +5266,7 @@ ${current}
                             const dynamicModelCatalogEnabled = config.enableDynamicModelCatalog === true;
                             console.log(`[QQCMD] local model catalog user=${userId} group=${groupId ?? "-"} dynamic=${String(dynamicModelCatalogEnabled)}`);
                             const catalog = await buildModelCatalogText(dynamicModelCatalogEnabled);
-                            if (!isGuild) {
+                            if (!isGuild && !isGroup) {
                                 const sentAsForward = await sendLongTextAsForwardMessage({
                                     client,
                                     groupId: isGroup ? groupId : undefined,
@@ -5670,7 +5676,7 @@ ${current}
                     let currentRunState: { isStale: () => boolean } | null = null;
                     let autoReactDispatched = false;
                     const forwardThreshold = Number(config.forwardLongReplyThreshold ?? 0);
-                    const canUseMergedForward = !isGuild && Number.isFinite(forwardThreshold) && forwardThreshold > 0;
+                    const canUseMergedForward = !isGuild && !isGroup && Number.isFinite(forwardThreshold) && forwardThreshold > 0;
                     const unknownBlockBoundaryThreshold = Number.isFinite(forwardThreshold) && forwardThreshold > 0 ? forwardThreshold : 300;
                     const unknownBlockMergeWindowMs = 350;
                     const bufferedFinalTexts: string[] = [];
@@ -6221,9 +6227,13 @@ ${current}
                                 normalizeModelConfig((cfg as any).agents?.defaults?.model) ||
                                 { primary: "", fallbacks: [] as string[] };
                             const mergedHasInboundImage = hasInboundImageLikeContent(mergedCtx);
-                            const shouldUseClaudeForInboundMedia = mergedHasInboundImage;
-                            const mediaModelOverride = shouldUseClaudeForInboundMedia ? "agentrouter-completions/claude-opus-4-8" : "";
-                            const mediaModelFallbacks = shouldUseClaudeForInboundMedia ? ["agentrouter-completions/claude-opus-4-6"] : [];
+                            const shouldUseClaudeForStickerLikeRequest =
+                                isQQStickerLikeRequestText(text) ||
+                                isQQStickerLikeRequestText(cleanedUserBody) ||
+                                isQQStickerLikeRequestText(bodyForAgentText);
+                            const shouldUseClaudeForMediaRoute = mergedHasInboundImage || shouldUseClaudeForStickerLikeRequest;
+                            const mediaModelOverride = shouldUseClaudeForMediaRoute ? "agentrouter-completions/claude-opus-4-8" : "";
+                            const mediaModelFallbacks = shouldUseClaudeForMediaRoute ? ["agentrouter-completions/claude-opus-4-6"] : [];
                             const effectiveModelConfig = mediaModelOverride
                                 ? {
                                     primary: mediaModelOverride,
@@ -6232,7 +6242,7 @@ ${current}
                                 : rawModelConfig;
                             const fallbacks = effectiveModelConfig.fallbacks;
                             if (mediaModelOverride) {
-                                console.log(`[QQ] inbound image/media detected; primary model override=${mediaModelOverride} currentNonText=${String(hasCurrentInboundNonTextContent)} mergedImage=${String(mergedHasInboundImage)} fallbacks=${fallbacks.join(",") || "-"}`);
+                                console.log(`[QQ] media/sticker route detected; primary model override=${mediaModelOverride} currentNonText=${String(hasCurrentInboundNonTextContent)} mergedImage=${String(mergedHasInboundImage)} stickerRequest=${String(shouldUseClaudeForStickerLikeRequest)} fallbacks=${fallbacks.join(",") || "-"}`);
                             }
 
                             const modelsToTry: Array<string | null> = [null];
@@ -6537,7 +6547,10 @@ ${current}
                     forceDocument: extra.forceDocument,
                     audioAsVoice: effectiveAudioAsVoice,
                 });
-                if (i < mediaItems.length - 1) await sleep(1000);
+                if (i < mediaItems.length - 1) {
+                    const pacingMs = Number(getRuntimeCfgForAccount(accountId || DEFAULT_ACCOUNT_ID).rateLimitMs ?? 200);
+                    if (Number.isFinite(pacingMs) && pacingMs > 0) await sleep(Math.min(Math.floor(pacingMs), 800));
+                }
             }
             return lastResult || { channel: "qq", messageId: resolveOutboundMessageId(), timestamp: Date.now() };
         },

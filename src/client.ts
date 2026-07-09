@@ -218,11 +218,17 @@ export class OneBotClient extends EventEmitter {
   }
 
   sendGroupMsg(groupId: number, message: OneBotMessage | string) {
-    this.send("send_group_msg", this.withDefaultSendOptions({ group_id: groupId, message }));
+    this.send("send_msg", this.withDefaultSendOptions({ message_type: "group", group_id: groupId, message }));
   }
 
   async sendGroupMsgAck(groupId: number, message: OneBotMessage | string): Promise<any> {
-    return this.sendWithResponse("send_group_msg", this.withDefaultSendOptions({ group_id: groupId, message }), 15000);
+    const unifiedParams = this.withDefaultSendOptions({ message_type: "group", group_id: groupId, message });
+    try {
+      return await this.sendWithResponse("send_msg", unifiedParams, 15000);
+    } catch (err) {
+      const legacyParams = this.withDefaultSendOptions({ group_id: groupId, message });
+      return this.sendWithResponse("send_group_msg", legacyParams, 15000);
+    }
   }
 
   deleteMsg(messageId: number | string) {
