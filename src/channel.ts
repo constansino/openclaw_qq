@@ -409,14 +409,28 @@ function buildQQConversationContextBlock(params: {
 }
 
 function buildQQLanguageConsistencyBlock(currentText: string): string {
-    const text = normalizeInboundTextEntities(currentText || "");
-    const cjkCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
+    const text = normalizeInboundTextEntities(currentText || "")
+        .replace(/\[CQ:[^\]]+\]/g, " ")
+        .replace(/https?:\/\/\S+/gi, " ")
+        .replace(/`{1,3}[\s\S]*?`{1,3}/g, " ")
+        .replace(/\/[A-Za-z][\w-]*/g, " ");
+    const hanCount = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length;
+    const kanaCount = (text.match(/[\u3040-\u30ff]/g) || []).length;
+    const hangulCount = (text.match(/[\uac00-\ud7af]/g) || []).length;
+    const cyrillicCount = (text.match(/[\u0400-\u04ff]/g) || []).length;
     const latinCount = (text.match(/[A-Za-z]/g) || []).length;
-    const preferredLanguage = cjkCount >= Math.max(2, latinCount) ? "中文" : latinCount > cjkCount ? "English" : "用户当前消息的主要语言";
+    const preferredLanguage =
+        kanaCount >= 2 ? "日文" :
+        hangulCount >= 2 ? "韩文" :
+        hanCount >= 1 ? "中文" :
+        cyrillicCount >= 2 ? "俄文" :
+        latinCount >= 2 ? "English" :
+        "用户当前消息的主要语言";
     return [
         "<reply_language_policy>",
-        `优先使用${preferredLanguage}回复。`,
-        "保持整段回复语言一致；除非用户明确要求翻译、术语本身只能用英文，或代码/API/模型名必须保留原文，不要在中文和英文之间无故切换。",
+        `必须使用${preferredLanguage}回复当前这条消息。`,
+        "保持整段回复的主要语言和用户当前输入一致；不要因为历史上下文、工具输出、网页内容、模型名、API 名或英文术语而切换主要回复语言。",
+        "只有用户明确要求翻译/改用另一种语言，或引用代码、命令、接口名、模型名、专有名词时，才保留原文。",
         "</reply_language_policy>",
         "",
     ].join("\n");
