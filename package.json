@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/qq",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "OpenClaw QQ channel plugin via OneBot v11",
   "openclaw": {
@@ -13,7 +13,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "openclaw": "*",
+    "openclaw": "2026.7.1-2",
     "typescript": "^5.9.3"
   }
 }
