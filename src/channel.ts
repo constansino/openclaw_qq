@@ -13,7 +13,7 @@ import {
     type ChannelSetupInput,
     type OpenClawConfig,
     type ReplyPayload,
-} from "openclaw/plugin-sdk";
+} from "openclaw/plugin-sdk/core";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { OneBotClient } from "./client.js";
 import { MilkyClient } from "./milky-client.js";
