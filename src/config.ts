@@ -64,8 +64,13 @@ const KeywordTriggersSchema = z.preprocess((value) => {
 }, z.string().optional().default(""));
 
 export const QQConfigSchema = z.object({
-  wsUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url()).describe("OneBot WebSocket 地址。示例：ws://127.0.0.1:3001"),
-  accessToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("OneBot 访问令牌（Token）。需与 NapCat/OneBot 配置一致。"),
+  protocol: z.preprocess(
+    (value) => normalizeLooseString(value)?.toLowerCase(),
+    z.enum(["onebot", "milky"]).optional().default("onebot")
+  ).describe("连接协议。onebot=OneBot v11 WebSocket（默认）；milky=Milky 协议（HTTP API + WebSocket 事件）。"),
+  wsUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url().optional()).describe("OneBot WebSocket 地址（protocol=onebot 时使用）。示例：ws://127.0.0.1:3001"),
+  milkyUrl: z.preprocess((value) => normalizeLooseString(value), z.string().url().optional()).describe("Milky 协议 HTTP 基础 URL（protocol=milky 时使用）。示例：http://127.0.0.1:6727"),
+  accessToken: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("访问令牌（Token）。需与 NapCat/Milky 配置一致。"),
   admins: IdListStringSchema.describe("管理员QQ号（字符串）。Web表单直接填：10000001,123456789；Raw JSON 填：\"10000001,123456789\"。"),
   requireMention: BooleanInputSchema(true).describe("群聊触发门槛（含命令）。true=仅在被@/回复机器人/命中关键词时触发；若同时开启 keywordOnlyTrigger，则群聊只认关键词。false=群内普通消息与命令都可能触发（容易被刷，谨慎关闭）。"),
   systemPrompt: z.preprocess((value) => normalizeLooseString(value), z.string().optional()).describe("系统提示词。示例：你是一个高效、礼貌的助理。"),
