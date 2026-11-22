@@ -3821,6 +3821,8 @@ function resolveReplyPayloadPhase(payload: any): "commentary" | "final_answer" |
 function isInternalNoticeLine(line: string): boolean {
     const text = line.trim();
     if (!text) return false;
+    // OpenClaw diagnostics do not change the retained thinking preference.
+    if (/^Thinking level clamped to \S+ for \S+\/\S+ \(requested \S+; preference retained\)\.?$/i.test(text)) return true;
     if (/^↪️?\s*Model Fallback:/i.test(text)) return true;
     if (/Model Fallback:/i.test(text) && /selected model unavailable/i.test(text)) return true;
     if (/当前服务无响应.*备用线路/.test(text)) return true;
@@ -5950,10 +5952,7 @@ ${current}
                         }
                         if (payload.text && payload.text.trim()) {
                             const cleanedText = stripInternalNoticeText(payload.text);
-                            if (!cleanedText.trim()) {
-                                return;
-                            }
-                            const processed = await prepareOutgoingText(cleanedText);
+                            const processed = cleanedText.trim() ? await prepareOutgoingText(cleanedText) : "";
                             if (currentRunState?.isStale()) return;
                             if (processed.trim()) {
                                 sawReplyContent = true;
