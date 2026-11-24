@@ -18,6 +18,7 @@ import {
     migrateBaseNameToDefaultAccount,
 } from "openclaw/plugin-sdk";
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
+import { jsonResult } from "openclaw/plugin-sdk/channel-actions";
 import { OneBotClient } from "./client.js";
 import { QQConfigSchema, type QQConfig } from "./config.js";
 import { getQQRuntime } from "./runtime.js";
@@ -31,7 +32,7 @@ export type ResolvedQQAccount = ChannelAccountSnapshot & {
 interface PendingQQMsg {
     ctxPayload: any;
     runEpoch: number;
-    executeDispatch: (mergedCtx: any, runState: { isStale: () => boolean }) => Promise<void>;
+    executeDispatch: (mergedCtx: any, runState: { isStale: () => boolean }, abortSignal?: AbortSignal) => Promise<void>;
 }
 
 interface SessionQueue {
@@ -68,6 +69,7 @@ type QQInboundAttachmentHint = {
 type QQOutboundMediaItem = {
     url: string;
     name?: string;
+    kind?: "image" | "audio" | "video" | "file";
 };
 
 type QQOutboundMediaAccess = {
@@ -80,8 +82,22 @@ type QQOutboundMediaOptions = {
     mediaReadFile?: (filePath: string) => Promise<Buffer>;
     mediaLocalRoots?: readonly string[] | "any";
     fileNameHint?: string;
+    mediaKindHint?: "image" | "audio" | "video" | "file";
     forceDocument?: boolean;
     audioAsVoice?: boolean;
+};
+
+type QQInboundLinkPreview = {
+    url: string;
+    finalUrl?: string;
+    host?: string;
+    title?: string;
+    description?: string;
+    siteName?: string;
+    text?: string;
+    contentType?: string;
+    status?: number;
+    error?: string;
 };
 
 type QQSetupInput = ChannelSetupInput & {
@@ -89,6 +105,342 @@ type QQSetupInput = ChannelSetupInput & {
 };
 
 const sessionQueues = new Map<string, SessionQueue>();
+
+type QQConversationContextKind = "group" | "guild" | "direct";
+type QQConversationContextSource = "user" | "bot" | "system";
+
+type QQConversationContextEntry = {
+    messageId?: string;
+    userId?: string;
+    senderName?: string;
+    source: QQConversationContextSource;
+    text: string;
+    timestampMs: number;
+    recalled?: boolean;
+    recalledAtMs?: number;
+    operatorId?: string;
+};
+
+const qqConversationContextCache = new Map<string, QQConversationContextEntry[]>();
+const QQ_CONVERSATION_CONTEXT_CACHE_LIMIT = 80;
+const QQ_CONVERSATION_CONTEXT_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+function normalizeQQContextId(value: unknown): string | undefined {
+    if (value === undefined || value === null) return undefined;
+    const text = String(value).trim();
+    return text ? text : undefined;
+}
+
+function normalizeQQContextTimestampMs(value: unknown): number {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed < 1000000000000 ? parsed * 1000 : parsed;
+    }
+    return Date.now();
+}
+
+function buildQQConversationContextKey(params: {
+    accountId: string;
+    kind: QQConversationContextKind;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+}): string | null {
+    const accountId = normalizeQQContextId(params.accountId) || DEFAULT_ACCOUNT_ID;
+    if (params.kind === "group") {
+        const groupId = normalizeQQContextId(params.groupId);
+        return groupId ? `${accountId}:group:${groupId}` : null;
+    }
+    if (params.kind === "guild") {
+        const guildId = normalizeQQContextId(params.guildId);
+        const channelId = normalizeQQContextId(params.channelId);
+        return guildId && channelId ? `${accountId}:guild:${guildId}:${channelId}` : null;
+    }
+    const userId = normalizeQQContextId(params.userId);
+    return userId ? `${accountId}:direct:${userId}` : null;
+}
+
+function getQQConversationKind(params: { isGroup?: boolean; isGuild?: boolean }): QQConversationContextKind {
+    if (params.isGroup) return "group";
+    if (params.isGuild) return "guild";
+    return "direct";
+}
+
+function compactQQContextText(value: unknown, maxChars = 700): string {
+    const cleaned = cleanCQCodes(String(value || ""))
+        .replace(/\s+/g, " ")
+        .trim();
+    return compactTextSnippet(cleaned, maxChars);
+}
+
+function pruneQQConversationContext(entries: QQConversationContextEntry[]): QQConversationContextEntry[] {
+    const cutoff = Date.now() - QQ_CONVERSATION_CONTEXT_CACHE_TTL_MS;
+    const recent = entries.filter((entry) => entry.timestampMs >= cutoff);
+    const source = recent.length > 0 ? recent : entries;
+    return source.slice(-QQ_CONVERSATION_CONTEXT_CACHE_LIMIT);
+}
+
+function rememberQQConversationMessage(params: {
+    accountId: string;
+    isGroup?: boolean;
+    isGuild?: boolean;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+    senderName?: unknown;
+    source?: QQConversationContextSource;
+    text?: unknown;
+    messageId?: unknown;
+    timestampMs?: unknown;
+    recalled?: boolean;
+    recalledAtMs?: unknown;
+    operatorId?: unknown;
+}): void {
+    const kind = getQQConversationKind(params);
+    const key = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind,
+        groupId: params.groupId,
+        guildId: params.guildId,
+        channelId: params.channelId,
+        userId: params.userId,
+    });
+    if (!key) return;
+
+    const text = compactQQContextText(params.text, 900);
+    if (!text) return;
+
+    const messageId = normalizeQQContextId(params.messageId);
+    const nextEntry: QQConversationContextEntry = {
+        ...(messageId ? { messageId } : {}),
+        ...(normalizeQQContextId(params.userId) ? { userId: normalizeQQContextId(params.userId) } : {}),
+        ...(normalizeQQContextId(params.senderName) ? { senderName: compactTextSnippet(String(params.senderName), 80) } : {}),
+        source: params.source || "user",
+        text,
+        timestampMs: normalizeQQContextTimestampMs(params.timestampMs),
+        ...(params.recalled ? { recalled: true } : {}),
+        ...(params.recalledAtMs ? { recalledAtMs: normalizeQQContextTimestampMs(params.recalledAtMs) } : {}),
+        ...(normalizeQQContextId(params.operatorId) ? { operatorId: normalizeQQContextId(params.operatorId) } : {}),
+    };
+
+    const entries = qqConversationContextCache.get(key) || [];
+    if (messageId) {
+        const existingIndex = entries.findIndex((entry) => entry.messageId === messageId);
+        if (existingIndex >= 0) {
+            const previous = entries[existingIndex]!;
+            entries[existingIndex] = {
+                ...previous,
+                ...nextEntry,
+                recalled: previous.recalled || nextEntry.recalled,
+                recalledAtMs: previous.recalledAtMs || nextEntry.recalledAtMs,
+                operatorId: nextEntry.operatorId || previous.operatorId,
+            };
+            qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+            return;
+        }
+    }
+
+    entries.push(nextEntry);
+    qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+}
+
+function isQQRecallNotice(event: any): boolean {
+    if (event?.post_type !== "notice") return false;
+    const noticeType = String(event?.notice_type ?? "").toLowerCase();
+    return [
+        "group_recall",
+        "friend_recall",
+        "message_recall",
+        "group_msg_recall",
+        "friend_msg_recall",
+    ].includes(noticeType);
+}
+
+function summarizeQQRecallNotice(event: any): string {
+    const noticeType = String(event?.notice_type ?? "");
+    const groupId = event?.group_id ?? "-";
+    const userId = event?.user_id ?? "-";
+    const operatorId = event?.operator_id ?? "-";
+    const messageId = event?.message_id ?? event?.msg_id ?? "-";
+    return `type=${noticeType} group=${groupId} user=${userId} operator=${operatorId} msg=${messageId}`;
+}
+
+function markQQConversationMessageRecalled(params: { accountId: string; event: any }): void {
+    const messageId = normalizeQQContextId(params.event?.message_id ?? params.event?.msg_id);
+    if (!messageId) return;
+
+    const noticeType = String(params.event?.notice_type ?? "").toLowerCase();
+    const isGroup = noticeType.includes("group") || params.event?.group_id !== undefined;
+    const isGuild = params.event?.guild_id !== undefined || params.event?.channel_id !== undefined;
+    const primaryKey = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind: getQQConversationKind({ isGroup, isGuild }),
+        groupId: params.event?.group_id,
+        guildId: params.event?.guild_id,
+        channelId: params.event?.channel_id,
+        userId: params.event?.user_id ?? params.event?.operator_id,
+    });
+    const candidateKeys = new Set<string>();
+    if (primaryKey) candidateKeys.add(primaryKey);
+    for (const [key, entries] of qqConversationContextCache.entries()) {
+        if (!key.startsWith(`${params.accountId}:`)) continue;
+        if (entries.some((entry) => entry.messageId === messageId)) candidateKeys.add(key);
+    }
+
+    const recalledAtMs = Date.now();
+    const operatorId = normalizeQQContextId(params.event?.operator_id);
+    let touched = false;
+    for (const key of candidateKeys) {
+        const entries = qqConversationContextCache.get(key);
+        if (!entries) continue;
+        let changed = false;
+        for (const entry of entries) {
+            if (entry.messageId !== messageId) continue;
+            entry.recalled = true;
+            entry.recalledAtMs = recalledAtMs;
+            if (operatorId) entry.operatorId = operatorId;
+            changed = true;
+            touched = true;
+        }
+        if (changed) qqConversationContextCache.set(key, pruneQQConversationContext(entries));
+    }
+
+    if (!touched && primaryKey) {
+        rememberQQConversationMessage({
+            accountId: params.accountId,
+            isGroup,
+            isGuild,
+            groupId: params.event?.group_id,
+            guildId: params.event?.guild_id,
+            channelId: params.event?.channel_id,
+            userId: params.event?.user_id ?? params.event?.operator_id,
+            senderName: params.event?.user_id ? `QQ ${params.event.user_id}` : "unknown",
+            source: "user",
+            text: "（撤回消息，内容未缓存）",
+            messageId,
+            timestampMs: recalledAtMs,
+            recalled: true,
+            recalledAtMs,
+            operatorId,
+        });
+    }
+}
+
+function resolveQQConversationContextLimit(config: QQConfig): number {
+    const raw = Number((config as any).conversationContextLimit ?? 10);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.min(40, Math.floor(raw)));
+}
+
+function resolveQQConversationContextMaxChars(config: QQConfig): number {
+    const raw = Number((config as any).conversationContextMaxChars ?? 2400);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.max(0, Math.min(10000, Math.floor(raw)));
+}
+
+function formatQQConversationContextTime(timestampMs: number): string {
+    const date = new Date(normalizeQQContextTimestampMs(timestampMs));
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+}
+
+function buildQQConversationContextBlock(params: {
+    accountId: string;
+    config: QQConfig;
+    isGroup: boolean;
+    isGuild: boolean;
+    groupId?: unknown;
+    guildId?: unknown;
+    channelId?: unknown;
+    userId?: unknown;
+    currentMessageId?: unknown;
+}): string {
+    const limit = resolveQQConversationContextLimit(params.config);
+    const maxChars = resolveQQConversationContextMaxChars(params.config);
+    if (limit <= 0 || maxChars <= 0) return "";
+
+    const key = buildQQConversationContextKey({
+        accountId: params.accountId,
+        kind: getQQConversationKind(params),
+        groupId: params.groupId,
+        guildId: params.guildId,
+        channelId: params.channelId,
+        userId: params.userId,
+    });
+    if (!key) return "";
+
+    const currentMessageId = normalizeQQContextId(params.currentMessageId);
+    const includeRecalled = (params.config as any).includeRecalledMessagesInContext !== false;
+    const prunedEntries = pruneQQConversationContext(qqConversationContextCache.get(key) || []);
+    qqConversationContextCache.set(key, prunedEntries);
+    const entries = prunedEntries
+        .filter((entry) => !currentMessageId || entry.messageId !== currentMessageId)
+        .filter((entry) => includeRecalled || !entry.recalled);
+    if (entries.length === 0) return "";
+
+    const lines: string[] = [];
+    let totalChars = 0;
+    for (const entry of entries.slice(-limit).reverse()) {
+        const text = sanitizeGroupHistoryLineForModel(entry.text);
+        if (!text) continue;
+        const timePart = formatQQConversationContextTime(entry.timestampMs);
+        const msgPart = entry.messageId ? ` msg=${entry.messageId}` : "";
+        const recalledPart = entry.recalled ? " [已撤回]" : "";
+        const speaker = entry.source === "bot"
+            ? "机器人"
+            : `${compactTextSnippet(entry.senderName || "用户", 60)}${entry.userId ? `(${entry.userId})` : ""}`;
+        const line = `[${timePart}${msgPart}] ${speaker}${recalledPart}: ${text}`;
+        if (lines.length > 0 && totalChars + line.length + 1 > maxChars) break;
+        lines.unshift(line);
+        totalChars += line.length + 1;
+    }
+    if (lines.length === 0) return "";
+
+    return [
+        "<recent_qq_context>",
+        "同一 QQ 会话最近消息，当前用户消息未重复列出；[已撤回] 表示消息后来被撤回，但内容来自收到时的缓存。",
+        ...lines,
+        "</recent_qq_context>",
+        "",
+    ].join("\n");
+}
+
+function buildQQLanguageConsistencyBlock(currentText: string): string {
+    const text = normalizeInboundTextEntities(currentText || "")
+        .replace(/\[CQ:[^\]]+\]/g, " ")
+        .replace(/https?:\/\/\S+/gi, " ")
+        .replace(/`{1,3}[\s\S]*?`{1,3}/g, " ")
+        .replace(/\/[A-Za-z][\w-]*/g, " ");
+    const hanCount = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length;
+    const kanaCount = (text.match(/[\u3040-\u30ff]/g) || []).length;
+    const hangulCount = (text.match(/[\uac00-\ud7af]/g) || []).length;
+    const cyrillicCount = (text.match(/[\u0400-\u04ff]/g) || []).length;
+    const latinCount = (text.match(/[A-Za-z]/g) || []).length;
+    const preferredLanguage =
+        kanaCount >= 2 ? "日文" :
+        hangulCount >= 2 ? "韩文" :
+        hanCount >= 1 ? "中文" :
+        cyrillicCount >= 2 ? "俄文" :
+        latinCount >= 2 ? "English" :
+        "用户当前消息的主要语言";
+    return [
+        "<reply_language_policy>",
+        `必须使用${preferredLanguage}回复当前这条消息。`,
+        "保持整段回复的主要语言和用户当前输入一致；不要因为历史上下文、工具输出、网页内容、模型名、API 名或英文术语而切换主要回复语言。",
+        "只有用户明确要求翻译/改用另一种语言，或引用代码、命令、接口名、模型名、专有名词时，才保留原文。",
+        "</reply_language_policy>",
+        "",
+    ].join("\n");
+}
+
+function resolveDispatchTimeoutMs(config: QQConfig): number {
+    const configured = Number((config as any).dispatchTimeoutMs ?? 180000);
+    if (!Number.isFinite(configured)) return 180000;
+    return Math.max(0, Math.trunc(configured));
+}
 
 async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessageFn: (msg: string) => void) {
     const q = sessionQueues.get(sessionKey);
@@ -128,14 +480,51 @@ async function drainSessionQueue(sessionKey: string, config: QQConfig, sendMessa
             }
         }
 
-        await payloads[0].executeDispatch(mergedCtx, {
+        const runState = {
             isStale: () => {
                 const state = sessionQueues.get(sessionKey);
                 if (!state) return true;
                 if (state.activeEpoch !== runEpoch) return true;
                 return interruptOnNewMessage && state.latestEpoch !== runEpoch;
             },
+        };
+        const timeoutMs = resolveDispatchTimeoutMs(config);
+        let timedOut = false;
+        const abortController = new AbortController();
+        const dispatchPromise = payloads[0].executeDispatch(mergedCtx, runState, abortController.signal).catch((err) => {
+            if (timedOut) {
+                console.error(`[QQ] stale dispatch failed after timeout session=${sessionKey}:`, err);
+                return;
+            }
+            throw err;
         });
+
+        if (timeoutMs > 0) {
+            let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+            const timeoutPromise = new Promise<"timeout">((resolve) => {
+                timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
+            });
+            const result = await Promise.race([
+                dispatchPromise.then(() => "done" as const),
+                timeoutPromise,
+            ]);
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            if (result === "timeout") {
+                timedOut = true;
+                console.warn(`[QQ] dispatch timeout after ${timeoutMs}ms; aborting and releasing queue session=${sessionKey}`);
+                abortController.abort();
+                const abortGraceMs = 1500;
+                const graceResult = await Promise.race([
+                    dispatchPromise.then(() => "settled" as const),
+                    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), abortGraceMs)),
+                ]);
+                if (graceResult === "timeout") {
+                    console.warn(`[QQ] dispatch abort did not settle within ${abortGraceMs}ms session=${sessionKey}`);
+                }
+            }
+        } else {
+            await dispatchPromise;
+        }
 
     } finally {
         q.isProcessing = false;
@@ -167,7 +556,10 @@ function enqueueQQMessageForDispatch(sessionKey: string, msg: PendingQQMsg, conf
 
     if (q.timer) clearTimeout(q.timer);
 
-    const debounceMs = config.queueDebounceMs ?? 3000;
+    const configuredDebounceMs = Number(config.queueDebounceMs ?? 0);
+    const debounceMs = Number.isFinite(configuredDebounceMs)
+        ? Math.max(0, configuredDebounceMs)
+        : 0;
 
     q.timer = setTimeout(() => {
         q!.timer = null;
@@ -182,7 +574,14 @@ const QQ_INBOUND_MEDIA_DIR = path.join(process.env.HOME || homedir(), ".openclaw
 const QQ_INBOUND_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 const QQ_INBOUND_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 const QQ_INBOUND_VIDEO_MAX_BYTES = 200 * 1024 * 1024;
-const QQ_INBOUND_MEDIA_FETCH_TIMEOUT_MS = 15000;
+const QQ_INBOUND_MEDIA_FETCH_TIMEOUT_MS = 5000;
+const QQ_CONTEXT_FETCH_TIMEOUT_MS = 2500;
+const QQ_HISTORY_FETCH_TIMEOUT_MS = 1500;
+const QQ_GROUP_INFO_FETCH_TIMEOUT_MS = 1200;
+const QQ_LAYER_CONTEXT_TIMEOUT_MS = 3000;
+const QQ_LINK_PREVIEW_TIMEOUT_MS = 20000;
+const QQ_LINK_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const QQ_LINK_PREVIEW_MAX_LINKS = 8;
 const DEFAULT_QQ_IMAGE_MIME = "image/jpeg";
 const DEFAULT_QQ_BINARY_MIME = "application/octet-stream";
 const IMAGE_EXT_TO_MIME = new Map<string, string>([
@@ -190,7 +589,9 @@ const IMAGE_EXT_TO_MIME = new Map<string, string>([
     [".jpg", "image/jpeg"],
     [".jpeg", "image/jpeg"],
     [".gif", "image/gif"],
+    [".apng", "image/apng"],
     [".webp", "image/webp"],
+    [".avif", "image/avif"],
     [".bmp", "image/bmp"],
     [".tif", "image/tiff"],
     [".tiff", "image/tiff"],
@@ -201,7 +602,9 @@ const IMAGE_MIME_TO_EXT = new Map<string, string>([
     ["image/png", ".png"],
     ["image/jpeg", ".jpg"],
     ["image/gif", ".gif"],
+    ["image/apng", ".apng"],
     ["image/webp", ".webp"],
+    ["image/avif", ".avif"],
     ["image/bmp", ".bmp"],
     ["image/tiff", ".tiff"],
     ["image/heic", ".heic"],
@@ -333,13 +736,489 @@ function setCachedGroupName(accountId: string, groupId: string, name: string) {
     groupInfoCache.set(`${accountId}:${groupId}`, { name, time: Date.now() });
 }
 
+function decodeOneBotCQValue(value: string): string {
+    return value
+        .replace(/&#44;/g, ",")
+        .replace(/&#91;/g, "[")
+        .replace(/&#93;/g, "]")
+        .replace(/&amp;/g, "&");
+}
+
+function decodeHtmlEntities(value: string | undefined | null): string {
+    if (!value) return "";
+    return String(value)
+        .replace(/&(amp|lt|gt|quot|apos|nbsp);/gi, (_match, name) => {
+            const normalized = String(name).toLowerCase();
+            if (normalized === "amp") return "&";
+            if (normalized === "lt") return "<";
+            if (normalized === "gt") return ">";
+            if (normalized === "quot") return "\"";
+            if (normalized === "apos") return "'";
+            return " ";
+        })
+        .replace(/&#x([0-9a-f]+);/gi, (_match, hex) => {
+            const code = Number.parseInt(hex, 16);
+            return Number.isFinite(code) ? String.fromCodePoint(code) : _match;
+        })
+        .replace(/&#(\d+);/g, (_match, raw) => {
+            const code = Number.parseInt(raw, 10);
+            return Number.isFinite(code) ? String.fromCodePoint(code) : _match;
+        });
+}
+
+function normalizeInboundTextEntities(value: string | undefined | null): string {
+    return decodeHtmlEntities(decodeOneBotCQValue(String(value || "")));
+}
+
+function compactTextSnippet(input: string | undefined | null, maxChars: number): string {
+    const text = decodeHtmlEntities(String(input || ""))
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    if (!text || maxChars <= 0) return "";
+    return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}…` : text;
+}
+
+function trimLikelyUrl(input: string): string {
+    let url = decodeHtmlEntities(input).trim();
+    while (/[)\]\}>"'，。！？；：、]+$/u.test(url)) {
+        url = url.slice(0, -1).trimEnd();
+    }
+    if (/[.,!?;:]$/u.test(url)) url = url.slice(0, -1).trimEnd();
+    return url;
+}
+
+function extractHttpUrlsFromText(text: string | undefined | null, maxLinks = QQ_LINK_PREVIEW_MAX_LINKS): string[] {
+    const decoded = normalizeInboundTextEntities(String(text || ""));
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const urlRegex = /https?:\/\/[^\s<>"'`]+/gi;
+    let match: RegExpExecArray | null;
+    while ((match = urlRegex.exec(decoded)) !== null) {
+        const url = trimLikelyUrl(match[0]);
+        if (!/^https?:\/\//i.test(url)) continue;
+        try {
+            new URL(url);
+        } catch {
+            continue;
+        }
+        if (seen.has(url)) continue;
+        seen.add(url);
+        out.push(url);
+        if (out.length >= maxLinks) break;
+    }
+    return out;
+}
+
+function formatUrlForModel(url: string): string {
+    try {
+        const parsed = new URL(url);
+        const pathValue = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
+        const queryHint = parsed.search ? "?..." : "";
+        return `${parsed.origin}${pathValue}${queryHint}`;
+    } catch {
+        return compactTextSnippet(url, 120);
+    }
+}
+
+function replaceInboundLinksForModel(text: string, urls: string[]): string {
+    let result = normalizeInboundTextEntities(text);
+    urls.forEach((url, index) => {
+        const marker = `[链接 ${index + 1}: ${formatUrlForModel(url)}]`;
+        const encoded = url.replace(/&/g, "&amp;");
+        result = result.split(url).join(marker);
+        result = result.split(encoded).join(marker);
+    });
+    return result.replace(/\s+/g, " ").trim();
+}
+
+function sanitizeGroupHistoryLineForModel(line: string): string {
+    let result = normalizeInboundTextEntities(line);
+    const urls = extractHttpUrlsFromText(result, 20);
+    if (urls.length > 0) result = replaceInboundLinksForModel(result, urls);
+    return compactTextSnippet(
+        result
+            .replace(/sensitive_words_detected/gi, "provider_filter_error")
+            .replace(/sensitive words detected/gi, "provider filter error")
+            .replace(/敏感词汇|敏感词/g, "过滤词")
+            .replace(/\s+/g, " ")
+            .trim(),
+        500,
+    );
+}
+
+function extractHtmlAttr(tag: string, attr: string): string {
+    const re = new RegExp(`${attr}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i");
+    const match = tag.match(re);
+    return decodeHtmlEntities(match?.[1] ?? match?.[2] ?? match?.[3] ?? "");
+}
+
+function extractHtmlMeta(html: string, names: string[]): string {
+    const wanted = new Set(names.map((name) => name.toLowerCase()));
+    const metaRegex = /<meta\b[^>]*>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = metaRegex.exec(html)) !== null) {
+        const tag = match[0];
+        const key = (extractHtmlAttr(tag, "property") || extractHtmlAttr(tag, "name") || extractHtmlAttr(tag, "itemprop")).toLowerCase();
+        if (!key || !wanted.has(key)) continue;
+        const content = extractHtmlAttr(tag, "content");
+        if (content) return compactTextSnippet(content, 500);
+    }
+    return "";
+}
+
+function extractHtmlTitle(html: string): string {
+    const match = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+    return compactTextSnippet(match?.[1] || "", 220);
+}
+
+function decodeJsStringFragment(input: string): string {
+    return decodeHtmlEntities(input
+        .replace(/\\x([0-9a-f]{2})/gi, (_match, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+        .replace(/\\u([0-9a-f]{4})/gi, (_match, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\\//g, "/")
+        .replace(/\\"/g, "\"")
+        .replace(/\\'/g, "'"));
+}
+
+function extractAssignedJsString(html: string, names: string[]): string {
+    for (const name of names) {
+        const re = new RegExp(`(?:var\\s+)?${name}\\s*=\\s*(['"])([\\s\\S]*?)\\1`, "i");
+        const match = html.match(re);
+        if (match?.[2]) return compactTextSnippet(decodeJsStringFragment(match[2]), 500);
+    }
+    return "";
+}
+
+function stripHtmlToText(html: string, maxChars = 1600): string {
+    const withoutNoise = html
+        .replace(/<script\b[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
+        .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<(?:br|p|div|li|h[1-6]|section|article)\b[^>]*>/gi, "\n")
+        .replace(/<[^>]+>/g, " ");
+    return compactTextSnippet(withoutNoise, maxChars);
+}
+
+function findDeepStringValues(value: unknown, keyPattern: RegExp, out: string[] = [], depth = 0): string[] {
+    if (depth > 7 || value === null || value === undefined) return out;
+    if (typeof value === "string") return out;
+    if (Array.isArray(value)) {
+        for (const item of value) findDeepStringValues(item, keyPattern, out, depth + 1);
+        return out;
+    }
+    if (typeof value !== "object") return out;
+    for (const [key, nextValue] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof nextValue === "string" && keyPattern.test(key)) {
+            const text = compactTextSnippet(nextValue, 500);
+            if (text) out.push(text);
+        }
+        findDeepStringValues(nextValue, keyPattern, out, depth + 1);
+    }
+    return out;
+}
+
+function collectDeepUrls(value: unknown, out: string[] = [], depth = 0): string[] {
+    if (depth > 7 || value === null || value === undefined) return out;
+    if (typeof value === "string") {
+        out.push(...extractHttpUrlsFromText(value, QQ_LINK_PREVIEW_MAX_LINKS));
+        return out;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) collectDeepUrls(item, out, depth + 1);
+        return out;
+    }
+    if (typeof value !== "object") return out;
+    for (const nextValue of Object.values(value as Record<string, unknown>)) {
+        collectDeepUrls(nextValue, out, depth + 1);
+    }
+    return out;
+}
+
+function parseJsonLikePayload(raw: string): unknown | null {
+    const decoded = normalizeInboundTextEntities(raw).trim();
+    if (!decoded) return null;
+    try {
+        return JSON.parse(decoded);
+    } catch { }
+    const unescaped = decoded.replace(/\\"/g, "\"");
+    try {
+        return JSON.parse(unescaped);
+    } catch {
+        return null;
+    }
+}
+
+function uniqueStrings(values: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const value of values) {
+        const trimmed = value.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        out.push(trimmed);
+    }
+    return out;
+}
+
+function summarizeOneBotLinkPayload(type: string, attrs: Record<string, unknown>): { text: string; urls: string[] } {
+    const normalizedType = String(type || "").toLowerCase();
+    const rawPayload = String(
+        attrs.data ?? attrs.content ?? attrs.text ?? attrs.json ?? attrs.xml ?? attrs.message ?? ""
+    );
+    const directStrings = [
+        attrs.url,
+        attrs.jumpUrl,
+        attrs.jump_url,
+        attrs.link,
+        attrs.href,
+        attrs.title,
+        attrs.desc,
+        attrs.description,
+        attrs.content,
+        attrs.text,
+    ].filter((value): value is string => typeof value === "string");
+
+    const parsed = rawPayload ? parseJsonLikePayload(rawPayload) : null;
+    const deepUrls = parsed ? collectDeepUrls(parsed) : [];
+    const rawUrls = extractHttpUrlsFromText(rawPayload);
+    const directUrls = directStrings.flatMap((value) => extractHttpUrlsFromText(value));
+    const urls = uniqueStrings([...directUrls, ...deepUrls, ...rawUrls]).slice(0, QQ_LINK_PREVIEW_MAX_LINKS);
+
+    const titles = parsed
+        ? findDeepStringValues(parsed, /^(title|name|prompt|summary)$/i)
+        : [];
+    const descriptions = parsed
+        ? findDeepStringValues(parsed, /^(desc|description|digest|content|text)$/i)
+        : [];
+    for (const key of ["title", "name", "summary"]) {
+        const value = attrs[key];
+        if (typeof value === "string") titles.push(value);
+    }
+    for (const key of ["desc", "description", "content", "text"]) {
+        const value = attrs[key];
+        if (typeof value === "string") descriptions.push(value);
+    }
+
+    const title = compactTextSnippet(uniqueStrings(titles)[0] || "", 120);
+    const desc = compactTextSnippet(uniqueStrings(descriptions).find((item) => item !== title) || "", 180);
+    let fallbackText = "";
+    if (!title && !desc && rawPayload && normalizedType !== "json") {
+        fallbackText = compactTextSnippet(stripHtmlToText(rawPayload, 220), 220);
+    }
+
+    const label = normalizedType === "share" ? "分享链接" : "卡片链接";
+    const parts = [title, desc || fallbackText].filter(Boolean);
+    const urlHint = urls[0] ? ` ${urls[0]}` : "";
+    const text = urls.length > 0 || parts.length > 0
+        ? ` [${label}: ${parts.join(" - ")}${urlHint}]`
+        : "";
+    return { text, urls };
+}
+
+function summarizeOneBotLinkLikeSegment(segment: any): { text: string; urls: string[] } {
+    const type = String(segment?.type || "").toLowerCase();
+    const data = segment?.data && typeof segment.data === "object" ? segment.data : {};
+    return summarizeOneBotLinkPayload(type, data);
+}
+
+async function readResponseTextLimited(resp: Response, maxBytes: number): Promise<string> {
+    const body: any = (resp as any).body;
+    if (!body || typeof body.getReader !== "function") {
+        const text = await resp.text();
+        return text.slice(0, maxBytes);
+    }
+    const reader = body.getReader();
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let cancelled = false;
+    try {
+        while (total < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = Buffer.from(value);
+            const remaining = maxBytes - total;
+            if (chunk.byteLength > remaining) {
+                chunks.push(chunk.subarray(0, remaining));
+                total += remaining;
+                await reader.cancel().catch(() => undefined);
+                cancelled = true;
+                break;
+            }
+            chunks.push(chunk);
+            total += chunk.byteLength;
+        }
+        if (!cancelled && total >= maxBytes) {
+            await reader.cancel().catch(() => undefined);
+            cancelled = true;
+        }
+    } finally {
+        try { reader.releaseLock?.(); } catch { }
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+}
+
+function parseHtmlLinkPreview(html: string): Pick<QQInboundLinkPreview, "title" | "description" | "siteName" | "text"> {
+    const title = extractAssignedJsString(html, ["msg_title", "window.msg_title"])
+        || extractHtmlMeta(html, ["og:title", "twitter:title", "title"])
+        || extractHtmlTitle(html);
+    const description = extractAssignedJsString(html, ["msg_desc", "window.msg_desc"])
+        || extractHtmlMeta(html, ["og:description", "twitter:description", "description"]);
+    const siteName = extractHtmlMeta(html, ["og:site_name", "application-name"]);
+    const text = stripHtmlToText(html, 1600);
+    return {
+        ...(title ? { title } : {}),
+        ...(description ? { description } : {}),
+        ...(siteName ? { siteName } : {}),
+        ...(text && text !== title && text !== description ? { text } : {}),
+    };
+}
+
+async function fetchQQLinkPreview(url: string): Promise<QQInboundLinkPreview> {
+    const normalizedUrl = trimLikelyUrl(url);
+    let host = "";
+    try {
+        host = new URL(normalizedUrl).host;
+    } catch {
+        return { url: normalizedUrl, error: "invalid_url" };
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), QQ_LINK_PREVIEW_TIMEOUT_MS);
+    try {
+        const resp = await fetch(normalizedUrl, {
+            method: "GET",
+            redirect: "follow",
+            signal: controller.signal,
+            headers: {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) OpenClawQQ/1.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+            },
+        });
+        const contentType = resp.headers.get("content-type") || "";
+        const preview: QQInboundLinkPreview = {
+            url: normalizedUrl,
+            finalUrl: resp.url && resp.url !== normalizedUrl ? resp.url : undefined,
+            host,
+            status: resp.status,
+            contentType,
+        };
+        if (!resp.ok) {
+            return { ...preview, error: `HTTP ${resp.status}` };
+        }
+        if (!/(?:text\/html|application\/xhtml\+xml|text\/plain|application\/json|application\/xml)/i.test(contentType)) {
+            return preview;
+        }
+        const body = await readResponseTextLimited(resp, QQ_LINK_PREVIEW_MAX_BYTES);
+        if (/html|xml/i.test(contentType) || /<html|<title|<meta/i.test(body)) {
+            return { ...preview, ...parseHtmlLinkPreview(body) };
+        }
+        return { ...preview, text: compactTextSnippet(body, 1600) };
+    } catch (err) {
+        return { url: normalizedUrl, host, error: String(err) };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function fetchQQLinkPreviews(urls: string[]): Promise<QQInboundLinkPreview[]> {
+    const unique = uniqueStrings(urls).slice(0, QQ_LINK_PREVIEW_MAX_LINKS);
+    if (unique.length === 0) return [];
+    return await Promise.all(unique.map((url) => fetchQQLinkPreview(url)));
+}
+
+function buildInboundLinkContextBlock(previews: QQInboundLinkPreview[]): string {
+    const useful = previews.filter((preview) => preview.url);
+    if (useful.length === 0) return "";
+    const lines = [
+        "<links>",
+        "The user sent link(s). Read the linked content before answering. Use the fetched content below first; if it is missing or insufficient, open/fetch the link again instead of answering from the URL alone.",
+    ];
+    useful.forEach((preview, index) => {
+        const url = preview.finalUrl || preview.url;
+        lines.push(`- [link ${index + 1}] url=${compactTextSnippet(url, 900)} host=${preview.host || ""}${preview.status ? ` status=${preview.status}` : ""}`);
+        if (preview.title) lines.push(`  title=${preview.title}`);
+        if (preview.description) lines.push(`  description=${preview.description}`);
+        if (preview.siteName) lines.push(`  site=${preview.siteName}`);
+        if (preview.text) lines.push(`  excerpt=${preview.text}`);
+        if (preview.error && !preview.title && !preview.description && !preview.text) lines.push(`  preview_error=${preview.error}`);
+    });
+    lines.push("</links>");
+    return `${lines.join("\n")}\n\n`;
+}
+
 function normalizeOneBotMediaUrlCandidate(value: unknown): string | undefined {
     if (typeof value !== "string") return undefined;
-    const trimmed = value.trim().replace(/&amp;/g, "&");
+    const trimmed = normalizeInboundTextEntities(value).trim();
     if (!trimmed) return undefined;
     if (/^(?:https?:\/\/|base64:\/\/|file:)/i.test(trimmed)) return trimmed;
     if (trimmed.startsWith("/")) return `file://${trimmed}`;
     return undefined;
+}
+
+function parseOneBotCQAttributes(rawAttrs: string | undefined): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    if (!rawAttrs) return attrs;
+    for (const part of rawAttrs.split(",")) {
+        const idx = part.indexOf("=");
+        if (idx <= 0) continue;
+        const key = part.slice(0, idx).trim();
+        if (!key) continue;
+        attrs[key] = decodeOneBotCQValue(part.slice(idx + 1));
+    }
+    return attrs;
+}
+
+function isImageLikeOneBotSegment(segment: any): boolean {
+    const type = String(segment?.type || "").toLowerCase();
+    return type === "image" ||
+        type === "mface" ||
+        type === "face" ||
+        type === "emoji" ||
+        type === "emoticon" ||
+        type === "sticker" ||
+        type === "marketface";
+}
+
+function readOneBotImageLikeUrl(segment: any): string | undefined {
+    const data = segment?.data || {};
+    return normalizeOneBotMediaUrlCandidate(data.url)
+        ?? normalizeOneBotMediaUrlCandidate(data.file)
+        ?? normalizeOneBotMediaUrlCandidate(data.path)
+        ?? normalizeOneBotMediaUrlCandidate(data.image)
+        ?? normalizeOneBotMediaUrlCandidate(data.imageUrl)
+        ?? normalizeOneBotMediaUrlCandidate(data.image_url)
+        ?? normalizeOneBotMediaUrlCandidate(data.preview)
+        ?? normalizeOneBotMediaUrlCandidate(data.previewUrl)
+        ?? normalizeOneBotMediaUrlCandidate(data.preview_url)
+        ?? normalizeOneBotMediaUrlCandidate(data.thumb)
+        ?? normalizeOneBotMediaUrlCandidate(data.thumbUrl)
+        ?? normalizeOneBotMediaUrlCandidate(data.thumb_url);
+}
+
+function getOneBotImageLikeLabel(segment: any): string {
+    const data = segment?.data || {};
+    const raw = data.summary ?? data.text ?? data.name ?? data.emoji_name ?? data.face_name ?? data.id ?? data.emoji_id ?? data.file;
+    const text = raw === undefined || raw === null ? "" : String(raw).trim();
+    if (!text) return "表情";
+    if (/^\[?表情\]?$/i.test(text)) return "表情";
+    return text.replace(/^\[(.*)\]$/, "$1").trim() || "表情";
+}
+
+function extractTextualEmojiPlaceholders(input: string | undefined): string[] {
+    if (!input) return [];
+    const labels: string[] = [];
+    const regex = /\[表情\](?:\/([^\s，。！？,.!?;；:：)）\]]+))?/g;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(input)) !== null) {
+        labels.push(match[1] ? `表情/${match[1]}` : "表情");
+    }
+    return labels;
 }
 
 function normalizeMimeTypeHint(value: unknown): string | undefined {
@@ -502,9 +1381,8 @@ function extractImageHints(message: OneBotMessage | string | undefined, maxImage
 
     if (Array.isArray(message)) {
         for (const segment of message) {
-            if (segment.type !== "image") continue;
-            const url = normalizeOneBotMediaUrlCandidate(segment.data?.url)
-                ?? normalizeOneBotMediaUrlCandidate(segment.data?.file);
+            if (!isImageLikeOneBotSegment(segment)) continue;
+            const url = readOneBotImageLikeUrl(segment);
             if (!url) continue;
             const fileName = typeof segment.data?.file === "string" ? guessFileName(segment.data.file) : undefined;
             pushHint({
@@ -515,16 +1393,22 @@ function extractImageHints(message: OneBotMessage | string | undefined, maxImage
             if (hints.length >= maxImages) break;
         }
     } else if (typeof message === "string") {
-        const imageRegex = /\[CQ:image,([^\]]+)\]/g;
+        const imageRegex = /\[CQ:(?:image|mface|emoji|emoticon|sticker|marketface),([^\]]+)\]/g;
         let match: RegExpExecArray | null;
         while ((match = imageRegex.exec(message)) !== null) {
-            const rawAttrs = match[1] || "";
-            const urlMatch = rawAttrs.match(/(?:^|,)url=([^,\]]+)/);
-            const fileMatch = rawAttrs.match(/(?:^|,)file=([^,\]]+)/);
-            const url = normalizeOneBotMediaUrlCandidate(urlMatch?.[1])
-                ?? normalizeOneBotMediaUrlCandidate(fileMatch?.[1]);
+            const attrs = parseOneBotCQAttributes(match[1]);
+            const url = normalizeOneBotMediaUrlCandidate(attrs.url)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.file)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.path)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.image)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.imageUrl)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.image_url)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.preview)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.preview_url)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.thumb)
+                ?? normalizeOneBotMediaUrlCandidate(attrs.thumb_url);
             if (!url) continue;
-            const fileNameRaw = fileMatch?.[1] ? guessFileName(fileMatch[1].replace(/&amp;/g, "&")) : undefined;
+            const fileNameRaw = attrs.file ? guessFileName(attrs.file) : undefined;
             pushHint({
                 url,
                 fileName: fileNameRaw,
@@ -624,9 +1508,9 @@ async function cacheImageHintsLocally(
     const entries: InboundMediaEntry[] = [];
     const failures: Array<{ url: string; error: string }> = [];
 
-    for (const url of imageUrls) {
+    const results = await Promise.all(imageUrls.map(async (url) => {
         const normalizedUrl = normalizeOneBotMediaUrlCandidate(url);
-        if (!normalizedUrl) continue;
+        if (!normalizedUrl) return null;
         const meta = imageHintMeta.get(normalizedUrl);
         const mimeTypeHint = normalizeMimeTypeHint(meta?.mimeType)
             ?? inferImageMimeType(meta?.fileName)
@@ -635,20 +1519,35 @@ async function cacheImageHintsLocally(
         try {
             const cached = await cacheOneBotImageLocally(normalizedUrl, meta);
             if (cached?.path) {
-                entries.push({
-                    url: normalizedUrl,
-                    path: cached.path,
-                    type: cached.mimeType || mimeTypeHint,
-                });
-                continue;
+                return {
+                    entry: {
+                        url: normalizedUrl,
+                        path: cached.path,
+                        type: cached.mimeType || mimeTypeHint,
+                    },
+                };
             }
         } catch (err) {
-            failures.push({ url: normalizedUrl, error: String(err) });
+            return {
+                entry: {
+                    url: normalizedUrl,
+                    type: mimeTypeHint,
+                },
+                failure: { url: normalizedUrl, error: String(err) },
+            };
         }
-        entries.push({
-            url: normalizedUrl,
-            type: mimeTypeHint,
-        });
+        return {
+            entry: {
+                url: normalizedUrl,
+                type: mimeTypeHint,
+            },
+        };
+    }));
+
+    for (const result of results) {
+        if (!result) continue;
+        entries.push(result.entry);
+        if (result.failure) failures.push(result.failure);
     }
 
     return { entries, failures };
@@ -686,6 +1585,31 @@ function collectInboundMediaEntriesFromCtx(ctx: any): InboundMediaEntry[] {
         });
     }
     return entries;
+}
+
+function hasInboundImageLikeContent(ctx: any): boolean {
+    if (!ctx || typeof ctx !== "object") return false;
+    const mediaEntries = collectInboundMediaEntriesFromCtx(ctx);
+    if (mediaEntries.some((entry) => {
+        const type = String(entry.type || "").toLowerCase();
+        if (type.startsWith("image/")) return true;
+        const candidate = `${entry.url || ""} ${entry.path || ""}`.toLowerCase();
+        return /\.(jpg|jpeg|png|gif|webp|apng|avif|bmp|heic|heif)(?:[?#\s]|$)/i.test(candidate);
+    })) {
+        return true;
+    }
+
+    const textFields = [
+        ctx.Body,
+        ctx.RawBody,
+        ctx.BodyForAgent,
+        ctx.BodyForCommands,
+        ctx.CommandBody,
+    ].filter((value): value is string => typeof value === "string" && value.length > 0);
+    const combined = textFields.join("\n");
+    return /\[CQ:(?:image|mface|face|emoji|emoticon|sticker|marketface)[,\]]/i.test(combined) ||
+        /\[(?:图片|表情|表情图片|qq_image|image)\b/i.test(combined) ||
+        /qq_image\s+url=/i.test(combined);
 }
 
 function buildInboundMediaPayloadFromEntries(entries: InboundMediaEntry[]): Record<string, unknown> {
@@ -797,7 +1721,7 @@ async function resolveOneBotFileUrl(
                 group_id: opts.groupId,
                 file_id: fileId,
                 ...(segment.data?.busid !== undefined ? { busid: segment.data.busid } : {}),
-            }));
+            }, QQ_CONTEXT_FETCH_TIMEOUT_MS));
             const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
             if (resolved) {
                 segment.data.url = resolved;
@@ -813,7 +1737,7 @@ async function resolveOneBotFileUrl(
         const info = unwrapOneBotActionData(await (client as any).sendWithResponse("get_private_file_url", {
             file_id: fileId,
             ...(opts?.userId !== undefined ? { user_id: opts.userId } : {}),
-        }));
+        }, QQ_CONTEXT_FETCH_TIMEOUT_MS));
         const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
         if (resolved) {
             segment.data.url = resolved;
@@ -841,7 +1765,7 @@ async function resolveOneBotImageUrl(client: OneBotClient, segment: any): Promis
     if (!fileRef) return undefined;
 
     try {
-        const info = await (client as any).sendWithResponse("get_image", { file: fileRef });
+        const info = await (client as any).sendWithResponse("get_image", { file: fileRef }, QQ_CONTEXT_FETCH_TIMEOUT_MS);
         const resolved = normalizeOneBotMediaUrlCandidate(info?.url) ?? normalizeOneBotMediaUrlCandidate(info?.file);
         if (resolved) {
             segment.data.url = resolved;
@@ -1011,20 +1935,40 @@ function extractImageUrls(message: OneBotMessage | string | undefined, maxImages
 function cleanCQCodes(text: string | undefined): string {
     if (!text) return "";
 
-    let result = text;
+    let result = normalizeInboundTextEntities(text);
     const imageUrls: string[] = [];
 
     // Match both url= and file= if they look like URLs
-    const imageRegex = /\[CQ:image,[^\]]*(?:url|file)=([^,\]]+)[^\]]*\]/g;
+    const imageRegex = /\[CQ:(?:image|mface|emoji|emoticon|sticker|marketface),([^\]]+)\]/g;
     let match;
-    while ((match = imageRegex.exec(text)) !== null) {
-        const val = normalizeOneBotMediaUrlCandidate(match[1]);
+    while ((match = imageRegex.exec(result)) !== null) {
+        const attrs = parseOneBotCQAttributes(match[1]);
+        const val = normalizeOneBotMediaUrlCandidate(attrs.url)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.file)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.path)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.image)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.imageUrl)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.image_url)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.preview)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.preview_url)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.thumb)
+            ?? normalizeOneBotMediaUrlCandidate(attrs.thumb_url);
         if (val) {
             imageUrls.push(val);
         }
     }
 
     result = result.replace(/\[CQ:face,id=(\d+)\]/g, "[表情]");
+    result = result.replace(/\[CQ:(?:mface|emoji|emoticon|sticker|marketface),([^\]]+)\]/g, (match, rawAttrs) => {
+        const attrs = parseOneBotCQAttributes(rawAttrs);
+        const label = attrs.summary || attrs.text || attrs.name || attrs.id || "表情";
+        return `[表情:${label}]`;
+    });
+    result = result.replace(/\[CQ:(json|xml|share),([^\]]+)\]/g, (_match, type, rawAttrs) => {
+        const attrs = parseOneBotCQAttributes(rawAttrs);
+        const summary = summarizeOneBotLinkPayload(type, attrs);
+        return summary.text || "[卡片消息]";
+    });
 
     result = result.replace(/\[CQ:[^\]]+\]/g, (match) => {
         if (match.startsWith("[CQ:image")) {
@@ -1195,10 +2139,11 @@ async function buildModelCatalogText(enableDynamicLookup: boolean): Promise<stri
     }
 
     const providers = parsed?.models?.providers as Record<string, any> | undefined;
-    const currentModel =
+    const currentModel = shortenVisibleModelRefs(
         (typeof parsed?.agents?.defaults?.model?.primary === "string" && parsed.agents.defaults.model.primary.trim())
         || (typeof parsed?.agent?.model === "string" && parsed.agent.model.trim())
-        || "unknown";
+        || "unknown"
+    );
     if (!providers || typeof providers !== "object") {
         return `[OpenClawd QQ]\nCurrent: ${currentModel}\n未找到 models.providers 配置。`;
     }
@@ -1217,7 +2162,7 @@ async function buildModelCatalogText(enableDynamicLookup: boolean): Promise<stri
         const source = dynamic ? `dynamic: ${dynamic.source}` : "config";
         lines.push(`- ${providerName} (${modelIds.length}) [${source}]`);
         for (const modelId of modelIds) {
-            lines.push(`  ${index}. ${providerName}/${modelId}`);
+            lines.push(`  ${index}. ${shortenVisibleModelRefs(`${providerName}/${modelId}`)}`);
             index += 1;
         }
     }
@@ -1277,8 +2222,48 @@ function extractMessageLikeFromPayload(payload: any): OneBotMessage | string | u
 
 function extractForwardNodeList(payload: any): any[] {
     const data = oneBotPayloadData(payload);
+    if (Array.isArray(data)) return data;
     const nodes = data?.messages ?? data?.message ?? data?.nodes ?? data?.nodeList;
     return Array.isArray(nodes) ? nodes : [];
+}
+
+function forwardNodeData(node: any): any {
+    if (node && typeof node === "object" && node.data && typeof node.data === "object") return node.data;
+    return node;
+}
+
+function getForwardNodeSenderName(node: any): string {
+    const data = forwardNodeData(node);
+    return data?.sender?.nickname ||
+        data?.sender?.card ||
+        data?.sender?.user_id ||
+        data?.nickname ||
+        data?.name ||
+        data?.user_id ||
+        data?.uin ||
+        "unknown";
+}
+
+function getForwardNodeContent(node: any): OneBotMessage | string | undefined {
+    const data = forwardNodeData(node);
+    const candidates = [
+        data?.message,
+        data?.content,
+        data?.raw_message,
+        data?.rawMessage,
+        data?.message_obj?.message,
+        data?.messageObj?.message,
+    ];
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate) || typeof candidate === "string") return candidate as any;
+    }
+    return undefined;
+}
+
+function getForwardNodeRawMessage(node: any): string | undefined {
+    const data = forwardNodeData(node);
+    const raw = data?.raw_message ?? data?.rawMessage;
+    return typeof raw === "string" ? raw : undefined;
 }
 
 function truncateWithEllipsis(text: string, maxChars: number): string {
@@ -1315,7 +2300,11 @@ function collectForwardIdsFromMessage(message: OneBotMessage | string | undefine
 
 function collectForwardIdsFromCandidates(...messages: Array<OneBotMessage | string | undefined>): string[] {
     const unique = new Set<string>();
-    for (const message of messages) {
+    const orderedMessages = [
+        ...messages.filter((message) => typeof message === "string"),
+        ...messages.filter((message) => typeof message !== "string"),
+    ];
+    for (const message of orderedMessages) {
         for (const id of collectForwardIdsFromMessage(message)) {
             unique.add(id);
         }
@@ -1331,12 +2320,15 @@ function summarizeOneBotSegments(message: OneBotMessage | string | undefined, ma
         text = cleanCQCodes(message);
     } else if (Array.isArray(message)) {
         for (const seg of message) {
-            if (seg.type === "text") text += seg.data?.text || "";
-            else if (seg.type === "at") text += ` @${seg.data?.qq || "unknown"} `;
+            if (seg.type === "text") text += normalizeInboundTextEntities(seg.data?.text || "");
+            else if (seg.type === "at") text += `@${seg.data?.qq || "unknown"}`;
             else if (seg.type === "record") text += ` [语音${seg.data?.text ? `:${seg.data.text}` : ""}]`;
             else if (seg.type === "image") text += " [图片]";
             else if (seg.type === "video") text += seg.data?.url ? ` [视频:${seg.data.url}]` : " [视频]";
-            else if (seg.type === "json") text += " [卡片]";
+            else if (seg.type === "json" || seg.type === "xml" || seg.type === "share") {
+                const cardSummary = summarizeOneBotLinkLikeSegment(seg);
+                text += cardSummary.text || " [卡片]";
+            }
             else if (seg.type === "file") {
                 const fileName = seg.data?.name || seg.data?.file || "未命名";
                 text += ` [文件:${fileName}]`;
@@ -1365,7 +2357,7 @@ async function buildReplyForwardContextBlock(opts: {
     cfg: QQConfig;
 }): Promise<{ block: string; imageUrls: string[] }> {
     const { client, rootEvent, repliedMsg, cfg } = opts;
-    if (!cfg.enrichReplyForwardContext) return { block: "", imageUrls: [] };
+    if (cfg.enrichReplyForwardContext === false) return { block: "", imageUrls: [] };
     const debugLayerTrace = cfg.debugLayerTrace === true;
 
     const maxReplyLayers = Math.max(0, Math.trunc(cfg.maxReplyLayers ?? 5));
@@ -1443,7 +2435,7 @@ async function buildReplyForwardContextBlock(opts: {
         if (!nextReplyId || seenReplyIds.has(nextReplyId)) break;
         seenReplyIds.add(nextReplyId);
         try {
-            cursor = await client.getMsg(nextReplyId);
+            cursor = await client.getMsg(nextReplyId, QQ_CONTEXT_FETCH_TIMEOUT_MS);
             if (debugLayerTrace) console.log(`[QQLayerTrace] get_msg ok id=${nextReplyId}`);
         } catch (err) {
             if (debugLayerTrace) console.warn(`[QQLayerTrace] get_msg failed id=${nextReplyId} err=${String(err)}`);
@@ -1456,7 +2448,7 @@ async function buildReplyForwardContextBlock(opts: {
         if (item.depth > maxForwardLayers) continue;
         if (debugLayerTrace) console.log(`[QQLayerTrace] dequeue forward id=${item.id} depth=${item.depth} tag=${item.layerTag}`);
         try {
-            const forwardData = await client.getForwardMsg(item.id);
+            const forwardData = await client.getForwardMsg(item.id, QQ_CONTEXT_FETCH_TIMEOUT_MS);
             if (debugLayerTrace) console.log(`[QQLayerTrace] get_forward_msg ok id=${item.id}`);
             const allNodes = extractForwardNodeList(forwardData);
             if (debugLayerTrace) console.log(`[QQLayerTrace] forward id=${item.id} nodes=${allNodes.length}`);
@@ -1464,12 +2456,8 @@ async function buildReplyForwardContextBlock(opts: {
             let idx = 0;
             for (const m of messages) {
                 idx += 1;
-                const senderName = m?.sender?.nickname || m?.sender?.card || m?.user_id || "unknown";
-                const content =
-                    (Array.isArray(m?.message) ? m.message : undefined)
-                    ?? (Array.isArray(m?.content) ? m.content : undefined)
-                    ?? (typeof m?.raw_message === "string" ? m.raw_message : undefined)
-                    ?? (typeof m?.content === "string" ? m.content : "");
+                const senderName = getForwardNodeSenderName(m);
+                const content = getForwardNodeContent(m) ?? "";
                 await hydrateOneBotMessageMedia(client, content, { groupId: m?.group_id ?? rootEvent?.group_id });
                 const summarized = summarizeOneBotSegments(content, maxCharsPerLayer);
                 for (const u of summarized.images) layeredImages.add(u);
@@ -1480,18 +2468,18 @@ async function buildReplyForwardContextBlock(opts: {
 
                 // nested forward inside forward message
                 if (item.depth < maxForwardLayers) {
-                    collectAndEnqueueForwards(item.depth + 1, "forward-nested", content as any, typeof m?.raw_message === "string" ? m.raw_message : undefined);
+                    collectAndEnqueueForwards(item.depth + 1, "forward-nested", content as any, getForwardNodeRawMessage(m));
                 }
 
                 // reply inside forward message
                 const replyIdInForward = getReplyMessageId(
-                    Array.isArray(m?.content) ? m.content : undefined,
-                    typeof m?.raw_message === "string" ? m.raw_message : undefined,
+                    Array.isArray(content) ? content : undefined,
+                    getForwardNodeRawMessage(m),
                     m,
                 );
                 if (replyIdInForward && item.depth < maxForwardLayers) {
                     try {
-                        const replied = await client.getMsg(replyIdInForward);
+                        const replied = await client.getMsg(replyIdInForward, QQ_CONTEXT_FETCH_TIMEOUT_MS);
                         const rSender = replied?.sender?.nickname || replied?.sender?.card || replied?.sender?.user_id || "unknown";
                         const rBody = Array.isArray(replied?.message) ? replied.message : replied?.raw_message;
                         await hydrateOneBotMessageMedia(client, rBody, { groupId: replied?.group_id ?? rootEvent?.group_id });
@@ -1950,6 +2938,14 @@ function buildEffectiveFromId(baseFromId: string, tempSlot: string | null): stri
     return `${baseFromId}::tmp:${tempSlot}`;
 }
 
+function buildPerMessageFromId(baseFromId: string, event: any, userId: number): string {
+    const rawId = event?.message_id !== undefined
+        ? String(event.message_id)
+        : `${String(event?.time ?? Date.now())}-${String(userId)}`;
+    const messageId = rawId.replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 80) || `${Date.now()}-${userId}`;
+    return `${baseFromId}::msg:${messageId}`;
+}
+
 type SessionCommandTarget = {
     slot: string | null;
     label: string;
@@ -2121,7 +3117,7 @@ async function setGroupTypingCard(client: OneBotClient, accountId: string, group
     if (current > 0) return;
 
     try {
-        const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: selfId, no_cache: true });
+        const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: selfId, no_cache: true }, QQ_CONTEXT_FETCH_TIMEOUT_MS);
         const currentCard = (info?.card || info?.nickname || "").trim();
         const baseCard = stripTrailingBusySuffixes(currentCard, suffix);
         groupBaseCards.set(groupKey, baseCard);
@@ -2191,13 +3187,291 @@ function getClientForAccount(accountId: string | undefined | null) {
     return undefined;
 }
 
+function pickFirstDefined(obj: Record<string, any> | undefined | null, keys: string[]): any {
+    if (!obj || typeof obj !== "object") return undefined;
+    for (const key of keys) {
+        if (obj[key] !== undefined && obj[key] !== null) return obj[key];
+    }
+    return undefined;
+}
+
+function normalizeQQMessageRef(value: unknown): string | number | null {
+    if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+    if (typeof value === "bigint") return value.toString();
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim().replace(/^"|"$|^'|'$/g, "");
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed) && trimmed.length < 16) {
+        const parsed = Number.parseInt(trimmed, 10);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return trimmed;
+}
+
+function normalizeQQEmojiRef(value: unknown): string | number | null {
+    const ref = normalizeQQMessageRef(value);
+    if (ref === null) return null;
+    return ref;
+}
+
+function normalizeQQEmojiSetFlag(value: unknown): boolean {
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value !== 0;
+    if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (["false", "0", "no", "n", "off", "remove", "delete", "cancel", "取消"].includes(normalized)) return false;
+        if (["true", "1", "yes", "y", "on", "add", "set", "添加"].includes(normalized)) return true;
+    }
+    return true;
+}
+
+function parseQQEmojiRefList(value: unknown): Array<string | number> {
+    const rawItems = Array.isArray(value)
+        ? value
+        : typeof value === "string"
+            ? value.split(/[\s,，;；|]+/)
+            : value === undefined || value === null
+                ? []
+                : [value];
+    const out: Array<string | number> = [];
+    const seen = new Set<string>();
+    for (const raw of rawItems) {
+        const ref = normalizeQQEmojiRef(raw);
+        if (ref === null) continue;
+        const key = String(ref);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(ref);
+    }
+    return out;
+}
+
+function resolveQQAutoReactProbability(config: QQConfig): number {
+    const raw = Number((config as any).groupAutoReactProbability ?? 0.2);
+    if (!Number.isFinite(raw)) return 0;
+    return Math.min(1, Math.max(0, raw));
+}
+
+function pickQQAutoReactEmoji(config: QQConfig): string | number | null {
+    const candidates = parseQQEmojiRefList((config as any).groupAutoReactEmojiIds);
+    if (candidates.length === 0) {
+        const fallback = normalizeQQEmojiRef((config as any).groupAutoReactEmojiId ?? "76");
+        return fallback;
+    }
+    const index = Math.floor(Math.random() * candidates.length);
+    return candidates[index] ?? null;
+}
+
+function extractQQEmojiLikeSummaries(payload: any): Array<{ emojiId: string; emojiType?: string; count?: number; clicked?: boolean }> {
+    const root = payload?.data ?? payload;
+    const candidates = [
+        root?.emoji_likes_list,
+        root?.emojiLikesList,
+        root?.emoji_like_list,
+        root?.message?.emoji_likes_list,
+        root?.message?.emojiLikesList,
+        root?.raw?.emoji_likes_list,
+        root?.raw?.emojiLikesList,
+        root?.likes,
+    ];
+    const list = candidates.find((item) => Array.isArray(item));
+    if (!Array.isArray(list)) return [];
+    return list
+        .map((entry: any) => {
+            const emojiId = String(entry?.emoji_id ?? entry?.emojiId ?? entry?.id ?? entry?.code ?? "").trim();
+            if (!emojiId) return null;
+            const rawCount = entry?.count ?? entry?.likesCnt ?? entry?.likes_count ?? entry?.like_count;
+            const count = Number(rawCount);
+            const rawClicked = entry?.isClicked ?? entry?.is_clicked ?? entry?.clicked;
+            return {
+                emojiId,
+                emojiType: entry?.emoji_type !== undefined ? String(entry.emoji_type) : entry?.emojiType !== undefined ? String(entry.emojiType) : undefined,
+                count: Number.isFinite(count) ? count : undefined,
+                clicked: rawClicked === true || rawClicked === "true" || rawClicked === "1",
+            };
+        })
+        .filter((entry): entry is { emojiId: string; emojiType?: string; count?: number; clicked?: boolean } => Boolean(entry));
+}
+
+function extractQQEmojiLikeUsers(payload: any): Array<{ userId: string; nickName?: string; headUrl?: string }> {
+    const root = payload?.data ?? payload;
+    const candidates = [
+        root?.emoji_like_list,
+        root?.emojiLikeList,
+        root?.emojiLikesList,
+        root?.likes,
+        root?.users,
+    ];
+    const list = candidates.find((item) => Array.isArray(item));
+    if (!Array.isArray(list)) return [];
+    return list
+        .map((entry: any) => {
+            const userId = String(entry?.user_id ?? entry?.userId ?? entry?.tinyId ?? entry?.uin ?? entry?.id ?? "").trim();
+            if (!userId) return null;
+            return {
+                userId,
+                nickName: entry?.nick_name ?? entry?.nickName ?? entry?.nickname ?? entry?.name,
+                headUrl: entry?.headUrl ?? entry?.head_url ?? entry?.avatar,
+            };
+        })
+        .filter((entry): entry is { userId: string; nickName?: string; headUrl?: string } => Boolean(entry));
+}
+
+function renderQQEmojiLikeSummary(messageId: string | number, summaries: Array<{ emojiId: string; emojiType?: string; count?: number; clicked?: boolean }>): string {
+    if (summaries.length === 0) {
+        return `[OpenClawd QQ]\n消息 ${String(messageId)} 当前没有可见的贴表情汇总，或当前 OneBot 实现未返回 emoji_likes_list。`;
+    }
+    const lines = summaries.map((item) => {
+        const parts = [`emoji_id=${item.emojiId}`];
+        if (item.emojiType) parts.push(`type=${item.emojiType}`);
+        if (item.count !== undefined) parts.push(`count=${item.count}`);
+        if (item.clicked) parts.push("self=clicked");
+        return `- ${parts.join(" ")}`;
+    });
+    return `[OpenClawd QQ]\n消息 ${String(messageId)} 的贴表情汇总：\n${lines.join("\n")}\n\n查看某个表情点击者：/查贴表情 ${String(messageId)} <emoji_id>`;
+}
+
+function renderQQEmojiLikeUsers(messageId: string | number, emojiId: string | number, users: Array<{ userId: string; nickName?: string }>): string {
+    if (users.length === 0) {
+        return `[OpenClawd QQ]\n消息 ${String(messageId)} 的 emoji_id=${String(emojiId)} 未返回点击者列表。`;
+    }
+    const lines = users.slice(0, 80).map((user) => `- ${user.nickName ? `${user.nickName} ` : ""}(${user.userId})`);
+    const suffix = users.length > lines.length ? `\n...另有 ${users.length - lines.length} 人` : "";
+    return `[OpenClawd QQ]\n消息 ${String(messageId)} 的 emoji_id=${String(emojiId)} 点击者：\n${lines.join("\n")}${suffix}`;
+}
+
+function isQQEmojiLikeNotice(event: any): boolean {
+    if (event?.post_type !== "notice") return false;
+    const noticeType = String(event?.notice_type ?? "").toLowerCase();
+    return noticeType === "group_msg_emoji_like" || noticeType === "reaction";
+}
+
+function summarizeQQEmojiLikeNotice(event: any): string {
+    const noticeType = String(event?.notice_type ?? "");
+    const groupId = event?.group_id ?? "-";
+    const actorId = event?.user_id ?? event?.operator_id ?? event?.sender_id ?? "-";
+    const messageId = event?.message_id ?? "-";
+    const action = event?.is_add === false || event?.sub_type === "remove" ? "remove" : "add";
+    const likes = extractQQEmojiLikeSummaries(event);
+    const fallbackEmoji = event?.emoji_id ?? event?.code;
+    const renderedLikes = likes.length > 0
+        ? likes.map((item) => `${item.emojiId}${item.count !== undefined ? `x${item.count}` : ""}`).join(",")
+        : fallbackEmoji !== undefined
+            ? String(fallbackEmoji)
+        : "-";
+    return `type=${noticeType} action=${action} group=${groupId} actor=${actorId} msg=${messageId} likes=${renderedLikes}`;
+}
+
+async function setQQMessageEmojiLike(params: {
+    client: OneBotClient;
+    messageId: string | number;
+    emojiId: string | number;
+    set?: boolean;
+}): Promise<{ ok: boolean; data?: any; error?: string }> {
+    try {
+        const data = await params.client.setMsgEmojiLike(params.messageId, params.emojiId, params.set ?? true, 5000);
+        return { ok: true, data };
+    } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+}
+
+async function getQQMessageEmojiLikeSummary(params: {
+    client: OneBotClient;
+    messageId: string | number;
+}): Promise<{ ok: boolean; text: string; data?: any; summaries?: Array<{ emojiId: string; emojiType?: string; count?: number; clicked?: boolean }>; error?: string }> {
+    try {
+        const data = await params.client.getMsg(params.messageId, 5000);
+        const summaries = extractQQEmojiLikeSummaries(data);
+        return {
+            ok: true,
+            text: renderQQEmojiLikeSummary(params.messageId, summaries),
+            data,
+            summaries,
+        };
+    } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        return {
+            ok: false,
+            text: `[OpenClawd QQ]\n查询消息 ${String(params.messageId)} 的贴表情失败：${error}`,
+            error,
+        };
+    }
+}
+
+async function getQQMessageEmojiLikeUsers(params: {
+    client: OneBotClient;
+    messageId: string | number;
+    emojiId: string | number;
+    groupId?: number | string;
+    emojiType?: string | number;
+    count?: number | string;
+}): Promise<{ ok: boolean; text: string; data?: any; users?: Array<{ userId: string; nickName?: string; headUrl?: string }>; error?: string }> {
+    try {
+        const data = await params.client.getMsgEmojiLikes(params.messageId, params.emojiId, {
+            groupId: params.groupId,
+            emojiType: params.emojiType,
+            count: params.count ?? 0,
+            timeoutMs: 7000,
+        });
+        const users = extractQQEmojiLikeUsers(data);
+        return {
+            ok: true,
+            text: renderQQEmojiLikeUsers(params.messageId, params.emojiId, users),
+            data,
+            users,
+        };
+    } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        return {
+            ok: false,
+            text: `[OpenClawd QQ]\n查询消息 ${String(params.messageId)} 的 emoji_id=${String(params.emojiId)} 点击者失败：${error}`,
+            error,
+        };
+    }
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function withSoftTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T, label: string): Promise<T> {
+    const safeTimeoutMs = Number.isFinite(timeoutMs) ? Math.max(0, Math.trunc(timeoutMs)) : 0;
+    if (safeTimeoutMs <= 0) {
+        try {
+            return await promise;
+        } catch (err) {
+            console.warn(`[QQ] ${label} failed: ${String(err)}`);
+            return fallback;
+        }
+    }
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const wrapped = promise.then(
+        (value) => ({ type: "value" as const, value }),
+        (error) => ({ type: "error" as const, error }),
+    );
+    const timeout = new Promise<{ type: "timeout" }>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve({ type: "timeout" }), safeTimeoutMs);
+    });
+
+    try {
+        const result = await Promise.race([wrapped, timeout]);
+        if (result.type === "value") return result.value;
+        if (result.type === "error") {
+            console.warn(`[QQ] ${label} failed: ${String(result.error)}`);
+            return fallback;
+        }
+        console.warn(`[QQ] ${label} timed out after ${safeTimeoutMs}ms; continuing without it`);
+        return fallback;
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+}
 
 function isImageFile(url: string): boolean {
     const lower = (toLocalPathIfAny(url) || url).split("?")[0].split("#")[0].toLowerCase();
     const mime = inferGenericMimeType(url);
     if (mime?.startsWith("image/")) return true;
-    return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp');
+    return lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith(".apng") || lower.endsWith(".avif");
 }
 
 function isAudioFile(url: string): boolean {
@@ -2235,6 +3509,20 @@ function detectMediaKind(...values: Array<string | undefined | null>): MediaKind
     if (sawNonMediaFileExtension) return "file";
     if (values.some((value) => typeof value === "string" && value.startsWith("base64://"))) return "image";
     return "file";
+}
+
+function normalizeOutboundMediaKind(value: unknown): MediaKind | undefined {
+    if (typeof value !== "string") return undefined;
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (normalized === "image" || normalized === "img" || normalized === "picture" || normalized === "photo" || normalized === "sticker" || normalized === "emoji" || normalized === "emoticon") return "image";
+    if (normalized === "audio" || normalized === "voice" || normalized === "record") return "audio";
+    if (normalized === "video") return "video";
+    if (normalized === "file" || normalized === "document" || normalized === "attachment") return "file";
+    if (normalized.startsWith("image/")) return "image";
+    if (normalized.startsWith("audio/")) return "audio";
+    if (normalized.startsWith("video/")) return "video";
+    return undefined;
 }
 
 function classifyMediaError(error: string): "rich_media" | "timeout" | "connection" | "permission" | "unsupported" | "unknown" {
@@ -2445,6 +3733,14 @@ function resolveOutboundMessageId(...candidates: Array<unknown>): string {
     return `qq-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function extractOutboundMessageId(candidate: unknown): string | undefined {
+    if (!candidate || typeof candidate !== "object") return normalizeQQContextId(candidate);
+    const root = (candidate as any).data && typeof (candidate as any).data === "object"
+        ? (candidate as any).data
+        : candidate as any;
+    return normalizeQQContextId(root.message_id ?? root.messageId ?? root.msg_id ?? root.msgId);
+}
+
 function buildQQHiddenMetaBlock(params: {
     accountId: string;
     userId: number;
@@ -2495,7 +3791,7 @@ function resolveReplySessionSourceLabel(activeTempSlot: string | null): string {
 }
 
 function buildReplySessionSourcePrefix(activeTempSlot: string | null): string {
-    return `(from ${resolveReplySessionSourceLabel(activeTempSlot)})`;
+    return `（来自${resolveReplySessionSourceLabel(activeTempSlot)}）`;
 }
 
 function normalizeAssistantTextPhase(value: unknown): "commentary" | "final_answer" | undefined {
@@ -2522,9 +3818,72 @@ function resolveReplyPayloadPhase(payload: any): "commentary" | "final_answer" |
     return undefined;
 }
 
+function isInternalNoticeLine(line: string): boolean {
+    const text = line.trim();
+    if (!text) return false;
+    // OpenClaw diagnostics do not change the retained thinking preference.
+    if (/^Thinking level clamped to \S+ for \S+\/\S+ \(requested \S+; preference retained\)\.?$/i.test(text)) return true;
+    if (/^↪️?\s*Model Fallback:/i.test(text)) return true;
+    if (/Model Fallback:/i.test(text) && /selected model unavailable/i.test(text)) return true;
+    if (/当前服务无响应.*备用线路/.test(text)) return true;
+    if (/没拿到内容，?重发一次/.test(text)) return true;
+    if (/这边没拿到结果，?重发一次/.test(text)) return true;
+    if (/^[-–—*•]*\s*(System|Developer|Assistant|Human|User|Tool|Function|Analysis|Commentary|Final)\s*[:：]/i.test(text)) return true;
+    return /^[-–—*•]*\s*(系统|开发者|助手|用户|工具|函数|分析|旁白|状态|模型切换|模型回退)\s*[:：]/.test(text);
+}
+
+function stripInternalNoticeText(input: string): string {
+    return input
+        .split(/\r?\n/)
+        .filter((line) => !isInternalNoticeLine(line))
+        .join("\n")
+        .trim();
+}
+
+function escapeRegExpText(input: string): string {
+    return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function shortenVisibleModelRefs(input: string): string {
+    let text = input;
+    const providers = [
+        "agentrouter-completions",
+        "agentrouter",
+        "deepseek",
+        "openrouter",
+        "openai",
+        "anthropic",
+        "google",
+        "github-copilot",
+        "copilot",
+        "z.ai",
+        "zai",
+    ];
+    for (const provider of providers) {
+        const re = new RegExp(`\\b${escapeRegExpText(provider)}\\/([A-Za-z0-9][A-Za-z0-9._:-]{1,120})`, "g");
+        text = text.replace(re, "$1");
+    }
+    return text;
+}
+
+function normalizeQQVisibleText(input: string): string {
+    let text = stripInternalNoticeText(input);
+    text = shortenVisibleModelRefs(text);
+    text = text.replace(/[。．.]\s*$/u, "");
+    text = text.replace(/([\u4e00-\u9fff])\s+([\p{Extended_Pictographic}\u2600-\u27bf])/gu, "$1$2");
+    return text.trim();
+}
+
+function isQQStickerLikeRequestText(input: string | undefined | null): boolean {
+    const text = cleanCQCodes(String(input || "")).toLowerCase();
+    if (!text.trim()) return false;
+    return /(?:表情包|发表情|发个表情|来个表情|斗图|梗图|动图|gif|sticker|stickers|meme|memes|reaction\s*image)/i.test(text);
+}
+
 async function sendLongTextAsForwardMessage(params: {
     client: OneBotClient;
-    groupId: number;
+    groupId?: number;
+    userId?: number;
     text?: string;
     texts?: string[];
     nodeName: string;
@@ -2554,17 +3913,28 @@ async function sendLongTextAsForwardMessage(params: {
     };
 
     const attemptForwardSend = async (messages: Array<Record<string, unknown>>, label: string): Promise<boolean> => {
-        const tries: Array<{ action: string; params: Record<string, unknown> }> = [
-            { action: "send_group_forward_msg", params: { group_id: params.groupId, messages } },
-            { action: "send_forward_msg", params: { group_id: params.groupId, messages } },
-        ];
+        const groupId = typeof params.groupId === "number" && Number.isFinite(params.groupId) ? params.groupId : undefined;
+        const userId = typeof params.userId === "number" && Number.isFinite(params.userId) ? params.userId : undefined;
+        const targetLabel = groupId !== undefined ? `group=${groupId}` : userId !== undefined ? `user=${userId}` : "target=unknown";
+        const tries: Array<{ action: string; params: Record<string, unknown> }> = groupId !== undefined
+            ? [
+                { action: "send_group_forward_msg", params: { group_id: groupId, messages } },
+                { action: "send_forward_msg", params: { group_id: groupId, messages } },
+            ]
+            : userId !== undefined
+                ? [
+                    { action: "send_private_forward_msg", params: { user_id: userId, messages } },
+                    { action: "send_forward_msg", params: { user_id: userId, messages } },
+                ]
+                : [];
+        if (tries.length === 0) return false;
         for (const attempt of tries) {
             try {
                 await (params.client as any).sendWithResponse(attempt.action, attempt.params, 15000);
-                console.log(`[QQ] forward-send success mode=${label} nodes=${messages.length} group=${params.groupId} action=${attempt.action}`);
+                console.log(`[QQ] forward-send success mode=${label} nodes=${messages.length} ${targetLabel} action=${attempt.action}`);
                 return true;
             } catch (err) {
-                console.warn(`[QQ] forward-send failed mode=${label} nodes=${messages.length} group=${params.groupId} action=${attempt.action} err=${String(err)}`);
+                console.warn(`[QQ] forward-send failed mode=${label} nodes=${messages.length} ${targetLabel} action=${attempt.action} err=${String(err)}`);
             }
         }
         return false;
@@ -2699,36 +4069,97 @@ async function sendOneBotMessageWithAck(client: OneBotClient, to: string, messag
 
 function collectOutboundMediaItemsFromPayload(payload: any): QQOutboundMediaItem[] {
     const items: QQOutboundMediaItem[] = [];
-    const push = (url: unknown, name?: unknown) => {
+    const push = (url: unknown, name?: unknown, kind?: unknown) => {
         if (typeof url !== "string") return;
         const trimmed = url.trim();
         if (!trimmed) return;
-        items.push({ url: trimmed, ...(typeof name === "string" && name.trim() ? { name: name.trim() } : {}) });
+        const kindHint = normalizeOutboundMediaKind(kind);
+        items.push({
+            url: trimmed,
+            ...(typeof name === "string" && name.trim() ? { name: name.trim() } : {}),
+            ...(kindHint ? { kind: kindHint } : {}),
+        });
+    };
+    const pushObject = (value: unknown, defaultKind?: MediaKind) => {
+        if (typeof value === "string") {
+            push(value, undefined, defaultKind);
+            return;
+        }
+        if (!value || typeof value !== "object") return;
+        const obj = value as Record<string, unknown>;
+        const kindHint = normalizeOutboundMediaKind(obj.kind)
+            ?? normalizeOutboundMediaKind(obj.type)
+            ?? normalizeOutboundMediaKind(obj.mediaType)
+            ?? normalizeOutboundMediaKind(obj.mimeType)
+            ?? defaultKind;
+        push(
+            obj.url ?? obj.mediaUrl ?? obj.imageUrl ?? obj.stickerUrl ?? obj.emojiUrl ?? obj.localPath ?? obj.path ?? obj.filePath ?? obj.file,
+            obj.name ?? obj.filename ?? obj.fileName ?? obj.title,
+            kindHint,
+        );
     };
 
     if (Array.isArray(payload?.mediaUrls)) {
-        for (const url of payload.mediaUrls) push(url);
+        for (const url of payload.mediaUrls) pushObject(url);
     }
-    push(payload?.mediaUrl);
+    push(payload?.mediaUrl, undefined, payload?.mediaKind ?? payload?.type ?? payload?.mimeType);
+
+    if (Array.isArray(payload?.imageUrls)) {
+        for (const image of payload.imageUrls) pushObject(image, "image");
+    }
+    push(payload?.imageUrl, payload?.imageName ?? payload?.name, "image");
+    pushObject(payload?.image, "image");
+
+    if (Array.isArray(payload?.images)) {
+        for (const image of payload.images) pushObject(image, "image");
+    }
+
+    if (Array.isArray(payload?.stickerUrls)) {
+        for (const sticker of payload.stickerUrls) pushObject(sticker, "image");
+    }
+    push(payload?.stickerUrl, payload?.stickerName ?? payload?.name, "image");
+    pushObject(payload?.sticker, "image");
+
+    if (Array.isArray(payload?.stickers)) {
+        for (const sticker of payload.stickers) pushObject(sticker, "image");
+    }
+
+    if (Array.isArray(payload?.emojiUrls)) {
+        for (const emoji of payload.emojiUrls) pushObject(emoji, "image");
+    }
+    push(payload?.emojiUrl, payload?.emojiName ?? payload?.name, "image");
+    pushObject(payload?.emoji, "image");
+
+    if (Array.isArray(payload?.emojis)) {
+        for (const emoji of payload.emojis) pushObject(emoji, "image");
+    }
+
+    if (Array.isArray(payload?.emoticonUrls)) {
+        for (const emoticon of payload.emoticonUrls) pushObject(emoticon, "image");
+    }
+    push(payload?.emoticonUrl, payload?.emoticonName ?? payload?.name, "image");
+    pushObject(payload?.emoticon, "image");
+
+    if (Array.isArray(payload?.emoticons)) {
+        for (const emoticon of payload.emoticons) pushObject(emoticon, "image");
+    }
 
     if (Array.isArray(payload?.files)) {
         for (const file of payload.files) {
-            if (typeof file === "string") {
-                push(file);
-                continue;
-            }
-            if (!file || typeof file !== "object") continue;
-            push(
-                file.url ?? file.mediaUrl ?? file.localPath ?? file.path ?? file.filePath ?? file.file,
-                file.name ?? file.filename ?? file.fileName,
-            );
+            pushObject(file);
+        }
+    }
+
+    if (Array.isArray(payload?.attachments)) {
+        for (const attachment of payload.attachments) {
+            pushObject(attachment);
         }
     }
 
     const unique: QQOutboundMediaItem[] = [];
     const seen = new Set<string>();
     for (const item of items) {
-        const key = `${item.url}|${item.name || ""}`;
+        const key = `${item.url}|${item.name || ""}|${item.kind || ""}`;
         if (seen.has(key)) continue;
         seen.add(key);
         unique.push(item);
@@ -2751,6 +4182,12 @@ function getRuntimeCfgForAccount(accountId: string | undefined | null): Partial<
         || accountConfigs.get(normalizeAccountId(lookupId))
         || accountConfigs.get(DEFAULT_ACCOUNT_ID)
         || {}) as Partial<QQConfig>;
+}
+
+function resolveQQMessageFont(config: Partial<QQConfig> | undefined | null): number | undefined {
+    const raw = Number((config as any)?.messageFont ?? 0);
+    if (!Number.isFinite(raw) || raw <= 0) return undefined;
+    return Math.trunc(raw);
 }
 
 async function sendQQTextMessage(params: {
@@ -2826,7 +4263,9 @@ async function sendQQMediaMessage(params: {
     }
 
     const fileName = sanitizeQQFileName(params.fileNameHint || guessFileName(mediaUrl));
-    const sourceKind = params.forceDocument ? "file" : detectMediaKind(params.fileNameHint, mediaUrl);
+    const hintedKind = normalizeOutboundMediaKind(params.mediaKindHint);
+    const detectedKind = detectMediaKind(params.fileNameHint, mediaUrl);
+    const sourceKind = hintedKind ?? detectedKind;
 
     let textAck: any = null;
     if (params.text && params.text.trim()) {
@@ -2844,11 +4283,11 @@ async function sendQQMediaMessage(params: {
     const mediaMessage: OneBotMessage = [];
     if (params.replyToId && !(params.text && params.text.trim())) mediaMessage.push({ type: "reply", data: { id: String(params.replyToId) } });
 
-    const mediaKind = sourceKind;
+    const mediaKind = sourceKind === "image" ? "image" : params.forceDocument ? "file" : sourceKind;
     const audioLike = mediaKind === "audio";
     const imageLike = mediaKind === "image";
     const videoLike = mediaKind === "video";
-    const fileLike = mediaKind === "file" || params.forceDocument === true;
+    const fileLike = mediaKind === "file";
 
     if (audioLike && textAck) {
         const configuredDelay = Number(runtimeCfg.rateLimitMs ?? 1000);
@@ -2890,6 +4329,10 @@ async function sendQQMediaMessage(params: {
     if (!mediaAck.ok) {
         const primaryError = mediaAck.error || "unknown";
         const errorClass = classifyMediaError(primaryError);
+        if (imageLike) {
+            console.warn(`[QQ] image send failed, not falling back to file upload: ${primaryError}`);
+            throw new Error(`Image send failed: ${primaryError} [${errorClass}]`);
+        }
         const uploadAck = await uploadFileToTarget(params.client, params.to, uploadableFileRef, fileName);
         if (uploadAck.ok) {
             return {
@@ -2936,6 +4379,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
     capabilities: {
         chatTypes: ["direct", "group"],
         media: true,
+        reactions: true,
         blockStreaming: true,
         // @ts-ignore
         deleteMessage: true,
@@ -2957,6 +4401,34 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 fastFailErrors: {
                     label: "快速跳过错误关键词",
                     help: "默认关闭（空数组）。填写如 401、Unauthorized、余额不足 后，命中时会直接跳过当前模型。",
+                },
+                groupAutoReact: {
+                    label: "群聊随机贴表情",
+                    help: "默认关闭。开启后，只有本 bot 实际回复某条群消息后，才按概率给那条消息贴 QQ 表情。",
+                },
+                groupAutoReactProbability: {
+                    label: "随机贴表情概率",
+                    help: "默认 0.2。0=不随机贴，1=每次回复都贴。",
+                },
+                groupAutoReactEmojiIds: {
+                    label: "随机贴表情池",
+                    help: "填写 NapCat/QQ 的 emoji_id 列表，用逗号或空格分隔；默认使用当前 NapCat QQ 表情全集。",
+                },
+                groupAutoReactEmojiId: {
+                    label: "兼容旧表情 ID",
+                    help: "当随机贴表情池为空时使用这个单个 emoji_id。",
+                },
+                conversationContextLimit: {
+                    label: "近期上下文条数",
+                    help: "默认 10。即使群聊开启每条消息独立会话，也会把同一群/私聊最近消息注入给模型；设 0 关闭。",
+                },
+                conversationContextMaxChars: {
+                    label: "近期上下文最大字符数",
+                    help: "默认 2400。过长会优先保留最新消息。",
+                },
+                includeRecalledMessagesInContext: {
+                    label: "保留撤回消息上下文",
+                    help: "默认开启。已收到并缓存的撤回消息会以 [已撤回] 标记继续作为上下文。",
                 },
                 queueDebounceMs: {
                     label: "同会话消息合并窗口（毫秒）",
@@ -2988,7 +4460,11 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 },
                 showReplySessionSource: {
                     label: "回复前标注来源会话",
-                    help: "默认开启。回复前会自动加上 `(from 主会话)` 或 `(from 会话xxx)`，特别适合用了 /会话 之后快速分辨当前回复来自哪个会话。",
+                    help: "默认开启。回复前会自动加上 `（来自主会话）` 或 `（来自会话xxx）`，特别适合用了 /会话 之后快速分辨当前回复来自哪个会话。",
+                },
+                messageFont: {
+                    label: "发送字体参数",
+                    help: "默认 0 表示不显式设置。若当前 OneBot/NapCat 支持 QQ font 数字参数，可填对应字体编号，群聊和私聊都会透传。",
                 },
                 keywordOnlyTrigger: {
                     label: "群聊仅关键词触发",
@@ -3104,6 +4580,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 wsUrl: account.config.wsUrl,
                 accessToken: account.config.accessToken,
             });
+            client.setDefaultSendOptions({ font: resolveQQMessageFont(account.config) });
 
             return new Promise((resolve) => {
                 const timer = setTimeout(() => {
@@ -3202,6 +4679,100 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
             };
         }
     },
+    actions: {
+        describeMessageTool: () => ({
+            actions: ["react", "reactions"] as any,
+            capabilities: ["presentation"] as any,
+        }),
+        supportsAction: ({ action }) => action === "react" || action === "reactions",
+        handleAction: async ({ action, params, accountId, toolContext }) => {
+            const client = getClientForAccount(accountId || DEFAULT_ACCOUNT_ID);
+            if (!client) {
+                return jsonResult({
+                    ok: false,
+                    channel: "qq",
+                    action,
+                    error: "QQ client not connected",
+                });
+            }
+
+            const messageId = normalizeQQMessageRef(
+                pickFirstDefined(params as any, ["message_id", "messageId", "message", "id", "target_message_id", "targetMessageId"])
+                ?? (toolContext as any)?.currentMessageId
+            );
+            if (messageId === null) {
+                return jsonResult({
+                    ok: false,
+                    channel: "qq",
+                    action,
+                    error: "QQ reaction action requires message_id or current message context",
+                });
+            }
+
+            if (action === "react") {
+                const emojiId = normalizeQQEmojiRef(
+                    pickFirstDefined(params as any, ["emoji_id", "emojiId", "emoji", "reaction", "code"])
+                );
+                if (emojiId === null) {
+                    return jsonResult({
+                        ok: false,
+                        channel: "qq",
+                        action,
+                        error: "QQ react requires emoji_id",
+                    });
+                }
+                const set = normalizeQQEmojiSetFlag(
+                    pickFirstDefined(params as any, ["set", "is_set", "add", "enabled", "value"])
+                );
+                const result = await setQQMessageEmojiLike({ client, messageId, emojiId, set });
+                return jsonResult({
+                    ok: result.ok,
+                    channel: "qq",
+                    action,
+                    message_id: messageId,
+                    emoji_id: emojiId,
+                    set,
+                    data: result.data,
+                    error: result.error,
+                });
+            }
+
+            const emojiId = normalizeQQEmojiRef(
+                pickFirstDefined(params as any, ["emoji_id", "emojiId", "emoji", "reaction", "code"])
+            );
+            if (emojiId === null) {
+                const summary = await getQQMessageEmojiLikeSummary({ client, messageId });
+                return jsonResult({
+                    ok: summary.ok,
+                    channel: "qq",
+                    action,
+                    message_id: messageId,
+                    summaries: summary.summaries ?? [],
+                    data: summary.data,
+                    error: summary.error,
+                });
+            }
+
+            const users = await getQQMessageEmojiLikeUsers({
+                client,
+                messageId,
+                emojiId,
+                groupId: pickFirstDefined(params as any, ["group_id", "groupId"]),
+                emojiType: pickFirstDefined(params as any, ["emoji_type", "emojiType"]),
+                count: pickFirstDefined(params as any, ["count", "limit"]),
+            });
+            return jsonResult({
+                ok: users.ok,
+                channel: "qq",
+                action,
+                message_id: messageId,
+                emoji_id: emojiId,
+                users: users.users ?? [],
+                data: users.data,
+                error: users.error,
+            });
+        },
+    },
     gateway: {
         startAccount: async (ctx) => {
             const { account, cfg } = ctx;
@@ -3249,6 +4820,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                 wsUrl: config.wsUrl,
                 accessToken: config.accessToken,
             });
+            client.setDefaultSendOptions({ font: resolveQQMessageFont(config) });
 
             const isStaleGeneration = () => accountStartGeneration.get(account.accountId) !== accountGen;
 
@@ -3315,6 +4887,17 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         return;
                     }
 
+                    if (isQQEmojiLikeNotice(event)) {
+                        console.log(`[QQ] emoji-like notice ${summarizeQQEmojiLikeNotice(event)}`);
+                        return;
+                    }
+
+                    if (isQQRecallNotice(event)) {
+                        markQQConversationMessageRecalled({ accountId: account.accountId, event });
+                        console.log(`[QQ] recall notice ${summarizeQQRecallNotice(event)}`);
+                        return;
+                    }
+
                     if (event.post_type === "notice" && event.notice_type === "notify" && event.sub_type === "poke") {
                         if (String(event.target_id) === String(client.getSelfId())) {
                             event.post_type = "message";
@@ -3352,11 +4935,14 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                     const audioHints: QQInboundAttachmentHint[] = [];
                     const imageHints: string[] = [];
                     const imageHintMeta = new Map<string, { fileName?: string; mimeType?: string }>();
+                    let hasCurrentInboundNonTextContent =
+                        /\[CQ:(?:image|mface|face|emoji|emoticon|sticker|marketface|file|record|video|forward|forward_msg|nodes|music)[,\]]/i.test(inboundRawMessage) ||
+                        extractTextualEmojiPlaceholders(inboundRawMessage).length > 0;
 
                     if (Array.isArray(event.message)) {
                         let resolvedText = "";
                         for (const seg of event.message) {
-                            if (seg.type === "text") resolvedText += seg.data?.text || "";
+                            if (seg.type === "text") resolvedText += normalizeInboundTextEntities(seg.data?.text || "");
                             else if (seg.type === "at") {
                                 let name = seg.data?.qq;
                                 if (name !== "all" && isGroup) {
@@ -3364,41 +4950,56 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     if (cached) name = cached;
                                     else {
                                         try {
-                                            const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: name });
+                                            const info = await (client as any).sendWithResponse("get_group_member_info", { group_id: groupId, user_id: name }, QQ_CONTEXT_FETCH_TIMEOUT_MS);
                                             name = info?.card || info?.nickname || name;
                                             setCachedMemberName(String(groupId), String(seg.data.qq), name);
                                         } catch (e) { }
                                     }
                                 }
-                                resolvedText += ` @${name} `;
+                                resolvedText += `@${name}`;
                             } else if (seg.type === "record") {
+                                hasCurrentInboundNonTextContent = true;
                                 const audioHint = await collectAudioHintFromOneBotSegment(seg);
                                 rememberAttachmentHint(audioHints, audioHint);
                                 resolvedText += ` [语音消息]${seg.data?.text ? `(${seg.data.text})` : ""}`;
                             }
-                            else if (seg.type === "image") {
-                                const imageUrl = await resolveOneBotImageUrl(client, seg);
+                            else if (isImageLikeOneBotSegment(seg)) {
+                                hasCurrentInboundNonTextContent = true;
+                                const imageUrl = seg.type === "image"
+                                    ? await resolveOneBotImageUrl(client, seg)
+                                    : readOneBotImageLikeUrl(seg);
+                                const label = getOneBotImageLikeLabel(seg);
                                 if (imageUrl) {
                                     rememberImageHint(imageHints, imageHintMeta, {
                                         url: imageUrl,
                                         fileName: typeof seg.data?.file === "string" ? guessFileName(seg.data.file) : undefined,
                                         mimeType: inferImageMimeType(typeof seg.data?.file === "string" ? seg.data.file : undefined),
                                     });
-                                    resolvedText += ` [图片: ${imageUrl}]`;
+                                    resolvedText += ` [表情图片:${label}, ${imageUrl}]`;
                                 } else {
-                                    resolvedText += " [图片]";
+                                    resolvedText += ` [表情图片:${label}]`;
                                 }
                             }
                             else if (seg.type === "video") {
+                                hasCurrentInboundNonTextContent = true;
                                 const videoHint = await collectVideoHintFromOneBotSegment(seg);
                                 rememberAttachmentHint(fileHints, videoHint);
                                 if (videoHint?.url) resolvedText += ` [视频: ${videoHint.url}]`;
                                 else resolvedText += " [视频消息]";
                             }
-                            else if (seg.type === "json") resolvedText += " [卡片消息]";
+                            else if (seg.type === "json" || seg.type === "xml" || seg.type === "share") {
+                                const cardSummary = summarizeOneBotLinkLikeSegment(seg);
+                                resolvedText += cardSummary.text || " [卡片消息]";
+                            }
                             else if (seg.type === "forward" && seg.data?.id) {
+                                hasCurrentInboundNonTextContent = true;
                                 try {
-                                    const forwardData = await client.getForwardMsg(seg.data.id);
+                                    const forwardData = await withSoftTimeout(
+                                        client.getForwardMsg(seg.data.id, QQ_CONTEXT_FETCH_TIMEOUT_MS),
+                                        QQ_CONTEXT_FETCH_TIMEOUT_MS,
+                                        null,
+                                        "current forward preview",
+                                    );
                                     if (forwardData?.messages) {
                                         resolvedText += "\n[转发聊天记录]:";
                                         for (const m of forwardData.messages.slice(0, 10)) {
@@ -3407,6 +5008,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                     }
                                 } catch (e) { }
                             } else if (seg.type === "file") {
+                                hasCurrentInboundNonTextContent = true;
                                 const fileHint = await collectFileHintFromOneBotSegment(client, seg, { groupId: isGroup ? groupId : undefined, userId });
                                 rememberAttachmentHint(fileHints, fileHint);
                                 const shortHint = fileHint?.url
@@ -3415,13 +5017,31 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                                         ? ` [文件: ${fileHint.name}, file_id=${fileHint.fileId}${fileHint.busid ? `, busid=${fileHint.busid}` : ""}]`
                                         : ` [文件: ${fileHint?.name || "未命名"}]`;
                                 resolvedText += shortHint;
+                            } else if (seg.type && seg.type !== "reply") {
+                                hasCurrentInboundNonTextContent = true;
                             }
                         }
-                        if (resolvedText) text = resolvedText;
+                        if (resolvedText) text = normalizeInboundTextEntities(resolvedText);
                     }
+                    text = normalizeInboundTextEntities(text);
 
                     if (blockedUserIds.includes(userId)) return;
                     if (isGroup && allowedGroupIds.length && !allowedGroupIds.includes(groupId)) return;
+
+                    rememberQQConversationMessage({
+                        accountId: account.accountId,
+                        isGroup,
+                        isGuild,
+                        groupId,
+                        guildId,
+                        channelId,
+                        userId,
+                        senderName: event.sender?.card || event.sender?.nickname || event.sender?.user_id || userId,
+                        source: "user",
+                        text,
+                        messageId: event.message_id,
+                        timestampMs: event.time,
+                    });
 
                     const isAdmin = adminIds.includes(userId);
                     await ensureTempSessionSlotsLoaded();
@@ -3478,7 +5098,7 @@ export const qqChannel: ChannelPlugin<ResolvedQQAccount> = {
                         if (!isAdmin) {
                             console.warn(`[QQCMD] session command denied: non-admin user=${userId} group=${groupId ?? "-"}`);
                             if (config.notifyNonAdminBlocked) {
-                                client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] 当前仅管理员可使用会话命令。`);
+                                client.sendGroupMsg(groupId, "当前仅管理员可使用会话命令。");
                             }
                             return;
                         }
@@ -3662,10 +5282,11 @@ ${current}
                             const dynamicModelCatalogEnabled = config.enableDynamicModelCatalog === true;
                             console.log(`[QQCMD] local model catalog user=${userId} group=${groupId ?? "-"} dynamic=${String(dynamicModelCatalogEnabled)}`);
                             const catalog = await buildModelCatalogText(dynamicModelCatalogEnabled);
-                            if (isGroup) {
+                            if (!isGuild && !isGroup) {
                                 const sentAsForward = await sendLongTextAsForwardMessage({
                                     client,
-                                    groupId,
+                                    groupId: isGroup ? groupId : undefined,
+                                    userId: isGroup ? undefined : userId,
                                     text: catalog,
                                     nodeName: (config.forwardNodeName || "OpenClaw").trim() || "OpenClaw",
                                     nodeUin: String(client.getSelfId() || userId),
@@ -3699,6 +5320,47 @@ ${current}
                             }
                             return;
                         }
+                        if (cmd === '/贴表情' || cmd === '/react') {
+                            const messageId = normalizeQQMessageRef(parts[1]);
+                            const emojiId = normalizeQQEmojiRef(parts[2]);
+                            const set = normalizeQQEmojiSetFlag(parts[3]);
+                            if (messageId === null || emojiId === null) {
+                                const usage = `[OpenClawd QQ]\n用法：/贴表情 <message_id> <emoji_id> [true|false]\n示例：/贴表情 123456 76`;
+                                if (isGroup) client.sendGroupMsg(groupId, usage);
+                                else client.sendPrivateMsg(userId, usage);
+                                return;
+                            }
+                            const result = await setQQMessageEmojiLike({ client, messageId, emojiId, set });
+                            const msg = result.ok
+                                ? `[OpenClawd QQ]\n已${set ? "添加" : "取消"}贴表情：message_id=${String(messageId)} emoji_id=${String(emojiId)}`
+                                : `[OpenClawd QQ]\n贴表情失败：${result.error ?? "unknown error"}`;
+                            if (isGroup) client.sendGroupMsg(groupId, msg);
+                            else client.sendPrivateMsg(userId, msg);
+                            return;
+                        }
+                        if (cmd === '/查贴表情' || cmd === '/reactions') {
+                            const messageId = normalizeQQMessageRef(parts[1]);
+                            const emojiId = normalizeQQEmojiRef(parts[2]);
+                            const count = parts[3] && /^\d+$/.test(parts[3]) ? Number(parts[3]) : 0;
+                            if (messageId === null) {
+                                const usage = `[OpenClawd QQ]\n用法：/查贴表情 <message_id> [emoji_id] [count]\n不传 emoji_id 时返回表情汇总；传 emoji_id 时返回点击者列表。`;
+                                if (isGroup) client.sendGroupMsg(groupId, usage);
+                                else client.sendPrivateMsg(userId, usage);
+                                return;
+                            }
+                            const result = emojiId === null
+                                ? await getQQMessageEmojiLikeSummary({ client, messageId })
+                                : await getQQMessageEmojiLikeUsers({
+                                    client,
+                                    messageId,
+                                    emojiId,
+                                    groupId: isGroup ? groupId : undefined,
+                                    count,
+                                });
+                            if (isGroup) client.sendGroupMsg(groupId, result.text);
+                            else client.sendPrivateMsg(userId, result.text);
+                            return;
+                        }
                         if (cmd === '/newsession') {
                             const runtimeForReset = getQQRuntime();
                             const baseFromIdForReset = isGroup
@@ -3721,7 +5383,7 @@ ${current}
                             const notice = resetOk
                                 ? "✅ 当前会话已重置。请继续发送你的问题。"
                                 : "ℹ️ 当前会话本就为空，已为你准备新会话。";
-                            if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${notice}`);
+                            if (isGroup) client.sendGroupMsg(groupId, notice);
                             else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, notice);
                             else client.sendPrivateMsg(userId, notice);
                             return;
@@ -3732,7 +5394,7 @@ ${current}
                             const draw = await grokDrawDirect(prompt);
                             if (draw.ok === false) {
                                 const fail = `[OpenClawd QQ]\n❌ ${draw.error}`;
-                                if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${fail}`);
+                                if (isGroup) client.sendGroupMsg(groupId, fail);
                                 else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, fail);
                                 else client.sendPrivateMsg(userId, fail);
                                 return;
@@ -3761,6 +5423,8 @@ ${current}
 /会话结束 - 结束当前会话
 /newsession - 重置当前会话
 /modelsync - 同步模型allowlist（按provider /models）
+/贴表情 <message_id> <emoji_id> - 给消息贴表情
+/查贴表情 <message_id> [emoji_id] - 查看消息贴表情
 /mute @用户 [分] - 禁言
 /kick @用户 - 踢出
 /help - 帮助`;
@@ -3799,15 +5463,25 @@ ${current}
                         );
                     }
                     if (replyMsgId) {
-                        try { repliedMsg = await client.getMsg(replyMsgId); } catch (err) { }
+                        repliedMsg = await withSoftTimeout(
+                            client.getMsg(replyMsgId, QQ_CONTEXT_FETCH_TIMEOUT_MS),
+                            QQ_CONTEXT_FETCH_TIMEOUT_MS,
+                            null,
+                            "reply message fetch",
+                        );
                     }
 
                     if (repliedMsg) {
                         try {
-                            await hydrateOneBotMessageMedia(client, Array.isArray(repliedMsg.message) ? repliedMsg.message : undefined, {
-                                groupId: repliedMsg?.group_id ?? groupId,
-                                userId: repliedMsg?.user_id ?? userId,
-                            });
+                            await withSoftTimeout(
+                                hydrateOneBotMessageMedia(client, Array.isArray(repliedMsg.message) ? repliedMsg.message : undefined, {
+                                    groupId: repliedMsg?.group_id ?? groupId,
+                                    userId: repliedMsg?.user_id ?? userId,
+                                }),
+                                QQ_CONTEXT_FETCH_TIMEOUT_MS,
+                                undefined,
+                                "reply media hydrate",
+                            );
                             const replyImageHints = extractImageHints(Array.isArray(repliedMsg.message) ? repliedMsg.message : repliedMsg.raw_message, 5);
                             for (const hint of replyImageHints) {
                                 rememberImageHint(imageHints, imageHintMeta, hint);
@@ -3842,12 +5516,21 @@ ${current}
                     }
 
                     let historyContext = "";
-                    if (isGroup && config.historyLimit !== 0) {
+                    const groupHistoryLimit = Number(config.historyLimit ?? 0);
+                    if (isGroup && Number.isFinite(groupHistoryLimit) && groupHistoryLimit > 0) {
                         try {
-                            const history = await client.getGroupMsgHistory(groupId);
+                            const history = await withSoftTimeout(
+                                client.getGroupMsgHistory(groupId, QQ_HISTORY_FETCH_TIMEOUT_MS),
+                                QQ_HISTORY_FETCH_TIMEOUT_MS,
+                                null,
+                                "group history fetch",
+                            );
                             if (history?.messages) {
-                                const limit = config.historyLimit || 5;
-                                historyContext = history.messages.slice(-(limit + 1), -1).map((m: any) => `${m.sender?.nickname || m.user_id}: ${cleanCQCodes(m.raw_message || "")}`).join("\n");
+                                const limit = Math.floor(groupHistoryLimit);
+                                historyContext = history.messages.slice(-(limit + 1), -1)
+                                    .map((m: any) => sanitizeGroupHistoryLineForModel(`${m.sender?.nickname || m.user_id}: ${cleanCQCodes(m.raw_message || "")}`))
+                                    .filter(Boolean)
+                                    .join("\n");
                             }
                         } catch (e) { }
                     }
@@ -3906,13 +5589,23 @@ ${current}
                             blockedNotifyCache.set(cacheKey, now);
                             const msg = (config.nonAdminBlockedMessage || "当前仅管理员可触发机器人。\n如需使用请联系管理员。").trim();
                             if (msg) {
-                                if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${msg}`);
+                                if (isGroup) client.sendGroupMsg(groupId, msg);
                                 else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, msg);
                                 else client.sendPrivateMsg(userId, msg);
                             }
                         }
                         return;
                     }
+
+                    const pendingAutoReact = (() => {
+                        if (!isGroup || config.groupAutoReact !== true || event.message_id === undefined) return null;
+                        const probability = resolveQQAutoReactProbability(config);
+                        if (probability <= 0 || Math.random() >= probability) return null;
+                        const messageId = normalizeQQMessageRef(event.message_id);
+                        const emojiId = pickQQAutoReactEmoji(config);
+                        if (messageId === null || emojiId === null) return null;
+                        return { messageId, emojiId, probability };
+                    })();
 
                     let baseFromId = String(userId);
                     let conversationLabel = `QQ User ${userId}`;
@@ -3922,7 +5615,12 @@ ${current}
                         let resolvedGroupName = cachedGroupName || "";
                         if (!resolvedGroupName) {
                             try {
-                                const groupInfo = await client.getGroupInfo(groupId);
+                                const groupInfo = await withSoftTimeout(
+                                    client.getGroupInfo(groupId, true, QQ_GROUP_INFO_FETCH_TIMEOUT_MS),
+                                    QQ_GROUP_INFO_FETCH_TIMEOUT_MS,
+                                    null,
+                                    "group info fetch",
+                                );
                                 const groupName = typeof groupInfo?.group_name === "string"
                                     ? groupInfo.group_name.trim()
                                     : (typeof groupInfo?.data?.group_name === "string" ? groupInfo.data.group_name.trim() : "");
@@ -3939,7 +5637,16 @@ ${current}
                         baseFromId = `guild:${guildId}:${channelId}`;
                         conversationLabel = `QQ Guild ${guildId} Channel ${channelId}`;
                     }
-                    const fromId = buildEffectiveFromId(baseFromId, activeTempSlot);
+                    const stableFromId = buildEffectiveFromId(baseFromId, activeTempSlot);
+                    const usePerMessageGroupSession =
+                        isGroup &&
+                        !activeTempSlot &&
+                        !forceTriggered &&
+                        !inlineCommand &&
+                        config.groupPerMessageSessions === true;
+                    const fromId = usePerMessageGroupSession
+                        ? buildPerMessageFromId(stableFromId, event, userId)
+                        : stableFromId;
                     const deliveryTo = buildEffectiveFromId(
                         isGroup
                             ? `group:${String(groupId)}`
@@ -3970,6 +5677,9 @@ ${current}
                             id: fromId,
                         },
                     });
+                    if (usePerMessageGroupSession) {
+                        console.log(`[QQ] per-message group session route base=${stableFromId} session=${route.sessionKey} msg=${String(event.message_id ?? "-")}`);
+                    }
 
                     let deliveredAnything = false;
                     // Track generated visible output separately from delivery completion.
@@ -3980,8 +5690,9 @@ ${current}
                     let sawReplyContent = false;
                     let dispatcherError: any = null;
                     let currentRunState: { isStale: () => boolean } | null = null;
+                    let autoReactDispatched = false;
                     const forwardThreshold = Number(config.forwardLongReplyThreshold ?? 0);
-                    const canUseMergedForward = isGroup && Number.isFinite(forwardThreshold) && forwardThreshold > 0;
+                    const canUseMergedForward = !isGuild && !isGroup && Number.isFinite(forwardThreshold) && forwardThreshold > 0;
                     const unknownBlockBoundaryThreshold = Number.isFinite(forwardThreshold) && forwardThreshold > 0 ? forwardThreshold : 300;
                     const unknownBlockMergeWindowMs = 350;
                     const bufferedFinalTexts: string[] = [];
@@ -4002,12 +5713,55 @@ ${current}
                         return prefix;
                     };
 
+                    const maybeDispatchAutoReactAfterReply = (phase: string) => {
+                        if (!pendingAutoReact || autoReactDispatched || currentRunState?.isStale()) return;
+                        autoReactDispatched = true;
+                        void setQQMessageEmojiLike({
+                            client,
+                            messageId: pendingAutoReact.messageId,
+                            emojiId: pendingAutoReact.emojiId,
+                            set: true,
+                        }).then((result) => {
+                            if (result.ok) {
+                                console.log(`[QQ] random emoji-like ok phase=${phase} group=${groupId} msg=${String(pendingAutoReact.messageId)} emoji=${String(pendingAutoReact.emojiId)} p=${pendingAutoReact.probability}`);
+                            } else {
+                                console.warn(`[QQ] random emoji-like failed phase=${phase} group=${groupId} msg=${String(pendingAutoReact.messageId)} emoji=${String(pendingAutoReact.emojiId)} err=${result.error ?? "unknown"}`);
+                            }
+                        }).catch((err) => {
+                            console.warn(`[QQ] random emoji-like error phase=${phase} group=${groupId} msg=${String(pendingAutoReact.messageId)} emoji=${String(pendingAutoReact.emojiId)} err=${String(err)}`);
+                        });
+                    };
+
+                    const rememberBotConversationReply = (replyText: string, messageId?: unknown) => {
+                        const textForContext = compactQQContextText(replyText, 900);
+                        if (!textForContext) return;
+                        rememberQQConversationMessage({
+                            accountId: account.accountId,
+                            isGroup,
+                            isGuild,
+                            groupId,
+                            guildId,
+                            channelId,
+                            userId,
+                            senderName: "机器人",
+                            source: "bot",
+                            text: textForContext,
+                            messageId,
+                            timestampMs: Date.now(),
+                        });
+                    };
+
                     const sendSessionSourcePrefixOnly = async (): Promise<boolean> => {
                         const prefix = takeReplySessionSourcePrefix();
                         if (!prefix || currentRunState?.isStale()) return false;
-                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${prefix}`);
-                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, prefix);
-                        else client.sendPrivateMsg(userId, prefix);
+                        const result = await sendOneBotMessageWithAck(client, deliveryTo, prefix);
+                        if (!result.ok) {
+                            console.warn(`[QQ] text send failed phase=session_source target=${deliveryTo} err=${result.error || "unknown"}`);
+                            return false;
+                        }
+                        console.log(`[QQ] text delivered phase=session_source target=${deliveryTo}`);
+                        rememberBotConversationReply(prefix, extractOutboundMessageId(result.data));
+                        maybeDispatchAutoReactAfterReply("session_source");
                         return true;
                     };
 
@@ -4031,7 +5785,8 @@ ${current}
                     };
 
                     const prepareOutgoingText = async (msg: string): Promise<string> => {
-                        let processed = msg;
+                        let processed = normalizeQQVisibleText(msg);
+                        if (!processed) return "";
                         const sessionPrefix = takeReplySessionSourcePrefix();
                         if (sessionPrefix) {
                             processed = processed.trim()
@@ -4045,15 +5800,39 @@ ${current}
 
                     const sendProcessedText = async (processed: string): Promise<boolean> => {
                         if (currentRunState?.isStale()) return false;
+                        if (canUseMergedForward && processed.length >= forwardThreshold) {
+                            const sentAsForward = await sendLongTextAsForwardMessage({
+                                client,
+                                groupId: isGroup ? groupId : undefined,
+                                userId: isGroup ? undefined : userId,
+                                text: processed,
+                                nodeName: (config.forwardNodeName || "OpenClaw").trim() || "OpenClaw",
+                                nodeUin: String(client.getSelfId() || userId),
+                                nodeCharLimit: Number(config.forwardNodeCharLimit ?? 0),
+                            });
+                            if (currentRunState?.isStale()) return false;
+                            if (sentAsForward) {
+                                console.log(`[QQ] merged-forward delivered phase=single_text len=${processed.length} threshold=${forwardThreshold} target=${deliveryTo}`);
+                                rememberBotConversationReply(processed);
+                                maybeDispatchAutoReactAfterReply("merged_forward_single_text");
+                                return true;
+                            }
+                            console.warn(`[QQ] merged-forward failed, fallback to plain chunks phase=single_text len=${processed.length} threshold=${forwardThreshold} target=${deliveryTo}`);
+                        }
                         const chunks = splitMessage(processed, config.maxMessageLength || 4000);
+                        let sentAnything = false;
                         for (let i = 0; i < chunks.length; i++) {
                             if (currentRunState?.isStale()) return i > 0;
                             let chunk = chunks[i];
-                            if (isGroup && i === 0) chunk = `[CQ:at,qq=${userId}] ${chunk}`;
-
-                            if (isGroup) client.sendGroupMsg(groupId, chunk);
-                            else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, chunk);
-                            else client.sendPrivateMsg(userId, chunk);
+                            const result = await sendOneBotMessageWithAck(client, deliveryTo, chunk);
+                            if (!result.ok) {
+                                console.warn(`[QQ] text send failed phase=plain chunk=${i + 1}/${chunks.length} target=${deliveryTo} err=${result.error || "unknown"}`);
+                                return sentAnything;
+                            }
+                            sentAnything = true;
+                            console.log(`[QQ] text delivered phase=plain chunk=${i + 1}/${chunks.length} len=${chunk.length} target=${deliveryTo}`);
+                            rememberBotConversationReply(chunk, extractOutboundMessageId(result.data));
+                            maybeDispatchAutoReactAfterReply("plain_text");
 
                             if (!isGuild && config.enableTTS && i === 0 && chunk.length < 100) {
                                 const tts = chunk.replace(/\[CQ:.*?\]/g, "").trim();
@@ -4065,7 +5844,7 @@ ${current}
 
                             if (chunks.length > 1 && config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                         }
-                        return chunks.length > 0;
+                        return sentAnything;
                     };
 
                     const flushTextBatch = async (
@@ -4077,7 +5856,8 @@ ${current}
                         if (canUseMergedForward && totalLen >= forwardThreshold) {
                             const sentAsForward = await sendLongTextAsForwardMessage({
                                 client,
-                                groupId,
+                                groupId: isGroup ? groupId : undefined,
+                                userId: isGroup ? undefined : userId,
                                 texts,
                                 nodeName: (config.forwardNodeName || "OpenClaw").trim() || "OpenClaw",
                                 nodeUin: String(client.getSelfId() || userId),
@@ -4085,7 +5865,9 @@ ${current}
                             });
                             if (currentRunState?.isStale()) return false;
                             if (sentAsForward) {
-                                console.log(`[QQ] merged-forward delivered phase=${meta.phaseLabel} blocks=${texts.length} len=${totalLen} threshold=${forwardThreshold} group=${groupId}${meta.reason ? ` reason=${meta.reason}` : ""}`);
+                                console.log(`[QQ] merged-forward delivered phase=${meta.phaseLabel} blocks=${texts.length} len=${totalLen} threshold=${forwardThreshold} target=${deliveryTo}${meta.reason ? ` reason=${meta.reason}` : ""}`);
+                                rememberBotConversationReply(texts.join("\n"));
+                                maybeDispatchAutoReactAfterReply(`merged_forward_${meta.phaseLabel}`);
                                 return true;
                             }
                             console.warn(`[QQ] merged-forward failed, fallback to plain chunks phase=${meta.phaseLabel} blocks=${texts.length} len=${totalLen} threshold=${forwardThreshold} group=${groupId}${meta.reason ? ` reason=${meta.reason}` : ""}`);
@@ -4169,7 +5951,8 @@ ${current}
                             console.log(`[QQLayerTrace] outbound text kind=${info?.kind || "unknown"} phase=${phase || "unknown"} len=${payload.text.length}`);
                         }
                         if (payload.text && payload.text.trim()) {
-                            const processed = await prepareOutgoingText(payload.text);
+                            const cleanedText = stripInternalNoticeText(payload.text);
+                            const processed = cleanedText.trim() ? await prepareOutgoingText(cleanedText) : "";
                             if (currentRunState?.isStale()) return;
                             if (processed.trim()) {
                                 sawReplyContent = true;
@@ -4217,12 +6000,22 @@ ${current}
                                     to: deliveryTo,
                                     mediaUrl: f.url,
                                     fileNameHint: f.name,
+                                    mediaKindHint: f.kind,
                                     accountId: account.accountId,
                                     replyToId: payload.replyToId || undefined,
                                     audioAsVoice: payload.audioAsVoice,
                                 });
                                 if (currentRunState?.isStale()) return;
-                                if (result) deliveredAnything = true;
+                                if (result) {
+                                    deliveredAnything = true;
+                                    const mediaSummary = [
+                                        f.kind ? `[${f.kind}]` : "[媒体]",
+                                        f.name || "",
+                                        f.url || "",
+                                    ].filter(Boolean).join(" ");
+                                    rememberBotConversationReply(mediaSummary, extractOutboundMessageId(result));
+                                    maybeDispatchAutoReactAfterReply("media");
+                                }
                                 if (config.rateLimitMs > 0) await sleep(config.rateLimitMs);
                             }
                         }
@@ -4235,8 +6028,25 @@ ${current}
                         replyToSender = repliedMsg.sender?.nickname || repliedMsg.sender?.card || String(repliedMsg.sender?.user_id || '');
                     }
 
+                    const cleanedUserBody = cleanCQCodes(text);
+                    const inboundLinks = extractHttpUrlsFromText(cleanedUserBody, QQ_LINK_PREVIEW_MAX_LINKS);
+                    const linkPreviews = inboundLinks.length > 0
+                        ? await withSoftTimeout(
+                            fetchQQLinkPreviews(inboundLinks),
+                            QQ_LINK_PREVIEW_TIMEOUT_MS + 700,
+                            [] as QQInboundLinkPreview[],
+                            "link preview",
+                        )
+                        : [] as QQInboundLinkPreview[];
+                    if (inboundLinks.length > 0) {
+                        console.log(`[QQ] inbound links=${inboundLinks.length} previews=${linkPreviews.filter((item) => item.title || item.description || item.text).length}`);
+                    }
+                    const linkContextBlock = buildInboundLinkContextBlock(linkPreviews);
+                    const bodyForAgentText = inboundLinks.length > 0
+                        ? replaceInboundLinksForModel(cleanedUserBody, inboundLinks)
+                        : cleanedUserBody;
                     const replySuffix = replyToBody ? `\n\n[Replying to ${replyToSender || "unknown"}]\n${replyToBody}\n[/Replying]` : "";
-                    let bodyWithReply = cleanCQCodes(text) + replySuffix;
+                    let bodyWithReply = bodyForAgentText + replySuffix;
                     let systemBlock = "";
                     if (config.injectGatewayMeta !== false) {
                         systemBlock += buildQQHiddenMetaBlock({
@@ -4259,16 +6069,35 @@ ${current}
                         });
                     }
                     if (config.systemPrompt) systemBlock += `<system>${config.systemPrompt}</system>\n\n`;
+                    systemBlock += buildQQLanguageConsistencyBlock(bodyForAgentText);
+                    if (linkContextBlock) systemBlock += linkContextBlock;
                     if (historyContext) systemBlock += `<history>\n${historyContext}\n</history>\n\n`;
+                    const recentConversationContextBlock = buildQQConversationContextBlock({
+                        accountId: account.accountId,
+                        config,
+                        isGroup,
+                        isGuild,
+                        groupId,
+                        guildId,
+                        channelId,
+                        userId,
+                        currentMessageId: event.message_id,
+                    });
+                    if (recentConversationContextBlock) systemBlock += recentConversationContextBlock;
                     if (config.debugLayerTrace) {
                         console.log(`[QQLayerTrace] invoke buildReplyForwardContextBlock enrich=${String(config.enrichReplyForwardContext)} debug=${String(config.debugLayerTrace)} hasReply=${String(Boolean(repliedMsg))}`);
                     }
-                    const layeredContext = await buildReplyForwardContextBlock({
-                        client,
-                        rootEvent: event,
-                        repliedMsg,
-                        cfg: config,
-                    });
+                    const layeredContext = await withSoftTimeout(
+                        buildReplyForwardContextBlock({
+                            client,
+                            rootEvent: event,
+                            repliedMsg,
+                            cfg: config,
+                        }),
+                        QQ_LAYER_CONTEXT_TIMEOUT_MS,
+                        { block: "", imageUrls: [] },
+                        "reply/forward context build",
+                    );
                     if (config.debugLayerTrace) {
                         console.log(`[QQLayerTrace] blockLen=${layeredContext.block.length} imageCount=${layeredContext.imageUrls.length}`);
                     }
@@ -4326,7 +6155,9 @@ ${current}
                     const shouldComputeCommandAuthorized = runtime.channel.commands.shouldComputeCommandAuthorized(text, cfg);
                     const commandAuthorized = shouldComputeCommandAuthorized ? isAdmin : true;
                     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
-                        Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: text,
+                        Provider: "qq", Channel: "qq", From: fromId, To: "qq:bot", Body: bodyWithReply, RawBody: bodyForAgentText,
+                        BodyForAgent: bodyWithReply,
+                        BodyForCommands: bodyForAgentText,
                         SenderId: String(userId), SenderName: event.sender?.nickname || "Unknown", ConversationLabel: conversationLabel, ThreadLabel: sessionLabel,
                         SessionKey: route.sessionKey, AccountId: route.accountId, ChatType: isGroup ? "group" : isGuild ? "channel" : "direct", Timestamp: event.time * 1000,
                         Surface: "qq",
@@ -4347,14 +6178,7 @@ ${current}
                         );
                     }
 
-                    await runtime.channel.session.recordInboundSession({
-                        storePath: runtime.channel.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId }),
-                        sessionKey: ctxPayload.SessionKey!, ctx: ctxPayload,
-                        updateLastRoute: undefined,
-                        onRecordError: (err) => console.error("QQ Session Error:", err)
-                    });
-
-                    const executeDispatch = async (mergedCtx: any, runState: { isStale: () => boolean }) => {
+                    const executeDispatch = async (mergedCtx: any, runState: { isStale: () => boolean }, abortSignal?: AbortSignal) => {
                         currentRunState = runState;
                         let processingDelayTimer: ReturnType<typeof setTimeout> | null = null;
                         let typingCardActivated = false;
@@ -4415,16 +6239,32 @@ ${current}
                                 normalizeModelConfig(matchedAgentConfig?.model) ||
                                 normalizeModelConfig((cfg as any).agents?.defaults?.model) ||
                                 { primary: "", fallbacks: [] as string[] };
-                            const fallbacks = rawModelConfig.fallbacks;
+                            const mergedHasInboundImage = hasInboundImageLikeContent(mergedCtx);
+                            const shouldUseClaudeForStickerLikeRequest =
+                                isQQStickerLikeRequestText(text) ||
+                                isQQStickerLikeRequestText(cleanedUserBody) ||
+                                isQQStickerLikeRequestText(bodyForAgentText);
+                            const shouldUseClaudeForMediaRoute = mergedHasInboundImage || shouldUseClaudeForStickerLikeRequest;
+                            const mediaModelOverride = shouldUseClaudeForMediaRoute ? "agentrouter-completions/claude-opus-4-8" : "";
+                            const mediaModelFallbacks = shouldUseClaudeForMediaRoute ? ["agentrouter-completions/claude-opus-4-6"] : [];
+                            const effectiveModelConfig = mediaModelOverride
+                                ? {
+                                    primary: mediaModelOverride,
+                                    fallbacks: mediaModelFallbacks,
+                                }
+                                : rawModelConfig;
+                            const fallbacks = effectiveModelConfig.fallbacks;
+                            if (mediaModelOverride) {
+                                console.log(`[QQ] media/sticker route detected; primary model override=${mediaModelOverride} currentNonText=${String(hasCurrentInboundNonTextContent)} mergedImage=${String(mergedHasInboundImage)} stickerRequest=${String(shouldUseClaudeForStickerLikeRequest)} fallbacks=${fallbacks.join(",") || "-"}`);
+                            }
 
-                            const modelsToTry = [null, ...fallbacks];
+                            const modelsToTry: Array<string | null> = [null];
                             let globalDispatchError: any = null;
 
                             out_loop:
                             for (let modelIndex = 0; modelIndex < modelsToTry.length; modelIndex++) {
-                                const selectedFallback = modelsToTry[modelIndex];
-
-                                const modelToTest = modelsToTry[modelIndex] || rawModelConfig.primary;
+                                const modelToTest = modelsToTry[modelIndex] || effectiveModelConfig.primary;
+                                const candidateFallbacks = modelsToTry[modelIndex] ? [] : fallbacks;
                                 let currentCfg = cfg as any;
                                 if (runState.isStale()) {
                                     break out_loop;
@@ -4438,12 +6278,6 @@ ${current}
 
                                 if (modelIndex > 0) {
                                     console.log(`[QQ] Failover triggered: Switching to fallback model ${modelToTest}`);
-                                    if (config.enableErrorNotify !== false) {
-                                        const notifyMsg = `⏳ 当前服务无响应，正尝试切换至备用线路 ${modelIndex}/${fallbacks.length}...`;
-                                        if (isGroup) client.sendGroupMsg(groupId, notifyMsg);
-                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, notifyMsg);
-                                        else client.sendPrivateMsg(userId, notifyMsg);
-                                    }
                                 }
 
                                 currentCfg = {
@@ -4452,17 +6286,18 @@ ${current}
                                         ...((cfg as any).agents || {}),
                                         defaults: {
                                             ...((cfg as any).agents?.defaults || {}),
-                                            model: { primary: modelToTest, fallbacks: [] }
+                                            model: { primary: modelToTest, fallbacks: candidateFallbacks }
                                         },
                                         list: ((cfg as any).agents?.list || []).map((a: any) => {
                                             if (a.id === matchedAgentId) {
-                                                return { ...a, model: { primary: modelToTest, fallbacks: [] } };
+                                                return { ...a, model: { primary: modelToTest, fallbacks: candidateFallbacks } };
                                             }
                                             return a;
                                         })
                                     }
                                 };
 
+                                let sessionConflictRetryCount = 0;
                                 for (let tryCount = 0; tryCount <= maxRetries; tryCount++) {
                                     if (runState.isStale()) {
                                         break out_loop;
@@ -4497,7 +6332,9 @@ ${current}
                                                         console.error(`[QQ] buffered dispatch ${deliveryInfo.kind} failed: ${String(err)}`);
                                                     },
                                                 },
-                                                replyOptions: {},
+                                                replyOptions: {
+                                                    ...(abortSignal ? { abortSignal } : {}),
+                                                },
                                             });
                                             if (!runState.isStale()) {
                                                 console.log(`[QQ] dispatch result queuedFinal=${String(Boolean(dispatchResult?.queuedFinal))} counts=${JSON.stringify(dispatchResult?.counts || {})} session=${route.sessionKey}`);
@@ -4516,6 +6353,23 @@ ${current}
                                         if (globalDispatchError) {
                                             resetBufferedUnknownTexts();
                                             resetBufferedFinalTexts();
+                                            if (/reply session initialization conflicted|message ordering conflict/i.test(errMessage) && sessionConflictRetryCount < 3 && !runState.isStale()) {
+                                                sessionConflictRetryCount += 1;
+                                                const conflictDelayMs = 750 * sessionConflictRetryCount;
+                                                console.warn(`[QQ] reply session conflict; retrying after ${conflictDelayMs}ms (${sessionConflictRetryCount}/3): ${errMessage}`);
+                                                await sleep(conflictDelayMs);
+                                                tryCount -= 1;
+                                                continue;
+                                            }
+                                            if (/reply session initialization conflicted|message ordering conflict|aborted|aborterror/i.test(errMessage)) {
+                                                console.warn(`[QQ] stopping dispatch loop for non-retryable session/abort error: ${errMessage}`);
+                                                const notifyMsg = (config.errorReplyFallbackText || "这边没拿到结果，重发一次").trim();
+                                                if (config.enableErrorNotify && notifyMsg && !runState.isStale()) {
+                                                    const visibleNotify = normalizeQQVisibleText(notifyMsg);
+                                                    if (visibleNotify) await deliver({ text: visibleNotify });
+                                                }
+                                                break out_loop;
+                                            }
                                         }
 
                                         if (globalDispatchError) {
@@ -4542,30 +6396,36 @@ ${current}
                                                 Number(dispatchCounts.block || 0) > 0 ||
                                                 Number(dispatchCounts.final || 0) > 0
                                             );
-                                            if (deliveredAnything || sawReplyContent || sawDispatcherOutput || !shouldFallback) {
+                                            if (deliveredAnything || sawReplyContent || sawDispatcherOutput) {
+                                                break out_loop;
+                                            }
+                                            if (!shouldFallback) {
                                                 break out_loop;
                                             }
 
                                             if (dispatchDurationMs < 500) {
-                                                console.log(`[QQ] Message dropped by core queue policy (duration ${dispatchDurationMs}ms). Skipping retries.`);
-                                                break out_loop;
+                                                console.log(`[QQ] Core returned empty quickly (duration ${dispatchDurationMs}ms). Sending fallback if configured.`);
                                             }
                                         }
 
                                         if (tryCount === maxRetries) {
                                                 if (modelIndex === modelsToTry.length - 1 && !runState.isStale()) {
                                                     if (globalDispatchError) {
-                                                        const errMessage = (globalDispatchError instanceof Error) ? globalDispatchError.message : String(globalDispatchError);
-                                                        const notifyMsg = errMessage.trim() ? `⚠️ 服务调用失败: ${errMessage}` : "⚠️ 服务调用失败，无具体错误信息，请稍后重试。";
-                                                    if (config.enableErrorNotify) deliver({ text: notifyMsg });
-                                                } else {
-                                                    const fallbackText = (config.emptyReplyFallbackText || "⚠️ 本轮模型返回空内容。请重试，或先执行 /newsession 后再试。").trim();
-                                                    if (fallbackText) {
-                                                        if (isGroup) client.sendGroupMsg(groupId, `[CQ:at,qq=${userId}] ${fallbackText}`);
-                                                        else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, fallbackText);
-                                                        else client.sendPrivateMsg(userId, fallbackText);
+                                                        const notifyMsg = (config.errorReplyFallbackText || "这边没拿到结果，重发一次").trim();
+                                                        if (config.enableErrorNotify && notifyMsg) {
+                                                            const visibleNotify = normalizeQQVisibleText(notifyMsg);
+                                                            if (visibleNotify) deliver({ text: visibleNotify });
+                                                        }
+                                                    } else {
+                                                        const fallbackText = (config.emptyReplyFallbackText || "没拿到内容，重发一次").trim();
+                                                        const visibleFallback = normalizeQQVisibleText(fallbackText);
+                                                        if (visibleFallback) {
+                                                            console.log(`[QQ] no visible reply fallback delivered session=${route.sessionKey} text=${JSON.stringify(visibleFallback)}`);
+                                                            if (isGroup) client.sendGroupMsg(groupId, visibleFallback);
+                                                            else if (isGuild) client.sendGuildChannelMsg(guildId, channelId, visibleFallback);
+                                                            else client.sendPrivateMsg(userId, visibleFallback);
+                                                        }
                                                     }
-                                                }
                                             }
                                             break;
                                         }
@@ -4661,6 +6521,8 @@ ${current}
                 mediaAccess: extra.mediaAccess as QQOutboundMediaAccess | undefined,
                 mediaLocalRoots: extra.mediaLocalRoots,
                 mediaReadFile: extra.mediaReadFile,
+                fileNameHint: extra.fileNameHint ?? extra.name ?? extra.filename ?? extra.fileName,
+                mediaKindHint: normalizeOutboundMediaKind(extra.mediaKindHint ?? extra.kind ?? extra.type ?? extra.mimeType),
                 forceDocument: extra.forceDocument,
                 audioAsVoice: extra.audioAsVoice,
             });
@@ -4694,10 +6556,14 @@ ${current}
                     mediaLocalRoots: extra.mediaLocalRoots,
                     mediaReadFile: extra.mediaReadFile,
                     fileNameHint: item.name,
+                    mediaKindHint: item.kind,
                     forceDocument: extra.forceDocument,
                     audioAsVoice: effectiveAudioAsVoice,
                 });
-                if (i < mediaItems.length - 1) await sleep(1000);
+                if (i < mediaItems.length - 1) {
+                    const pacingMs = Number(getRuntimeCfgForAccount(accountId || DEFAULT_ACCOUNT_ID).rateLimitMs ?? 200);
+                    if (Number.isFinite(pacingMs) && pacingMs > 0) await sleep(Math.min(Math.floor(pacingMs), 800));
+                }
             }
             return lastResult || { channel: "qq", messageId: resolveOutboundMessageId(), timestamp: Date.now() };
         },
@@ -4722,6 +6588,7 @@ ${current}
     agentPrompt: {
         messageToolHints: () => [
             "QQ 发送目标必须带类型前缀：私聊 `user:<QQ号>`，群聊 `group:<群号>`，频道 `guild:<guildId>:<channelId>`；不要只写纯数字。",
+            "QQ message action 支持 `react` 和 `reactions`：`react` 用 `message_id`/当前消息上下文 + `emoji_id` 给群消息贴表情，`reactions` 用 `message_id` 查看贴表情汇总，附带 `emoji_id` 可拉取点击者列表。QQ/NapCat 的贴表情通常需要 QQ emoji id，私聊 reaction 不可靠。",
         ],
     }
 };
